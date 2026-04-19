@@ -1,0 +1,304 @@
+/* ── Design tokens ────────────────────────────────────────────
+ *
+ * Semantic tokens only — named for where they're used. Components
+ * reference these, never raw values. Themes override whichever
+ * ones they want to retarget via [data-theme="name"] blocks.
+ *
+ * Runtime switch:
+ *   document.documentElement.dataset.theme = "name"
+ * ─────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Backgrounds */
+  --bg-page: rgb(20 20 22);
+  --bg-surface: rgb(28 28 32);
+  --bg-surface-raised: rgb(36 36 42);
+  --bg-surface-hover: rgb(46 46 54);
+  --bg-button: rgb(40 40 46);
+  --bg-button-hover: rgb(55 55 62);
+  --bg-button-secondary: rgb(50 50 56);
+  --bg-button-secondary-hover: rgb(65 65 72);
+  --bg-tile: rgb(28 28 32);
+  --bg-hover-subtle: rgb(255 255 255 / 0.06);
+  --bg-row: rgb(255 255 255 / 0.03);
+  --bg-row-hover: rgb(255 255 255 / 0.06);
+  --bg-error: rgb(229 9 20 / 0.9);
+  --bg-error-ghost: rgb(229 9 20 / 0.1);
+  --bg-accent-ghost: rgb(229 9 20 / 0.15);
+  --bg-accent-ghost-hover: rgb(229 9 20 / 0.25);
+  --bg-backdrop: rgb(0 0 0 / 0.6);
+  --bg-raised: var(--bg-page);
+
+  /* Text */
+  --text-primary: rgb(240 240 244);
+  --text-secondary: rgb(220 220 226);
+  --text-tertiary: rgb(185 185 195);
+  --text-muted: rgb(145 148 160);
+  --text-dim: rgb(110 112 124);
+  --text-dimmer: rgb(85 87 98);
+  --text-on-accent: #fff;
+  --text-accent: #e50914;
+  --text-accent-hover: #ff1624;
+  --text-error: #ff4d5e;
+  --text-placeholder: rgb(110 112 124);
+  --text-icon-muted: rgb(255 255 255 / 0.15);
+
+  /* Borders */
+  --border-default: rgb(255 255 255 / 0.08);
+  --border-raised: rgb(255 255 255 / 0.12);
+  --border-strong: rgb(255 255 255 / 0.18);
+  --border-dialog: rgb(70 70 80);
+  --border-accent: #e50914;
+  --border-error: #ff4d5e;
+
+  /* Accent */
+  --accent: #e50914;
+  --accent-hover: #ff1624;
+  --danger: #d32f2f;
+  --accent-rgb: 229 9 20;
+
+  /* Typography */
+  --font-body: "Open Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-heading: "Chivo", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.875rem;
+  --text-base: 0.9375rem;
+  --text-lg: 1rem;
+  --text-xl: 1.1rem;
+  --text-2xl: 2rem;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Spacing */
+  --space-1: 0.125rem;
+  --space-2: 0.25rem;
+  --space-3: 0.375rem;
+  --space-4: 0.5rem;
+  --space-5: 0.625rem;
+  --space-6: 0.75rem;
+  --space-7: 1rem;
+  --space-8: 1.25rem;
+  --space-9: 1.5rem;
+  --space-10: 2rem;
+
+  /* Shape */
+  --radius-button: 6px;
+  --radius-input: 6px;
+  --radius-tile: 8px;
+  --radius-dialog: 10px;
+  --radius-badge: 9999px;
+  --radius-row: 6px;
+  --radius-toast: 6px;
+  --radius-radio: 8px;
+
+  --stroke-default: 1px;
+
+  /* Motion */
+  --motion-hover: 150ms cubic-bezier(0.33, 1, 0.68, 1);
+  --motion-focus-appear: 150ms cubic-bezier(0.33, 1, 0.68, 1);
+  --motion-spinner: 0.8s linear;
+
+  /* Elevation */
+  --shadow-tile: none;
+  --shadow-dialog: 0 12px 32px rgb(0 0 0 / 0.5);
+  --shadow-button: none;
+  --shadow-button-hover: none;
+  --shadow-raised: none;
+}
+
+/* ── Classic light theme ─────────────────────────────────────── */
+
+[data-theme="classic-light"] {
+  --bg-page: #f5f5f5;
+  --bg-surface: #ffffff;
+  --bg-surface-raised: #ffffff;
+  --bg-surface-hover: #ececec;
+  --bg-button: #ffffff;
+  --bg-button-hover: #ececec;
+  --bg-button-secondary: #ebebeb;
+  --bg-button-secondary-hover: #dcdcdc;
+  --bg-tile: #ffffff;
+  --bg-hover-subtle: rgb(0 0 0 / 0.04);
+  --bg-row: rgb(0 0 0 / 0.02);
+  --bg-row-hover: rgb(0 0 0 / 0.05);
+  --bg-error: rgb(211 47 47 / 0.9);
+  --bg-error-ghost: rgb(211 47 47 / 0.08);
+  --bg-accent-ghost: rgb(229 9 20 / 0.1);
+  --bg-accent-ghost-hover: rgb(229 9 20 / 0.18);
+  --bg-backdrop: rgb(0 0 0 / 0.4);
+  --bg-raised: var(--bg-surface);
+
+  --text-primary: rgb(20 20 20);
+  --text-secondary: rgb(50 50 50);
+  --text-tertiary: rgb(80 80 80);
+  --text-muted: rgb(110 110 110);
+  --text-dim: rgb(140 140 140);
+  --text-dimmer: rgb(170 170 170);
+  --text-on-accent: #fff;
+  --text-accent: #c00712;
+  --text-accent-hover: #e50914;
+  --text-error: #d32f2f;
+  --text-placeholder: rgb(150 150 150);
+  --text-icon-muted: rgb(0 0 0 / 0.3);
+
+  --border-default: rgb(0 0 0 / 0.1);
+  --border-raised: rgb(0 0 0 / 0.15);
+  --border-strong: rgb(0 0 0 / 0.25);
+  --border-dialog: rgb(0 0 0 / 0.12);
+  --border-accent: #e50914;
+  --border-error: #d32f2f;
+
+  --shadow-dialog: 0 10px 24px rgb(0 0 0 / 0.18);
+}
+
+/* ── Terminal theme ──────────────────────────────────────────── */
+
+[data-theme="terminal"] {
+  --bg-page: #000;
+  --bg-surface: #000;
+  --bg-surface-raised: #000;
+  --bg-surface-hover: #001a00;
+  --bg-button: #000;
+  --bg-button-hover: #001a00;
+  --bg-button-secondary: #000;
+  --bg-button-secondary-hover: #001a00;
+  --bg-tile: #000;
+  --bg-hover-subtle: rgb(0 255 0 / 0.05);
+  --bg-row: rgb(0 255 0 / 0.04);
+  --bg-row-hover: rgb(0 255 0 / 0.1);
+  --bg-error: rgb(255 0 64 / 0.9);
+  --bg-error-ghost: rgb(255 0 64 / 0.1);
+  --bg-accent-ghost: rgb(0 255 136 / 0.15);
+  --bg-accent-ghost-hover: rgb(0 255 136 / 0.25);
+  --bg-backdrop: rgb(0 0 0 / 0.85);
+
+  --text-primary: #00ff00;
+  --text-secondary: #00dd00;
+  --text-tertiary: #00bb00;
+  --text-muted: #008800;
+  --text-dim: #006600;
+  --text-dimmer: #004400;
+  --text-on-accent: #000;
+  --text-accent: #00ff88;
+  --text-accent-hover: #00ffaa;
+  --text-error: #ff0040;
+  --text-placeholder: #006600;
+  --text-icon-muted: rgb(0 255 0 / 0.25);
+
+  --border-default: #00aa00;
+  --border-raised: #00cc00;
+  --border-strong: #00ff00;
+  --border-dialog: #00ff00;
+  --border-accent: #00ff88;
+  --border-error: #ff0040;
+
+  --accent: #00ff88;
+  --accent-hover: #00ffaa;
+  --danger: #ff0040;
+  --accent-rgb: 0 255 136;
+
+  --font-body: ui-monospace, "JetBrains Mono", "SF Mono", "Courier New", monospace;
+  --font-heading: ui-monospace, "JetBrains Mono", "SF Mono", "Courier New", monospace;
+
+  --radius-button: 0;
+  --radius-input: 0;
+  --radius-tile: 0;
+  --radius-dialog: 0;
+  --radius-badge: 0;
+  --radius-row: 0;
+  --radius-toast: 0;
+  --radius-radio: 0;
+
+  --stroke-default: 2px;
+
+  --motion-hover: 0ms;
+  --motion-focus-appear: 0ms;
+
+  --shadow-dialog: none;
+}
+
+/* ── Material theme ──────────────────────────────────────────── */
+
+[data-theme="material"] {
+  --bg-page: #fafafa;
+  --bg-surface: #ffffff;
+  --bg-surface-raised: #ffffff;
+  --bg-surface-hover: #f5f5f5;
+  --bg-button: #ffffff;
+  --bg-button-hover: #f5f5f5;
+  --bg-button-secondary: #ffffff;
+  --bg-button-secondary-hover: #f5f5f5;
+  --bg-tile: #ffffff;
+  --bg-hover-subtle: rgb(98 0 238 / 0.04);
+  --bg-row: transparent;
+  --bg-row-hover: rgb(98 0 238 / 0.06);
+  --bg-error: rgb(176 0 32 / 0.9);
+  --bg-error-ghost: rgb(176 0 32 / 0.08);
+  --bg-accent-ghost: rgb(98 0 238 / 0.08);
+  --bg-accent-ghost-hover: rgb(98 0 238 / 0.12);
+  --bg-backdrop: rgb(0 0 0 / 0.32);
+  --bg-raised: var(--bg-surface);
+
+  --text-primary: rgb(0 0 0 / 0.87);
+  --text-secondary: rgb(0 0 0 / 0.74);
+  --text-tertiary: rgb(0 0 0 / 0.6);
+  --text-muted: rgb(0 0 0 / 0.54);
+  --text-dim: rgb(0 0 0 / 0.38);
+  --text-dimmer: rgb(0 0 0 / 0.26);
+  --text-on-accent: #ffffff;
+  --text-accent: #6200ee;
+  --text-accent-hover: #7722ff;
+  --text-error: #b00020;
+  --text-placeholder: rgb(0 0 0 / 0.38);
+  --text-icon-muted: rgb(0 0 0 / 0.38);
+
+  --border-default: transparent;
+  --border-raised: rgb(0 0 0 / 0.23);
+  --border-strong: rgb(0 0 0 / 0.42);
+  --border-dialog: transparent;
+  --border-accent: #6200ee;
+  --border-error: #b00020;
+
+  --accent: #6200ee;
+  --accent-hover: #7722ff;
+  --danger: #b00020;
+  --accent-rgb: 98 0 238;
+
+  --font-body: Roboto, "Helvetica Neue", Arial, system-ui, sans-serif;
+  --font-heading: Roboto, "Helvetica Neue", Arial, system-ui, sans-serif;
+
+  --radius-button: 9999px;
+  --radius-input: 9999px;
+  --radius-tile: 12px;
+  --radius-dialog: 12px;
+  --radius-badge: 9999px;
+  --radius-row: 8px;
+  --radius-toast: 8px;
+  --radius-radio: 9999px;
+
+  --shadow-tile:
+    0 2px 1px -1px rgb(0 0 0 / 0.2),
+    0 1px 1px 0 rgb(0 0 0 / 0.14),
+    0 1px 3px 0 rgb(0 0 0 / 0.12);
+  --shadow-button:
+    0 3px 1px -2px rgb(0 0 0 / 0.2),
+    0 2px 2px 0 rgb(0 0 0 / 0.14),
+    0 1px 5px 0 rgb(0 0 0 / 0.12);
+  --shadow-button-hover:
+    0 5px 5px -3px rgb(0 0 0 / 0.2),
+    0 8px 10px 1px rgb(0 0 0 / 0.14),
+    0 3px 14px 2px rgb(0 0 0 / 0.12);
+  --shadow-raised:
+    0 2px 4px -1px rgb(0 0 0 / 0.2),
+    0 4px 5px 0 rgb(0 0 0 / 0.14),
+    0 1px 10px 0 rgb(0 0 0 / 0.12);
+  --shadow-dialog:
+    0 11px 15px -7px rgb(0 0 0 / 0.2),
+    0 24px 38px 3px rgb(0 0 0 / 0.14),
+    0 9px 46px 8px rgb(0 0 0 / 0.12);
+}

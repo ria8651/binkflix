@@ -198,10 +198,302 @@ async function setVttInner(videoId, url, label, language) {
 // no-op and subtitles never appear. A pre-stub (installed synchronously
 // when the HTML parser hits the <script type="module">) queues the call
 // and replays it once the real implementation is ready.
+// ── Custom overlay controls ────────────────────────────────────
+//
+// Rust renders the static chrome (buttons, scrubber, time labels, volume
+// slider, subtitle menu). We wire up the dynamic behaviour here — binding
+// DOM events to the <video>, syncing the scrubber + time + icon state,
+// and managing the auto-hide timer. Subtitle menu state stays in Rust.
+//
+// Expected DOM inside the .video-wrap containing `#videoId`:
+//   .player-chrome
+//     input.player-scrub[type=range]
+//     .player-row
+//       button.player-btn.play-btn
+//       span.time-cur
+//       span.time-dur
+//       input.volume-slider[type=range]
+//       button.player-btn.fullscreen-btn
+//
+// Idempotent: safe to call multiple times on the same video.
+
+const controllers = new Map(); // videoId -> teardown fn
+
+const SVG_PLAY = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>`;
+const SVG_PAUSE = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>`;
+const SVG_VOL_HIGH = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>`;
+const SVG_VOL_MUTE = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4V5z"/><path d="M22 9l-6 6M16 9l6 6"/></svg>`;
+
+function fmtTime(s) {
+    if (!isFinite(s) || s < 0) s = 0;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    const pad = (n) => String(n).padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+
+function initControls(videoId) {
+    // Tear down any previous controller for this id so hot-reload / remount
+    // doesn't stack listeners.
+    controllers.get(videoId)?.();
+
+    const video = getVideo(videoId);
+    if (!video) return;
+    const wrap = video.closest(".video-wrap");
+    if (!wrap) return;
+
+    const $ = (sel) => wrap.querySelector(sel);
+    const playBtn = $(".play-btn");
+    const scrub = $(".player-scrub");
+    const timeCur = $(".time-cur");
+    const timeDur = $(".time-dur");
+    const volSlider = $(".volume-slider");
+    const volBtn = $(".volume-btn");
+    const fsBtn = $(".fullscreen-btn");
+
+    let seeking = false;
+    let activeTimer = null;
+
+    const setPausedClass = () => wrap.classList.toggle("paused", video.paused);
+    const setPlayIcon = () => {
+        if (playBtn) playBtn.innerHTML = video.paused ? SVG_PLAY : SVG_PAUSE;
+    };
+    const setMuteIcon = () => {
+        if (volBtn) volBtn.innerHTML = (video.muted || video.volume === 0) ? SVG_VOL_MUTE : SVG_VOL_HIGH;
+    };
+
+    const updateFill = () => {
+        if (!scrub) return;
+        const d = video.duration;
+        let played = 0, buffered = 0;
+        if (isFinite(d) && d > 0) {
+            played = (video.currentTime / d) * 100;
+            try {
+                const b = video.buffered;
+                // Pick the range covering currentTime, else the last one.
+                for (let i = 0; i < b.length; i++) {
+                    if (b.start(i) <= video.currentTime && video.currentTime <= b.end(i)) {
+                        buffered = (b.end(i) / d) * 100;
+                        break;
+                    }
+                    if (i === b.length - 1) buffered = (b.end(i) / d) * 100;
+                }
+            } catch (_) { /* ignore */ }
+        }
+        buffered = Math.max(buffered, played);
+        scrub.style.setProperty("--played", played + "%");
+        scrub.style.setProperty("--buffered", buffered + "%");
+    };
+
+    const syncTime = () => {
+        if (!seeking && scrub && isFinite(video.duration)) {
+            scrub.value = String((video.currentTime / video.duration) * 1000);
+        }
+        if (timeCur) timeCur.textContent = fmtTime(video.currentTime);
+        updateFill();
+    };
+    const syncDuration = () => {
+        if (timeDur) timeDur.textContent = fmtTime(video.duration);
+        updateFill();
+    };
+
+    const onPlay = () => { setPausedClass(); setPlayIcon(); };
+    const onPause = () => { setPausedClass(); setPlayIcon(); };
+    const onTime = () => syncTime();
+    const onMeta = () => { syncDuration(); syncTime(); };
+    const onVol = () => {
+        const v = video.muted ? 0 : video.volume;
+        if (volSlider) {
+            volSlider.value = String(v);
+            volSlider.style.setProperty("--vol", (v * 100) + "%");
+        }
+        setMuteIcon();
+    };
+
+    const onProgress = () => updateFill();
+
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("timeupdate", onTime);
+    video.addEventListener("loadedmetadata", onMeta);
+    video.addEventListener("durationchange", onMeta);
+    video.addEventListener("volumechange", onVol);
+    video.addEventListener("progress", onProgress);
+
+    // Stop chrome-button clicks from ever bubbling to the wrap-level listener,
+    // which only treats clicks on the video itself as a play/pause toggle.
+    // Defence-in-depth: even though the wrap handler checks `target === video`,
+    // some browsers / devtools redispatch events oddly, and a single stray
+    // pause from clicking the mute button is a miserable UX bug.
+    const stopBubble = (e) => e.stopPropagation();
+
+    // Drop focus after any chrome interaction so the slider doesn't park
+    // focus and hijack future arrow keys. Our custom shortcuts still work
+    // regardless (onKey allows range inputs through), but this also kills
+    // the persistent focus ring.
+    const blurSelf = (e) => { e.currentTarget.blur?.(); };
+
+    const onPlayBtn = () => { if (video.paused) video.play(); else video.pause(); };
+    const onScrubInput = () => {
+        seeking = true;
+        if (timeCur && isFinite(video.duration)) {
+            timeCur.textContent = fmtTime((scrub.value / 1000) * video.duration);
+        }
+    };
+    const onScrubChange = () => {
+        if (isFinite(video.duration)) {
+            video.currentTime = (scrub.value / 1000) * video.duration;
+        }
+        seeking = false;
+    };
+    const onVolInput = () => {
+        const v = Number(volSlider.value);
+        video.volume = v;
+        video.muted = v === 0;
+        volSlider.style.setProperty("--vol", (v * 100) + "%");
+    };
+    const onVolBtn = () => { video.muted = !video.muted; };
+    const onFsBtn = () => {
+        if (document.fullscreenElement) document.exitFullscreen();
+        else wrap.requestFullscreen?.();
+    };
+
+    playBtn?.addEventListener("click", onPlayBtn);
+    playBtn?.addEventListener("click", stopBubble);
+    playBtn?.addEventListener("pointerup", blurSelf);
+    scrub?.addEventListener("input", onScrubInput);
+    scrub?.addEventListener("change", onScrubChange);
+    scrub?.addEventListener("click", stopBubble);
+    scrub?.addEventListener("pointerup", blurSelf);
+    volSlider?.addEventListener("input", onVolInput);
+    volSlider?.addEventListener("click", stopBubble);
+    volSlider?.addEventListener("pointerup", blurSelf);
+    volBtn?.addEventListener("click", onVolBtn);
+    volBtn?.addEventListener("click", stopBubble);
+    volBtn?.addEventListener("pointerup", blurSelf);
+    fsBtn?.addEventListener("click", onFsBtn);
+    fsBtn?.addEventListener("click", stopBubble);
+    fsBtn?.addEventListener("pointerup", blurSelf);
+
+    // Click video area toggles play (but not on the chrome itself).
+    const onVideoClick = (e) => {
+        if (e.target === video) onPlayBtn();
+    };
+    wrap.addEventListener("click", onVideoClick);
+
+    // Auto-hide: show chrome on mouse activity, hide after 2s of idle playback.
+    const bumpActive = () => {
+        wrap.classList.add("active");
+        if (activeTimer) clearTimeout(activeTimer);
+        activeTimer = setTimeout(() => {
+            if (!video.paused) wrap.classList.remove("active");
+        }, 2000);
+    };
+    const onLeave = () => {
+        if (activeTimer) clearTimeout(activeTimer);
+        if (!video.paused) wrap.classList.remove("active");
+    };
+    wrap.addEventListener("mousemove", bumpActive);
+    wrap.addEventListener("mouseleave", onLeave);
+
+    // Keyboard shortcuts (document-level so the user doesn't have to click the
+    // video first). Bail if they're typing in a form field.
+    const onKey = (e) => {
+        // Only bail for *text* inputs / editables — don't let a focused
+        // range slider (scrubber, volume) steal arrow keys from our custom
+        // shortcuts. After a user drags a slider, focus parks there and
+        // would otherwise capture ArrowLeft/Right/Up/Down.
+        const t = e.target;
+        if (t) {
+            const tag = t.tagName;
+            const type = (t.type || "").toLowerCase();
+            const isTextInput =
+                tag === "TEXTAREA" ||
+                t.isContentEditable ||
+                (tag === "INPUT" && type !== "range" && type !== "button" && type !== "checkbox");
+            if (isTextInput) return;
+        }
+        const step = 5;
+        const vstep = 0.05;
+        switch (e.key) {
+            case " ":
+            case "k":
+                e.preventDefault(); onPlayBtn(); bumpActive(); break;
+            case "ArrowLeft":
+                e.preventDefault();
+                video.currentTime = Math.max(0, video.currentTime - step);
+                bumpActive(); break;
+            case "ArrowRight":
+                e.preventDefault();
+                if (isFinite(video.duration)) {
+                    video.currentTime = Math.min(video.duration, video.currentTime + step);
+                }
+                bumpActive(); break;
+            case "ArrowUp":
+                e.preventDefault();
+                video.muted = false;
+                video.volume = Math.min(1, video.volume + vstep);
+                bumpActive(); break;
+            case "ArrowDown":
+                e.preventDefault();
+                video.volume = Math.max(0, video.volume - vstep);
+                bumpActive(); break;
+            case "m":
+            case "M":
+                e.preventDefault(); video.muted = !video.muted; bumpActive(); break;
+            case "f":
+            case "F":
+                e.preventDefault(); onFsBtn(); bumpActive(); break;
+        }
+    };
+    document.addEventListener("keydown", onKey);
+
+    // Initial sync
+    setPausedClass();
+    setPlayIcon();
+    syncTime();
+    syncDuration();
+    onVol();
+
+    controllers.set(videoId, () => {
+        video.removeEventListener("play", onPlay);
+        video.removeEventListener("pause", onPause);
+        video.removeEventListener("timeupdate", onTime);
+        video.removeEventListener("loadedmetadata", onMeta);
+        video.removeEventListener("durationchange", onMeta);
+        video.removeEventListener("volumechange", onVol);
+        video.removeEventListener("progress", onProgress);
+        playBtn?.removeEventListener("click", onPlayBtn);
+        playBtn?.removeEventListener("click", stopBubble);
+        playBtn?.removeEventListener("pointerup", blurSelf);
+        scrub?.removeEventListener("input", onScrubInput);
+        scrub?.removeEventListener("change", onScrubChange);
+        scrub?.removeEventListener("click", stopBubble);
+        scrub?.removeEventListener("pointerup", blurSelf);
+        volSlider?.removeEventListener("input", onVolInput);
+        volSlider?.removeEventListener("click", stopBubble);
+        volSlider?.removeEventListener("pointerup", blurSelf);
+        volBtn?.removeEventListener("click", onVolBtn);
+        volBtn?.removeEventListener("click", stopBubble);
+        volBtn?.removeEventListener("pointerup", blurSelf);
+        fsBtn?.removeEventListener("click", onFsBtn);
+        fsBtn?.removeEventListener("click", stopBubble);
+        fsBtn?.removeEventListener("pointerup", blurSelf);
+        wrap.removeEventListener("click", onVideoClick);
+        wrap.removeEventListener("mousemove", bumpActive);
+        wrap.removeEventListener("mouseleave", onLeave);
+        document.removeEventListener("keydown", onKey);
+        if (activeTimer) clearTimeout(activeTimer);
+        controllers.delete(videoId);
+    });
+}
+
 const realApi = {
     setAss,
     setVtt,
     clear: detach,
+    initControls,
 };
 
 const pending = (window.binkflixPlayer && window.binkflixPlayer.__queue) || [];

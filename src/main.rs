@@ -3,6 +3,7 @@
 mod app;
 mod client_api;
 mod types;
+mod video_player;
 
 mod syncplay_client;
 

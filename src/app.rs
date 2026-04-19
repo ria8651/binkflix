@@ -1,6 +1,14 @@
 use crate::client_api::*;
 use crate::types::*;
+use crate::video_player::VideoPlayer;
 use dioxus::prelude::*;
+
+const ICON_PALETTE: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2a10 10 0 0 0 0 20c1.1 0 2-.9 2-2 0-.48-.18-.95-.55-1.28A1.5 1.5 0 0 1 14.5 16H16a6 6 0 0 0 6-6c0-4.42-4.48-8-10-8z"/></svg>"#;
+const ICON_CARET: &str = r#"<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>"#;
+const ICON_CHECK_SMALL: &str = r#"<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
+const ICON_BACK: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>"#;
+const ICON_PLAY_BTN: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>"#;
+pub const ICON_GROUP: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
 
 #[derive(Routable, Clone, PartialEq)]
 #[rustfmt::skip]
@@ -19,6 +27,7 @@ pub enum Route {
 #[component]
 pub fn App() -> Element {
     rsx! {
+        document::Stylesheet { href: asset!("/assets/tokens.css") }
         document::Stylesheet { href: asset!("/assets/style.css") }
         // Synchronous stub queues calls made before the async module below
         // finishes evaluating; the module replays the queue on load.
@@ -38,12 +47,97 @@ fn Shell() -> Element {
     rsx! {
         header { class: "topbar",
             Link { to: Route::Home {}, class: "brand", "BINKFLIX" }
-            span { class: "muted", "self-hosted" }
-            crate::syncplay_client::RoomsDropdown {}
+            div { class: "top-right",
+                crate::syncplay_client::RoomsDropdown {}
+                ThemeSwitcher {}
+            }
         }
         main {
             crate::syncplay_client::RoomNavigator {}
             Outlet::<Route> {}
+        }
+    }
+}
+
+const THEMES: &[(&str, &str)] = &[
+    ("default", "Default (dark)"),
+    ("classic-light", "Classic light"),
+    ("terminal", "Terminal"),
+    ("material", "Material"),
+];
+
+#[component]
+pub fn ThemeSwitcher() -> Element {
+    let mut theme = use_signal(|| "default".to_string());
+    let mut open = use_signal(|| false);
+
+    // On mount: restore from localStorage, then apply current theme.
+    use_effect(move || {
+        spawn(async move {
+            let mut eval = document::eval(
+                r#"
+                const saved = localStorage.getItem('binkflix-theme') || 'default';
+                document.documentElement.dataset.theme = saved;
+                dioxus.send(saved);
+                "#,
+            );
+            if let Ok(val) = eval.recv::<serde_json::Value>().await {
+                if let Some(s) = val.as_str() {
+                    theme.set(s.to_string());
+                }
+            }
+        });
+    });
+
+    // Whenever the theme signal changes, apply + persist.
+    use_effect(move || {
+        let t = theme.read().clone();
+        let js = format!(
+            r#"
+            document.documentElement.dataset.theme = '{t}';
+            localStorage.setItem('binkflix-theme', '{t}');
+            "#
+        );
+        spawn(async move { let _ = document::eval(&js).await; });
+    });
+
+    let is_open = *open.read();
+    let current_id = theme.read().clone();
+
+    rsx! {
+        div { class: "theme-switcher",
+            button {
+                class: "btn-theme btn-icon",
+                r#type: "button",
+                aria_label: "Theme",
+                onclick: move |_| { let cur = *open.peek(); open.set(!cur); },
+                span { class: "icon", dangerous_inner_html: ICON_PALETTE }
+            }
+            if is_open {
+                div { class: "menu",
+                    for (id, label) in THEMES.iter() {
+                        {
+                            let tid = id.to_string();
+                            let active = current_id == *id;
+                            rsx! {
+                                button {
+                                    key: "{id}",
+                                    class: if active { "active" } else { "" },
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        theme.set(tid.clone());
+                                        open.set(false);
+                                    },
+                                    span { "{label}" }
+                                    if active {
+                                        span { class: "check", dangerous_inner_html: ICON_CHECK_SMALL }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -187,7 +281,10 @@ fn MediaDetail(id: String) -> Element {
                             p { class: "plot", "{plot}" }
                         }
                         div { style: "margin-top: 1.5rem; display: flex; gap: 0.75rem;",
-                            Link { to: Route::MediaPlay { id: m.id.clone() }, class: "btn", "▶ Play" }
+                            Link { to: Route::MediaPlay { id: m.id.clone() }, class: "btn",
+                                span { dangerous_inner_html: ICON_PLAY_BTN }
+                                span { "Play" }
+                            }
                             if m.kind == "episode" {
                                 if let Some(sid) = m.show_id.as_deref() {
                                     Link { to: Route::ShowDetail { id: sid.to_string() }, class: "btn ghost", "Show" }
@@ -300,256 +397,31 @@ fn MediaPlay(id: String) -> Element {
         async move { get_media(&id).await }
     });
 
-    rsx! {
-        VideoPlayer { id: id.clone() }
-        crate::syncplay_client::SyncplayBridge {
-            video_dom_id: "binkflix-video".to_string(),
-            media_id: id.clone(),
-        }
-        div { style: "margin-top: 1rem;",
-            match &*media.read_unchecked() {
-                Some(Ok(m)) if m.kind == "episode" => {
-                    let back_to = m.show_id.clone().map(|sid| Route::ShowDetail { id: sid })
-                        .unwrap_or(Route::Home {});
-                    rsx! { Link { to: back_to, class: "btn ghost", "← Back" } }
-                }
-                _ => rsx! {
-                    Link { to: Route::MediaDetail { id: id.clone() }, class: "btn ghost", "← Back" }
-                }
-            }
-        }
-    }
-}
-
-/// HTML5 video + subtitle track picker. Hands subtitle loading off to
-/// `window.binkflixPlayer` (see assets/player.js): ASS goes through JASSUB,
-/// VTT through a native `<track>`.
-///
-/// The state machine is small but deliberately reactive:
-///   * `user_pick`     — user's explicit choice (`None` = untouched).
-///   * `effective_id`  — memo: user's pick if any, else the "default"/first
-///                       track from the list. PartialEq-deduped.
-///   * `sub_command`   — memo: the concrete call to make into JS
-///                       (`Option<SubCommand>`). Deduped by value.
-///   * the effect      — subscribes to `sub_command` only. Fires the eval
-///                       exactly once per actual change, no flag bookkeeping.
-#[component]
-fn VideoPlayer(id: String) -> Element {
-    let id_for_subs = id.clone();
-    let tracks = use_resource(move || {
-        let id = id_for_subs.clone();
-        async move { get_subtitles(&id).await }
-    });
-
-    // Stable DOM id so the JS helper can find the <video> element.
-    let video_dom_id = "binkflix-video";
-
-    // `None` = user hasn't touched the picker (fall back to default);
-    // `Some(None)` = user explicitly chose "Off";
-    // `Some(Some(id))` = user picked a track.
-    let mut user_pick = use_signal(|| None::<Option<String>>);
-
-    // The track the player should currently be showing. Recomputed when
-    // either the user touches the picker or the track list resolves.
-    let effective_id = use_memo(move || -> Option<String> {
-        if let Some(explicit) = user_pick.read().clone() {
-            return explicit;
-        }
-        let tracks_read = tracks.read();
-        let Some(Ok(list)) = &*tracks_read else { return None };
-        list.iter()
-            .find(|t| t.default)
-            .or_else(|| list.first())
-            .map(|t| t.id.clone())
-    });
-
-    // What we actually want to tell the JS side to do. By deriving this as
-    // a memo with PartialEq, the downstream effect only fires when the value
-    // genuinely changes — independent of how many times Dioxus re-renders.
-    let apply_id = id.clone();
-    let sub_command = use_memo(move || -> Option<SubCommand> {
-        let id = effective_id.read().clone()?;
-        let tracks_read = tracks.read();
-        let Some(Ok(list)) = &*tracks_read else { return None };
-        let track = list.iter().find(|t| t.id == id)?;
-        Some(SubCommand {
-            format: if track.format == "ass" { SubFormat::Ass } else { SubFormat::Vtt },
-            url: media_subtitle_url(&apply_id, &track.id),
-            label: track.label.clone(),
-            language: track.language.clone(),
-        })
-    });
-
-    // `loading` shows a spinner while a subtitle attach is in flight;
-    // `sub_error` surfaces the exception message from JS/ffmpeg so the user
-    // isn't left staring at a silent failure.
-    let mut loading = use_signal(|| false);
-    let mut sub_error = use_signal(|| None::<String>);
-
-    // Belt-and-suspenders dedupe. Dioxus memos don't reliably suppress
-    // downstream notification on PartialEq-equal values across all render
-    // paths (hydration, HMR, Resource re-emission), so we explicitly
-    // remember the last-applied command and bail out if unchanged.
-    // `.peek()` reads without subscribing — writing here doesn't re-trigger us.
-    let mut last_applied = use_signal(|| None::<Option<SubCommand>>);
-
-    use_effect(move || {
-        let cmd = sub_command.read().clone();
-        if matches!(&*last_applied.peek(), Some(p) if p == &cmd) {
-            return;
-        }
-        last_applied.set(Some(cmd.clone()));
-
-        let js = match &cmd {
-            None => format!(
-                r#"
-                (async () => {{
-                    try {{
-                        await window.binkflixPlayer?.clear('{video_dom_id}');
-                        dioxus.send({{ ok: true }});
-                    }} catch (e) {{
-                        dioxus.send({{ ok: false, error: String(e && e.message || e) }});
-                    }}
-                }})();
-                "#
-            ),
-            Some(cmd) => {
-                let url = &cmd.url;
-                let label = cmd.label.replace('\\', "\\\\").replace('\'', "\\'");
-                let lang = cmd.language.replace('\\', "\\\\").replace('\'', "\\'");
-                let call = match cmd.format {
-                    SubFormat::Ass =>
-                        format!("window.binkflixPlayer?.setAss('{video_dom_id}', '{url}')"),
-                    SubFormat::Vtt =>
-                        format!("window.binkflixPlayer?.setVtt('{video_dom_id}', '{url}', '{label}', '{lang}')"),
-                };
-                format!(
-                    r#"
-                    (async () => {{
-                        const timeout = new Promise((_, rej) =>
-                            setTimeout(() => rej(new Error('timed out after 15s')), 15000)
-                        );
-                        try {{
-                            await Promise.race([{call}, timeout]);
-                            dioxus.send({{ ok: true }});
-                        }} catch (e) {{
-                            console.error('subtitle load failed', e);
-                            dioxus.send({{ ok: false, error: String(e && e.message || e) }});
-                        }}
-                    }})();
-                    "#
-                )
-            }
-        };
-        let show_spinner = cmd.is_some();
-        if show_spinner {
-            loading.set(true);
-            sub_error.set(None);
-        }
-        spawn(async move {
-            let mut eval = document::eval(&js);
-            let received = eval.recv::<serde_json::Value>().await;
-            if show_spinner {
-                loading.set(false);
-            }
-            match received {
-                Ok(v) => {
-                    let ok = v.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
-                    if !ok && show_spinner {
-                        let msg = v
-                            .get("error")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        sub_error.set(Some(msg));
-                    }
-                }
-                Err(e) => {
-                    if show_spinner {
-                        sub_error.set(Some(format!("eval failed: {e}")));
-                    }
-                }
-            }
-        });
-    });
+    let back_route = match &*media.read_unchecked() {
+        Some(Ok(m)) if m.kind == "episode" => m
+            .show_id
+            .clone()
+            .map(|sid| Route::ShowDetail { id: sid })
+            .unwrap_or(Route::Home {}),
+        _ => Route::MediaDetail { id: id.clone() },
+    };
 
     rsx! {
-        div { class: "video-wrap",
-            video {
-                id: "{video_dom_id}",
-                src: "{media_stream_url(&id)}",
-                controls: true,
-                autoplay: true,
-                preload: "metadata",
+        div { class: "player-fullpage",
+            Link { to: back_route, class: "player-back",
+                span { dangerous_inner_html: ICON_BACK }
+                span { "Back" }
             }
-        }
-        div { class: "player-controls",
-            match &*tracks.read_unchecked() {
-                None => rsx! { span { class: "muted", "Loading subtitles…" } },
-                Some(Err(e)) => rsx! { span { class: "muted", "Subtitles unavailable: {e}" } },
-                Some(Ok(list)) if list.is_empty() => rsx! {
-                    span { class: "muted", "No subtitle tracks found" }
-                },
-                Some(Ok(list)) => {
-                    let list = list.clone();
-                    let current = effective_id.read().clone().unwrap_or_default();
-                    let is_loading = *loading.read();
-                    rsx! {
-                        label { class: "muted", "Subtitles: " }
-                        select {
-                            disabled: is_loading,
-                            onchange: move |evt| {
-                                let v = evt.value();
-                                // Any onchange is an explicit choice — including "Off".
-                                user_pick.set(Some(if v.is_empty() { None } else { Some(v) }));
-                            },
-                            option {
-                                value: "",
-                                selected: current.is_empty(),
-                                "Off"
-                            }
-                            for t in list.iter() {
-                                option {
-                                    key: "{t.id}",
-                                    value: "{t.id}",
-                                    selected: current == t.id,
-                                    {subtitle_option_label(t)}
-                                }
-                            }
-                        }
-                        if is_loading {
-                            span { class: "spinner", aria_label: "loading subtitles" }
-                            span { class: "muted", "Loading subtitles…" }
-                        }
-                        if let Some(msg) = sub_error.read().clone() {
-                            span { class: "sub-error", title: "{msg}", "⚠ {msg}" }
-                        }
-                    }
-                }
+            div { class: "player-theme",
+                crate::syncplay_client::RoomsDropdown {}
+                ThemeSwitcher {}
+            }
+            VideoPlayer { id: id.clone() }
+            crate::syncplay_client::SyncplayBridge {
+                video_dom_id: "binkflix-video".to_string(),
+                media_id: id.clone(),
             }
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum SubFormat { Ass, Vtt }
-
-/// Concrete instruction for the JS player layer. `PartialEq` drives memo
-/// dedupe: the apply-effect only re-fires when a field actually changes.
-#[derive(Clone, PartialEq)]
-struct SubCommand {
-    format: SubFormat,
-    url: String,
-    label: String,
-    language: String,
-}
-
-fn subtitle_option_label(t: &SubtitleTrack) -> String {
-    let mut s = t.label.clone();
-    if !t.language.is_empty() && !s.to_lowercase().contains(&t.language.to_lowercase()) {
-        s = format!("{s} ({})", t.language);
-    }
-    if t.forced { s.push_str(" · forced"); }
-    if t.default { s.push_str(" · default"); }
-    s
-}

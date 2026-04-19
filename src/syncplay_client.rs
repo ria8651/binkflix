@@ -328,7 +328,7 @@ pub fn RoomsDropdown() -> Element {
     let viewers = *ctx.viewers.read();
     let current_state = ctx.current.read().clone();
 
-    let status_text = if in_room {
+    let title = if in_room {
         let id = ctx.room_id.read().clone().unwrap_or_default();
         let short: String = id.chars().take(6).collect();
         let media = current_state
@@ -339,11 +339,14 @@ pub fn RoomsDropdown() -> Element {
     } else {
         "Rooms".to_string()
     };
+    let _ = viewers;
 
     rsx! {
         div { class: "rooms-dd",
             button {
-                class: if in_room { "rooms-btn in-room" } else { "rooms-btn" },
+                class: if in_room { "rooms-btn btn-icon in-room" } else { "rooms-btn btn-icon" },
+                aria_label: "Rooms",
+                title: "{title}",
                 onclick: move |_| {
                     let cur = *open.read();
                     open.set(!cur);
@@ -351,7 +354,7 @@ pub fn RoomsDropdown() -> Element {
                         rooms.restart();
                     }
                 },
-                "{status_text} ▾"
+                span { class: "icon", dangerous_inner_html: crate::app::ICON_GROUP }
             }
             if *open.read() {
                 div { class: "rooms-panel",
