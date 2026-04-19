@@ -50,6 +50,8 @@
   --border-dialog: rgb(70 70 80);
   --border-accent: #e50914;
   --border-error: #ff4d5e;
+  --border-tile: var(--border-default);
+  --border-tile-hover: var(--border-raised);
 
   /* Accent */
   --accent: #e50914;
@@ -263,6 +265,8 @@
   --border-dialog: transparent;
   --border-accent: #6200ee;
   --border-error: #b00020;
+  --border-tile: transparent;
+  --border-tile-hover: transparent;
 
   --accent: #6200ee;
   --accent-hover: #7722ff;
@@ -275,7 +279,7 @@
   --radius-button: 9999px;
   --radius-input: 9999px;
   --radius-tile: 12px;
-  --radius-dialog: 12px;
+  --radius-dialog: 18px;
   --radius-badge: 9999px;
   --radius-row: 8px;
   --radius-toast: 8px;

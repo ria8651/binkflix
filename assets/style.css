@@ -27,7 +27,8 @@ header.topbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--space-7) var(--space-9);
+    padding-block: var(--space-7);
+    padding-inline: max(var(--space-9), calc((100% - 1400px) / 2 + var(--space-9)));
     background: var(--bg-surface);
     position: sticky;
     top: 0;
@@ -38,11 +39,15 @@ header.topbar {
 }
 
 header.topbar .brand {
-    font-family: var(--font-heading);
-    font-weight: var(--weight-bold);
-    letter-spacing: 0.04em;
-    color: var(--text-accent);
-    font-size: var(--text-xl);
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-primary);
+}
+
+header.topbar .brand svg {
+    display: block;
+    height: 32px;
+    width: auto;
 }
 
 header.topbar .top-right {
@@ -57,7 +62,7 @@ header.topbar .top-right {
     position: relative;
 }
 
-.theme-switcher .btn-theme {
+.btn-theme {
     display: inline-flex;
     align-items: center;
     gap: var(--space-4);
@@ -73,7 +78,7 @@ header.topbar .top-right {
     box-shadow: var(--shadow-button);
 }
 
-.theme-switcher .btn-theme:hover {
+.btn-theme:hover {
     background: var(--bg-button-hover);
     border-color: var(--border-raised);
     box-shadow: var(--shadow-button-hover);
@@ -172,7 +177,7 @@ h2.section {
 
 .card {
     background: var(--bg-tile);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default) solid var(--border-tile);
     border-radius: var(--radius-tile);
     overflow: hidden;
     transition: transform var(--motion-hover), box-shadow var(--motion-hover), border-color var(--motion-hover);
@@ -181,7 +186,7 @@ h2.section {
 }
 .card:hover {
     transform: translateY(-3px);
-    border-color: var(--border-raised);
+    border-color: var(--border-tile-hover);
     box-shadow: var(--shadow-button-hover), 0 6px 18px rgb(0 0 0 / 0.3);
 }
 
@@ -194,8 +199,9 @@ h2.section {
     color: transparent;
 }
 
-.card .meta {
-    padding: var(--space-6) var(--space-6) var(--space-7);
+.card-link {
+    display: block;
+    color: inherit;
 }
 .card .title {
     font-size: var(--text-md);
@@ -204,11 +210,14 @@ h2.section {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    margin: 0;
+    padding: var(--space-6) var(--space-6) 0;
 }
 .card .year {
     color: var(--text-muted);
     font-size: var(--text-xs);
-    margin-top: var(--space-2);
+    margin: var(--space-2) 0 0;
+    padding: 0 var(--space-6) var(--space-7);
 }
 
 /* ── Detail page ───────────────────────────────────────────── */
@@ -248,6 +257,14 @@ h2.section {
     display: flex;
     gap: var(--space-4);
     align-items: center;
+}
+.detail-info {
+    display: block;
+}
+.detail-actions {
+    margin-top: var(--space-8);
+    display: flex;
+    gap: var(--space-5);
 }
 
 /* ── Buttons ───────────────────────────────────────────────── */
@@ -618,7 +635,7 @@ h2.section {
     gap: var(--space-5);
     margin-top: var(--space-7);
 }
-.episode {
+.episode-link {
     display: grid;
     grid-template-columns: 160px 1fr;
     gap: var(--space-7);
@@ -626,11 +643,11 @@ h2.section {
     border-radius: var(--radius-tile);
     background: var(--bg-tile);
     border: var(--stroke-default) solid var(--border-default);
-    cursor: pointer;
+    color: inherit;
     transition: background var(--motion-hover), border-color var(--motion-hover);
     box-shadow: var(--shadow-tile);
 }
-.episode:hover {
+.episode-link:hover {
     background: var(--bg-surface-hover);
     border-color: var(--border-raised);
 }
@@ -647,7 +664,8 @@ h2.section {
 .ep-title {
     font-weight: var(--weight-semibold);
     color: var(--text-primary);
-    margin-bottom: var(--space-3);
+    margin: 0 0 var(--space-3);
+    font-size: var(--text-md);
 }
 .ep-num {
     color: var(--text-muted);
@@ -667,18 +685,54 @@ h2.section {
 }
 
 /* ---- Syncplay rooms dropdown ---- */
+/* search dropdown */
+.search-dd { position: relative; }
+.search-panel {
+    position: absolute;
+    right: 0;
+    top: calc(100% + var(--space-3));
+    background: var(--bg-surface-raised);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-dialog);
+    padding: var(--space-4);
+    min-width: 280px;
+    z-index: 20;
+    box-shadow: var(--shadow-dialog);
+}
+.search-panel input {
+    width: 100%;
+    padding: var(--space-5) var(--space-6);
+    background: var(--bg-input, var(--bg-surface));
+    color: var(--text-primary);
+    border: var(--stroke-default) solid var(--border-default);
+    border-radius: var(--radius-button);
+    font: inherit;
+    font-size: var(--text-md);
+    outline: none;
+}
+.search-panel input:focus {
+    border-color: var(--border-accent);
+}
+
 .rooms-dd { position: relative; }
 .rooms-btn {
-    background: transparent;
-    color: var(--text-primary);
-    border: 1px solid var(--border-raised);
-    padding: var(--space-3) var(--space-4);
+    background: var(--bg-button);
+    color: var(--text-secondary);
+    border: var(--stroke-default) solid var(--border-default);
+    padding: var(--space-4) var(--space-6);
     border-radius: var(--radius-button);
+    font: inherit;
+    font-size: var(--text-sm);
     cursor: pointer;
-    font-size: var(--text-md);
+    transition: background var(--motion-hover), border-color var(--motion-hover);
+    box-shadow: var(--shadow-button);
     white-space: nowrap;
 }
-.rooms-btn:hover { background: var(--bg-hover-subtle); }
+.rooms-btn:hover {
+    background: var(--bg-button-hover);
+    border-color: var(--border-raised);
+    box-shadow: var(--shadow-button-hover);
+}
 .rooms-btn.in-room {
     border-color: var(--border-accent);
     color: var(--text-accent);
@@ -689,7 +743,7 @@ h2.section {
     top: calc(100% + var(--space-3));
     background: var(--bg-surface-raised);
     border: 1px solid var(--border-default);
-    border-radius: var(--radius-button);
+    border-radius: var(--radius-dialog);
     padding: var(--space-4);
     min-width: 280px;
     z-index: 20;

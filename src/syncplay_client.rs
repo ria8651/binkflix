@@ -317,10 +317,11 @@ pub fn RoomNavigator() -> Element {
 #[component]
 pub fn RoomsDropdown() -> Element {
     let ctx = use_room_context();
-    let mut open = use_signal(|| false);
+    let mut open_menu = use_context::<crate::app::OpenMenu>().0;
+    let is_open = *open_menu.read() == Some("rooms");
     let mut rooms = use_resource(move || async move {
-        // Reading `open` in the future body subscribes — opening refetches.
-        let _ = open.read();
+        // Reading `open_menu` in the future body subscribes — opening refetches.
+        let _ = open_menu.read();
         crate::client_api::get_rooms().await
     });
 
@@ -348,22 +349,23 @@ pub fn RoomsDropdown() -> Element {
                 aria_label: "Rooms",
                 title: "{title}",
                 onclick: move |_| {
-                    let cur = *open.read();
-                    open.set(!cur);
-                    if !cur {
+                    if is_open {
+                        open_menu.set(None);
+                    } else {
+                        open_menu.set(Some("rooms"));
                         rooms.restart();
                     }
                 },
                 span { class: "icon", dangerous_inner_html: crate::app::ICON_GROUP }
             }
-            if *open.read() {
+            if is_open {
                 div { class: "rooms-panel",
                     if in_room {
                         button {
                             class: "btn ghost",
                             onclick: move |_| {
                                 ctx.leave();
-                                open.set(false);
+                                open_menu.set(None);
                             },
                             "Leave room"
                         }
@@ -372,7 +374,7 @@ pub fn RoomsDropdown() -> Element {
                             class: "btn",
                             onclick: move |_| {
                                 create_and_join(ctx);
-                                open.set(false);
+                                open_menu.set(None);
                             },
                             "Create new room"
                         }

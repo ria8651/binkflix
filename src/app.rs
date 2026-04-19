@@ -9,6 +9,7 @@ const ICON_CHECK_SMALL: &str = r#"<svg viewBox="0 0 24 24" width="14" height="14
 const ICON_BACK: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>"#;
 const ICON_PLAY_BTN: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>"#;
 pub const ICON_GROUP: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
+const ICON_SEARCH: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>"#;
 
 #[derive(Routable, Clone, PartialEq)]
 #[rustfmt::skip]
@@ -40,14 +41,32 @@ pub fn App() -> Element {
     }
 }
 
+const LOGO_SVG: &str = include_str!("../assets/binkflix.svg");
+
+/// Which topbar dropdown is open. Shared so opening one closes the others.
+#[derive(Clone, Copy, Default)]
+pub struct OpenMenu(pub Signal<Option<&'static str>>);
+
+/// Library search query, read by Home to filter shows/movies.
+#[derive(Clone, Copy, Default)]
+pub struct SearchQuery(pub Signal<String>);
+
 #[component]
 fn Shell() -> Element {
     crate::syncplay_client::provide_room_context();
+    use_context_provider(|| OpenMenu(Signal::new(None)));
+    use_context_provider(|| SearchQuery(Signal::new(String::new())));
 
     rsx! {
         header { class: "topbar",
-            Link { to: Route::Home {}, class: "brand", "BINKFLIX" }
+            Link {
+                to: Route::Home {},
+                class: "brand",
+                aria_label: "Binkflix home",
+                dangerous_inner_html: LOGO_SVG,
+            }
             div { class: "top-right",
+                SearchDropdown {}
                 crate::syncplay_client::RoomsDropdown {}
                 ThemeSwitcher {}
             }
@@ -69,7 +88,8 @@ const THEMES: &[(&str, &str)] = &[
 #[component]
 pub fn ThemeSwitcher() -> Element {
     let mut theme = use_signal(|| "default".to_string());
-    let mut open = use_signal(|| false);
+    let mut open_menu = use_context::<OpenMenu>().0;
+    let is_open = *open_menu.read() == Some("theme");
 
     // On mount: restore from localStorage, then apply current theme.
     use_effect(move || {
@@ -101,7 +121,6 @@ pub fn ThemeSwitcher() -> Element {
         spawn(async move { let _ = document::eval(&js).await; });
     });
 
-    let is_open = *open.read();
     let current_id = theme.read().clone();
 
     rsx! {
@@ -110,7 +129,9 @@ pub fn ThemeSwitcher() -> Element {
                 class: "btn-theme btn-icon",
                 r#type: "button",
                 aria_label: "Theme",
-                onclick: move |_| { let cur = *open.peek(); open.set(!cur); },
+                onclick: move |_| {
+                    open_menu.set(if is_open { None } else { Some("theme") });
+                },
                 span { class: "icon", dangerous_inner_html: ICON_PALETTE }
             }
             if is_open {
@@ -126,7 +147,7 @@ pub fn ThemeSwitcher() -> Element {
                                     r#type: "button",
                                     onclick: move |_| {
                                         theme.set(tid.clone());
-                                        open.set(false);
+                                        open_menu.set(None);
                                     },
                                     span { "{label}" }
                                     if active {
@@ -143,36 +164,83 @@ pub fn ThemeSwitcher() -> Element {
 }
 
 #[component]
+fn SearchDropdown() -> Element {
+    let mut open_menu = use_context::<OpenMenu>().0;
+    let mut query = use_context::<SearchQuery>().0;
+    let is_open = *open_menu.read() == Some("search");
+    let current = query.read().clone();
+
+    rsx! {
+        div { class: "search-dd",
+            button {
+                class: "btn-theme btn-icon",
+                r#type: "button",
+                aria_label: "Search",
+                onclick: move |_| {
+                    open_menu.set(if is_open { None } else { Some("search") });
+                },
+                span { class: "icon", dangerous_inner_html: ICON_SEARCH }
+            }
+            if is_open {
+                div { class: "search-panel",
+                    input {
+                        r#type: "search",
+                        placeholder: "Search shows and movies…",
+                        autofocus: true,
+                        value: "{current}",
+                        oninput: move |e| query.set(e.value()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
 fn Home() -> Element {
     let lib = use_resource(get_library);
+    let query = use_context::<SearchQuery>().0;
+    let q = query.read().to_lowercase();
+    let q = q.trim().to_string();
 
     rsx! {
         match &*lib.read_unchecked() {
-            None => rsx! { div { class: "empty", "Loading…" } },
-            Some(Err(e)) => rsx! { div { class: "empty", "Failed to load: {e}" } },
+            None => rsx! { p { class: "empty", "Loading…" } },
+            Some(Err(e)) => rsx! { p { class: "empty", "Failed to load: {e}" } },
             Some(Ok(lib)) if lib.movies.is_empty() && lib.shows.is_empty() => rsx! {
                 div { class: "empty",
                     p { "Your library is empty." }
                     p { class: "muted", "Add movies and/or shows with .nfo metadata, then restart the server." }
                 }
             },
-            Some(Ok(lib)) => rsx! {
-                if !lib.shows.is_empty() {
-                    section {
-                        h2 { class: "section", "Shows" }
-                        div { class: "grid",
-                            for s in lib.shows.iter().cloned() {
-                                ShowCard { key: "{s.id}", show: s }
+            Some(Ok(lib)) => {
+                let shows: Vec<_> = lib.shows.iter().cloned()
+                    .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
+                    .collect();
+                let movies: Vec<_> = lib.movies.iter().cloned()
+                    .filter(|m| q.is_empty() || m.title.to_lowercase().contains(&q))
+                    .collect();
+                rsx! {
+                    if shows.is_empty() && movies.is_empty() {
+                        p { class: "empty", "No matches for “{q}”." }
+                    }
+                    if !shows.is_empty() {
+                        section {
+                            h2 { class: "section", "Shows" }
+                            div { class: "grid",
+                                for s in shows {
+                                    ShowCard { key: "{s.id}", show: s }
+                                }
                             }
                         }
                     }
-                }
-                if !lib.movies.is_empty() {
-                    section {
-                        h2 { class: "section", "Movies" }
-                        div { class: "grid",
-                            for m in lib.movies.iter().cloned() {
-                                MovieCard { key: "{m.id}", movie: m }
+                    if !movies.is_empty() {
+                        section {
+                            h2 { class: "section", "Movies" }
+                            div { class: "grid",
+                                for m in movies {
+                                    MovieCard { key: "{m.id}", movie: m }
+                                }
                             }
                         }
                     }
@@ -184,24 +252,20 @@ fn Home() -> Element {
 
 #[component]
 fn MovieCard(movie: MovieSummary) -> Element {
-    let nav = use_navigator();
-    let id = movie.id.clone();
     let year = movie.year.map(|y| y.to_string()).unwrap_or_default();
 
     rsx! {
-        div {
-            class: "card",
-            onclick: move |_| { nav.push(Route::MediaDetail { id: id.clone() }); },
-            img {
-                class: "poster",
-                src: "{media_image_url(&movie.id)}",
-                loading: "lazy",
-                decoding: "async",
-                alt: "{movie.title}",
-            }
-            div { class: "meta",
-                div { class: "title", "{movie.title}" }
-                div { class: "year", "{year}" }
+        article { class: "card",
+            Link { to: Route::MediaDetail { id: movie.id.clone() }, class: "card-link",
+                img {
+                    class: "poster",
+                    src: "{media_image_url(&movie.id)}",
+                    loading: "lazy",
+                    decoding: "async",
+                    alt: "{movie.title}",
+                }
+                h3 { class: "title", "{movie.title}" }
+                p { class: "year", "{year}" }
             }
         }
     }
@@ -209,25 +273,21 @@ fn MovieCard(movie: MovieSummary) -> Element {
 
 #[component]
 fn ShowCard(show: ShowSummary) -> Element {
-    let nav = use_navigator();
-    let id = show.id.clone();
     let year = show.year.map(|y| y.to_string()).unwrap_or_default();
     let count = show.episode_count;
 
     rsx! {
-        div {
-            class: "card",
-            onclick: move |_| { nav.push(Route::ShowDetail { id: id.clone() }); },
-            img {
-                class: "poster",
-                src: "{show_poster_url(&show.id)}",
-                loading: "lazy",
-                decoding: "async",
-                alt: "{show.title}",
-            }
-            div { class: "meta",
-                div { class: "title", "{show.title}" }
-                div { class: "year",
+        article { class: "card",
+            Link { to: Route::ShowDetail { id: show.id.clone() }, class: "card-link",
+                img {
+                    class: "poster",
+                    src: "{show_poster_url(&show.id)}",
+                    loading: "lazy",
+                    decoding: "async",
+                    alt: "{show.title}",
+                }
+                h3 { class: "title", "{show.title}" }
+                p { class: "year",
                     "{year}"
                     if !year.is_empty() { " · " }
                     "{count} eps"
@@ -247,10 +307,10 @@ fn MediaDetail(id: String) -> Element {
 
     rsx! {
         match &*media.read_unchecked() {
-            None => rsx! { div { class: "empty", "Loading…" } },
-            Some(Err(e)) => rsx! { div { class: "empty", "Failed to load: {e}" } },
+            None => rsx! { p { class: "empty", "Loading…" } },
+            Some(Err(e)) => rsx! { p { class: "empty", "Failed to load: {e}" } },
             Some(Ok(m)) => rsx! {
-                div { class: "detail",
+                article { class: "detail",
                     div {
                         class: "poster",
                         style: if m.kind == "episode" {
@@ -263,27 +323,27 @@ fn MediaDetail(id: String) -> Element {
                             format!("background-image: url('{}')", media_image_url(&m.id))
                         },
                     }
-                    div {
+                    header { class: "detail-info",
                         h1 { "{m.title}" }
-                        div { class: "meta-row",
+                        p { class: "meta-row",
                             if m.kind == "episode" {
                                 if let (Some(s), Some(e)) = (m.season_number, m.episode_number) {
-                                    span { "S{s:02}E{e:02}" }
+                                    "S{s:02}E{e:02}"
                                 }
                             } else if let Some(y) = m.year {
-                                span { "{y}" }
+                                "{y}"
                             }
                             if let Some(r) = m.runtime_minutes {
-                                span { " · {r} min" }
+                                " · {r} min"
                             }
                         }
                         if let Some(plot) = m.plot.as_deref() {
                             p { class: "plot", "{plot}" }
                         }
-                        div { style: "margin-top: 1.5rem; display: flex; gap: 0.75rem;",
+                        nav { class: "detail-actions",
                             Link { to: Route::MediaPlay { id: m.id.clone() }, class: "btn",
                                 span { dangerous_inner_html: ICON_PLAY_BTN }
-                                span { "Play" }
+                                "Play"
                             }
                             if m.kind == "episode" {
                                 if let Some(sid) = m.show_id.as_deref() {
@@ -308,18 +368,18 @@ fn ShowDetail(id: String) -> Element {
 
     rsx! {
         match &*detail.read_unchecked() {
-            None => rsx! { div { class: "empty", "Loading…" } },
-            Some(Err(e)) => rsx! { div { class: "empty", "Failed to load: {e}" } },
+            None => rsx! { p { class: "empty", "Loading…" } },
+            Some(Err(e)) => rsx! { p { class: "empty", "Failed to load: {e}" } },
             Some(Ok(d)) => rsx! {
-                div { class: "detail",
+                article { class: "detail",
                     div {
                         class: "poster",
                         style: "background-image: url('{show_poster_url(&d.show.id)}')",
                     }
-                    div {
+                    header { class: "detail-info",
                         h1 { "{d.show.title}" }
                         if let Some(y) = d.show.year {
-                            div { class: "meta-row", "{y}" }
+                            p { class: "meta-row", "{y}" }
                         }
                         if let Some(plot) = d.show.plot.as_deref() {
                             p { class: "plot", "{plot}" }
@@ -361,28 +421,25 @@ fn SeasonBlock(show_id: String, season: Season) -> Element {
 
 #[component]
 fn EpisodeRow(episode: EpisodeSummary) -> Element {
-    let nav = use_navigator();
-    let id = episode.id.clone();
-
     rsx! {
-        div {
-            class: "episode",
-            onclick: move |_| { nav.push(Route::MediaPlay { id: id.clone() }); },
-            img {
-                class: "ep-thumb",
-                src: "{media_image_url(&episode.id)}",
-                loading: "lazy",
-                decoding: "async",
-                alt: "",
-            }
-            div { class: "ep-body",
-                div { class: "ep-title",
-                    span { class: "ep-num", "S{episode.season_number:02}E{episode.episode_number:02}" }
-                    " · "
-                    "{episode.title}"
+        article { class: "episode",
+            Link { to: Route::MediaPlay { id: episode.id.clone() }, class: "episode-link",
+                img {
+                    class: "ep-thumb",
+                    src: "{media_image_url(&episode.id)}",
+                    loading: "lazy",
+                    decoding: "async",
+                    alt: "",
                 }
-                if let Some(plot) = episode.plot.as_deref() {
-                    p { class: "ep-plot", "{plot}" }
+                div { class: "ep-body",
+                    h3 { class: "ep-title",
+                        span { class: "ep-num", "S{episode.season_number:02}E{episode.episode_number:02}" }
+                        " · "
+                        "{episode.title}"
+                    }
+                    if let Some(plot) = episode.plot.as_deref() {
+                        p { class: "ep-plot", "{plot}" }
+                    }
                 }
             }
         }
