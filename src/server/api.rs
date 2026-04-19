@@ -1,5 +1,5 @@
 use super::error::{Error, Result};
-use super::{subtitles, thumbnails};
+use super::{media_info, subtitles, thumbnails};
 use super::AppState;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -20,6 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/media/{id}/stream", get(media_stream))
         .route("/api/media/{id}/subtitles", get(media_subtitles))
         .route("/api/media/{id}/subtitle/{track}", get(media_subtitle))
+        .route("/api/media/{id}/tech", get(media_tech))
         .route("/api/media/{id}/image", get(media_image))
         .route("/api/media/{id}/fanart", get(media_fanart))
         .route("/api/shows/{id}", get(show))
@@ -302,6 +303,17 @@ async fn media_subtitle(
         HeaderValue::from_static("private, max-age=3600"),
     );
     Ok((StatusCode::OK, headers, body).into_response())
+}
+
+async fn media_tech(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::types::MediaTechInfo>> {
+    let path = lookup(&state, "SELECT path FROM media WHERE id = ?", &id).await?;
+    let info = media_info::probe(std::path::Path::new(&path))
+        .await
+        .map_err(Error::Other)?;
+    Ok(Json(info))
 }
 
 async fn media_image(

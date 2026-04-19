@@ -204,18 +204,29 @@ fn RescanButton() -> Element {
     let mut open_menu = use_context::<OpenMenu>().0;
     let is_open = *open_menu.read() == Some("rescan");
 
-    // Poll status. Fast while running, slow while idle so we catch scans
-    // started from another tab or triggered by startup.
+    // Fetch once on mount, then only poll while a scan is running OR while
+    // the menu is open. Previously this polled forever every 3s on every
+    // page (including the player), which was wasteful bandwidth and
+    // cluttered the network tab. External scans started in another tab
+    // won't light up the topbar until the user opens the menu — acceptable
+    // tradeoff for a single-user media app.
     use_future(move || async move {
         #[cfg(feature = "web")]
-        loop {
+        {
             if let Ok(s) = get_scan_status().await {
-                let running = s.running;
                 status.set(s);
-                let ms = if running { 500 } else { 3000 };
+            }
+            loop {
+                let should_poll = status.peek().running || *open_menu.read() == Some("rescan");
+                if !should_poll {
+                    gloo_timers::future::TimeoutFuture::new(1500).await;
+                    continue;
+                }
+                let ms = if status.peek().running { 500 } else { 2000 };
                 gloo_timers::future::TimeoutFuture::new(ms).await;
-            } else {
-                gloo_timers::future::TimeoutFuture::new(5000).await;
+                if let Ok(s) = get_scan_status().await {
+                    status.set(s);
+                }
             }
         }
     });

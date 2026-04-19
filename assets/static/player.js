@@ -313,6 +313,54 @@ function initControls(videoId) {
 
     const onProgress = () => updateFill();
 
+    // ── Load / buffer / error state ────────────────────────────
+    //
+    // Drive two CSS classes on the wrap so Rust can show overlays without
+    // round-tripping state through Dioxus for every video event:
+    //   .loading — initial load or waiting on buffer; shows a spinner.
+    //   .errored — <video>'s error event fired; shows the message.
+    //
+    // Error message is written into `.player-error-msg` so Rust can render
+    // the static container once and we just fill the text here. Clearing
+    // .errored when playback recovers (e.g. user switches source) is a
+    // simple "hide on loadstart" — the video element fires that on every
+    // fresh src attach.
+    const errMsgEl = wrap.querySelector(".player-error-msg");
+    const setLoading = (on) => wrap.classList.toggle("loading", !!on);
+    const setError = (msg) => {
+        if (msg) {
+            if (errMsgEl) errMsgEl.textContent = msg;
+            wrap.classList.add("errored");
+            wrap.classList.remove("loading");
+        } else {
+            wrap.classList.remove("errored");
+            if (errMsgEl) errMsgEl.textContent = "";
+        }
+    };
+    const describeError = () => {
+        const e = video.error;
+        if (!e) return "Playback failed.";
+        // MEDIA_ERR_SRC_NOT_SUPPORTED (4) is the big one: container or
+        // codec the browser can't decode. Show the detail message if the
+        // browser gave one.
+        const codes = {
+            1: "Playback aborted.",
+            2: "Network error while loading video.",
+            3: "Video decode error — the stream is corrupt or uses a codec this browser can't decode.",
+            4: "Source or codec not supported by this browser.",
+        };
+        const base = codes[e.code] || `Playback failed (code ${e.code}).`;
+        return e.message ? `${base} (${e.message})` : base;
+    };
+
+    const onLoadStart = () => { setError(null); setLoading(true); };
+    const onWaiting = () => setLoading(true);
+    const onCanPlay = () => setLoading(false);
+    const onPlaying = () => setLoading(false);
+    const onLoadedData = () => setLoading(false);
+    const onStalled = () => setLoading(true);
+    const onError = () => setError(describeError());
+
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTime);
@@ -320,6 +368,21 @@ function initControls(videoId) {
     video.addEventListener("durationchange", onMeta);
     video.addEventListener("volumechange", onVol);
     video.addEventListener("progress", onProgress);
+    video.addEventListener("loadstart", onLoadStart);
+    video.addEventListener("waiting", onWaiting);
+    video.addEventListener("canplay", onCanPlay);
+    video.addEventListener("playing", onPlaying);
+    video.addEventListener("loadeddata", onLoadedData);
+    video.addEventListener("stalled", onStalled);
+    video.addEventListener("error", onError);
+    // If we're initialising after the video already started loading, the
+    // readyState lets us pick the right starting state without waiting for
+    // the next event.
+    if (video.error) {
+        setError(describeError());
+    } else if (video.readyState < 3) {
+        setLoading(true);
+    }
 
     // Stop chrome-button clicks from ever bubbling to the wrap-level listener,
     // which only treats clicks on the video itself as a play/pause toggle.
@@ -464,6 +527,13 @@ function initControls(videoId) {
         video.removeEventListener("durationchange", onMeta);
         video.removeEventListener("volumechange", onVol);
         video.removeEventListener("progress", onProgress);
+        video.removeEventListener("loadstart", onLoadStart);
+        video.removeEventListener("waiting", onWaiting);
+        video.removeEventListener("canplay", onCanPlay);
+        video.removeEventListener("playing", onPlaying);
+        video.removeEventListener("loadeddata", onLoadedData);
+        video.removeEventListener("stalled", onStalled);
+        video.removeEventListener("error", onError);
         playBtn?.removeEventListener("click", onPlayBtn);
         playBtn?.removeEventListener("click", stopBubble);
         playBtn?.removeEventListener("pointerup", blurSelf);
@@ -489,11 +559,56 @@ function initControls(videoId) {
     });
 }
 
+// Runtime playback stats for the debug menu. ffprobe gives us the
+// authoritative codec/bitrate info server-side; this covers what only
+// the browser knows — the rendered resolution (post-scaling),
+// readyState, buffered ranges, dropped frames, playback rate.
+function getDebugStats(videoId) {
+    const video = getVideo(videoId);
+    if (!video) return null;
+    let buffered = 0;
+    try {
+        const b = video.buffered;
+        for (let i = 0; i < b.length; i++) {
+            if (b.start(i) <= video.currentTime && video.currentTime <= b.end(i)) {
+                buffered = b.end(i) - video.currentTime;
+                break;
+            }
+        }
+    } catch (_) { /* ignore */ }
+    let droppedFrames = null, totalFrames = null;
+    try {
+        const q = video.getVideoPlaybackQuality?.();
+        if (q) {
+            droppedFrames = q.droppedVideoFrames;
+            totalFrames = q.totalVideoFrames;
+        }
+    } catch (_) { /* ignore */ }
+    const readyStates = ["HAVE_NOTHING", "HAVE_METADATA", "HAVE_CURRENT_DATA", "HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA"];
+    return {
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+        readyState: readyStates[video.readyState] || String(video.readyState),
+        networkState: video.networkState,
+        buffered_ahead_seconds: Number(buffered.toFixed(1)),
+        current_time: Number(video.currentTime.toFixed(1)),
+        duration: isFinite(video.duration) ? Number(video.duration.toFixed(1)) : null,
+        playback_rate: video.playbackRate,
+        dropped_frames: droppedFrames,
+        total_frames: totalFrames,
+        muted: video.muted,
+        volume: Number(video.volume.toFixed(2)),
+        current_src: video.currentSrc || video.src,
+        error: video.error ? { code: video.error.code, message: video.error.message || null } : null,
+    };
+}
+
 const realApi = {
     setAss,
     setVtt,
     clear: detach,
     initControls,
+    getDebugStats,
 };
 
 const pending = (window.binkflixPlayer && window.binkflixPlayer.__queue) || [];

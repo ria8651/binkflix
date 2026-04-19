@@ -55,6 +55,10 @@ pub async fn get_subtitles(id: &str) -> Result<Vec<SubtitleTrack>, String> {
     fetch_json(&format!("/api/media/{id}/subtitles")).await
 }
 
+pub async fn get_media_tech(id: &str) -> Result<MediaTechInfo, String> {
+    fetch_json(&format!("/api/media/{id}/tech")).await
+}
+
 #[cfg(feature = "web")]
 async fn post_empty<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
     let resp = gloo_net::http::Request::post(url)

@@ -75,6 +75,40 @@ pub struct ShowDetail {
     pub seasons: Vec<Season>,
 }
 
+/// Video/audio technical metadata probed on demand with ffprobe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaTechInfo {
+    pub container: Option<String>,
+    pub duration_seconds: Option<f64>,
+    pub bitrate_kbps: Option<u64>,
+    pub file_size: Option<u64>,
+    pub video: Option<VideoTrackInfo>,
+    pub audio: Vec<AudioTrackInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VideoTrackInfo {
+    pub codec: String,
+    pub profile: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub bitrate_kbps: Option<u64>,
+    pub pix_fmt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioTrackInfo {
+    pub codec: String,
+    pub channels: Option<u32>,
+    pub channel_layout: Option<String>,
+    pub sample_rate_hz: Option<u32>,
+    pub bitrate_kbps: Option<u64>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubtitleTrack {
     pub id: String,
@@ -91,6 +125,7 @@ pub fn media_image_url(id: &str) -> String { format!("/api/media/{id}/image") }
 pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") }
 pub fn media_subtitles_url(id: &str) -> String { format!("/api/media/{id}/subtitles") }
+pub fn media_tech_url(id: &str) -> String { format!("/api/media/{id}/tech") }
 pub fn media_subtitle_url(id: &str, track: &str) -> String {
     format!("/api/media/{id}/subtitle/{track}")
 }

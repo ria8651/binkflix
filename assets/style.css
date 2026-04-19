@@ -691,6 +691,140 @@ h2.section {
     white-space: nowrap;
 }
 
+/* ── Loading / error overlays ─────────────────────────────── */
+.player-loading {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    z-index: 1;
+}
+.video-wrap.loading .player-loading { display: flex; }
+.player-loading .spinner {
+    width: 48px;
+    height: 48px;
+    border-width: 4px;
+}
+
+.player-error {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-5);
+    padding: var(--space-8);
+    background: rgb(0 0 0 / 0.82);
+    color: #fff;
+    text-align: center;
+    z-index: 4;
+}
+.video-wrap.errored .player-error { display: flex; }
+.player-error-icon {
+    font-size: 36px;
+    color: var(--text-error, #ff6b6b);
+    line-height: 1;
+}
+.player-error-title {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    margin-bottom: var(--space-3);
+}
+.player-error-msg {
+    font-size: var(--text-sm);
+    color: rgb(255 255 255 / 0.78);
+    max-width: 32rem;
+}
+
+/* ── Debug / playback info floating panel ────────────────── */
+.debug-panel {
+    position: absolute;
+    top: var(--space-6);
+    right: var(--space-6);
+    width: 340px;
+    max-height: calc(100% - var(--space-10));
+    background: rgb(20 20 20 / 0.95);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgb(255 255 255 / 0.12);
+    border-radius: var(--radius-dialog);
+    color: #fff;
+    box-shadow: 0 12px 32px rgb(0 0 0 / 0.6);
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    font-size: var(--text-sm);
+    pointer-events: auto;
+}
+.debug-panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--space-5) var(--space-6);
+    border-bottom: 1px solid rgb(255 255 255 / 0.08);
+}
+.debug-panel-title {
+    font-weight: 600;
+    color: rgb(255 255 255 / 0.92);
+}
+.debug-panel-close {
+    background: transparent;
+    border: none;
+    color: rgb(255 255 255 / 0.7);
+    font-size: 22px;
+    line-height: 1;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-button);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--motion-hover), color var(--motion-hover);
+    padding: 0;
+}
+.debug-panel-close:hover {
+    background: rgb(255 255 255 / 0.12);
+    color: #fff;
+}
+.debug-panel-body {
+    padding: var(--space-5) 0;
+    overflow-y: auto;
+}
+.player-btn.debug-btn.active { background: rgb(255 255 255 / 0.18); }
+.debug-section + .debug-section {
+    margin-top: var(--space-5);
+    padding-top: var(--space-5);
+    border-top: 1px solid rgb(255 255 255 / 0.08);
+}
+.debug-section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: rgb(255 255 255 / 0.55);
+    padding: 0 var(--space-6) var(--space-3);
+}
+.debug-row {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-6);
+    padding: var(--space-3) var(--space-6);
+    color: rgb(255 255 255 / 0.88);
+}
+.debug-row.muted { color: rgb(255 255 255 / 0.55); }
+.debug-row.error { color: var(--text-error, #ff6b6b); white-space: normal; }
+.debug-label {
+    color: rgb(255 255 255 / 0.6);
+    flex-shrink: 0;
+}
+.debug-value {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    word-break: break-word;
+}
+
 /* ── Seasons / episodes ────────────────────────────────────── */
 
 .season { margin-top: var(--space-10); }

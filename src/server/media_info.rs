@@ -1,0 +1,132 @@
+//! On-demand video/audio technical metadata via `ffprobe`.
+//!
+//! Unlike subtitles (extracted once at scan time and cached in SQLite),
+//! tech info is only relevant when someone opens the debug menu, so we
+//! probe at request time and don't persist. Results are small — a single
+//! ffprobe call takes well under a second on local storage.
+
+use crate::types::{AudioTrackInfo, MediaTechInfo, VideoTrackInfo};
+use serde::Deserialize;
+use std::path::Path;
+use tokio::process::Command;
+
+pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(video)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)?;
+
+    let mut video_track: Option<VideoTrackInfo> = None;
+    let mut audio_tracks: Vec<AudioTrackInfo> = Vec::new();
+
+    for s in &parsed.streams {
+        match s.codec_type.as_str() {
+            "video" => {
+                // Skip cover art / attached pics, which ffprobe also reports
+                // as "video" streams. Rare on TV rips but common on music.
+                if s.disposition.get("attached_pic").copied().unwrap_or(0) != 0 {
+                    continue;
+                }
+                if video_track.is_none() {
+                    video_track = Some(VideoTrackInfo {
+                        codec: s.codec_name.clone(),
+                        profile: s.profile.clone().filter(|s| !s.is_empty()),
+                        width: s.width,
+                        height: s.height,
+                        fps: parse_fps(s.r_frame_rate.as_deref()),
+                        bitrate_kbps: parse_bitrate_kbps(s.bit_rate.as_deref()),
+                        pix_fmt: s.pix_fmt.clone().filter(|s| !s.is_empty()),
+                    });
+                }
+            }
+            "audio" => {
+                audio_tracks.push(AudioTrackInfo {
+                    codec: s.codec_name.clone(),
+                    channels: s.channels,
+                    channel_layout: s.channel_layout.clone().filter(|s| !s.is_empty()),
+                    sample_rate_hz: s.sample_rate.as_deref().and_then(|s| s.parse().ok()),
+                    bitrate_kbps: parse_bitrate_kbps(s.bit_rate.as_deref()),
+                    language: s.tags.get("language").cloned().filter(|s| !s.is_empty()),
+                    title: s.tags.get("title").cloned().filter(|s| !s.is_empty()),
+                    default: s.disposition.get("default").copied().unwrap_or(0) != 0,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(MediaTechInfo {
+        container: parsed.format.format_name.clone().filter(|s| !s.is_empty()),
+        duration_seconds: parsed.format.duration.as_deref().and_then(|s| s.parse().ok()),
+        bitrate_kbps: parse_bitrate_kbps(parsed.format.bit_rate.as_deref()),
+        file_size: parsed.format.size.as_deref().and_then(|s| s.parse().ok()),
+        video: video_track,
+        audio: audio_tracks,
+    })
+}
+
+fn parse_bitrate_kbps(s: Option<&str>) -> Option<u64> {
+    s.and_then(|s| s.parse::<u64>().ok()).map(|bps| bps / 1000)
+}
+
+fn parse_fps(s: Option<&str>) -> Option<f64> {
+    // ffprobe reports `num/den`, e.g. `24000/1001`.
+    let s = s?;
+    let (num, den) = s.split_once('/')?;
+    let n: f64 = num.parse().ok()?;
+    let d: f64 = den.parse().ok()?;
+    if d == 0.0 { return None; }
+    Some(n / d)
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeOutput {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    #[serde(default)]
+    format: ProbeFormat,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProbeFormat {
+    format_name: Option<String>,
+    duration: Option<String>,
+    size: Option<String>,
+    bit_rate: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeStream {
+    #[serde(default)]
+    codec_type: String,
+    #[serde(default)]
+    codec_name: String,
+    profile: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    r_frame_rate: Option<String>,
+    pix_fmt: Option<String>,
+    channels: Option<u32>,
+    channel_layout: Option<String>,
+    sample_rate: Option<String>,
+    bit_rate: Option<String>,
+    #[serde(default)]
+    tags: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    disposition: std::collections::BTreeMap<String, i64>,
+}

@@ -4,6 +4,7 @@
 pub mod api;
 pub mod db;
 pub mod error;
+pub mod media_info;
 pub mod nfo;
 pub mod scanner;
 pub mod subtitles;
