@@ -1031,6 +1031,30 @@ h2.section {
 .search-panel input:focus {
     border-color: var(--border-accent);
 }
+.search-panel { position: relative; }
+.search-panel input { padding-right: calc(var(--space-6) + 24px); }
+.search-clear {
+    position: absolute;
+    right: calc(var(--space-4) + var(--space-3));
+    top: 50%;
+    transform: translateY(-50%);
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    border-radius: 50%;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+}
+.search-clear:hover { background: var(--bg-button); color: var(--text-primary); }
+/* Hide the webkit built-in clear indicator so ours is the only one visible. */
+.search-panel input[type="search"]::-webkit-search-cancel-button { display: none; }
 
 .rooms-dd { position: relative; }
 .rooms-btn {

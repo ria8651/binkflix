@@ -164,13 +164,18 @@ async fn remux_stream(state: &AppState, id: &str, path: &str) -> Result<Response
         .unwrap_or(OutputFamily::Mp4);
 
     let (content_type, format_flag, movflags_flag): (&str, &str, Option<&str>) = match family {
-        // Fragmented MP4 + delay_moov: browser can start playback before
-        // ffmpeg writes the full moov, and -t above populates mvhd with
-        // the real duration so the scrubber shows correct length up-front.
+        // Fragmented MP4 with empty_moov: moov is written up-front (before
+        // any fragments), so we can buffer + patch it inline below. We used
+        // to use delay_moov hoping ffmpeg would write the full duration
+        // there, but under `-c:v copy` the duration written is just the
+        // first fragment's accumulated track_duration — often a single
+        // multi-minute GOP — so the scrubber reported e.g. 4 minutes for a
+        // 2-hour movie. With empty_moov the moov has duration 0, which we
+        // then overwrite with the probed total in `patch_mp4_moov_durations`.
         OutputFamily::Mp4 => (
             "video/mp4",
             "mp4",
-            Some("frag_keyframe+delay_moov+default_base_moof"),
+            Some("frag_keyframe+empty_moov+default_base_moof"),
         ),
         // WebM is natively streamable (Matroska's cues are optional) —
         // no special flags needed. Live mode prevents ffmpeg from
@@ -245,17 +250,87 @@ async fn remux_stream(state: &AppState, id: &str, path: &str) -> Result<Response
     // instant the response body is dropped (client disconnects, switches
     // source, etc.). If we let `child` drop here, ffmpeg would be killed
     // before the first byte is read.
-    let stream = stream::unfold(ReadState { stdout, _child: child }, |mut st| async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        match st.stdout.read(&mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((Ok::<_, std::io::Error>(Bytes::from(buf)), st))
+    //
+    // For MP4 output we also buffer until we've seen the whole `moov` box,
+    // patch its duration fields with the probed total, then switch to raw
+    // pass-through for the fragments that follow. ffmpeg under `-c:v copy`
+    // writes mvhd/tkhd/mdhd/mehd with wrong or zero durations (see the
+    // movflags comment above); without this patch the browser's scrubber
+    // shows the wrong length and refuses to seek past the initial fragment.
+    // WebM output doesn't need this — ffmpeg writes the Matroska Duration
+    // element from its own input probe.
+    let patch_moov = matches!(family, OutputFamily::Mp4);
+    let stream = stream::unfold(
+        StreamState {
+            stdout,
+            _child: child,
+            phase: if patch_moov {
+                Phase::Buffering { buf: Vec::with_capacity(64 * 1024), total_secs: duration }
+            } else {
+                Phase::PassThrough
+            },
+        },
+        |mut st| async move {
+            loop {
+                match st.phase {
+                    Phase::Buffering { mut buf, total_secs } => {
+                        let mut chunk = vec![0u8; 64 * 1024];
+                        match st.stdout.read(&mut chunk).await {
+                            Ok(0) => {
+                                // ffmpeg exited before we finished the moov. Flush
+                                // whatever we buffered so the client sees the error
+                                // the same way it would for a raw stream.
+                                st.phase = Phase::PassThrough;
+                                if buf.is_empty() {
+                                    return None;
+                                }
+                                return Some((Ok::<_, std::io::Error>(Bytes::from(buf)), st));
+                            }
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if let Some(range) = find_top_level_box(&buf, *b"moov") {
+                                    if let Some(secs) = total_secs {
+                                        patch_mp4_moov_durations(&mut buf[range], secs);
+                                    }
+                                    st.phase = Phase::PassThrough;
+                                    return Some((Ok(Bytes::from(buf)), st));
+                                }
+                                // Safety valve: if ffmpeg somehow writes >4MB of
+                                // pre-moov data, stop buffering and stream as-is
+                                // rather than holding memory forever. The client
+                                // will just see the uncorrected duration.
+                                if buf.len() > 4 * 1024 * 1024 {
+                                    st.phase = Phase::PassThrough;
+                                    return Some((Ok(Bytes::from(buf)), st));
+                                }
+                                st.phase = Phase::Buffering { buf, total_secs };
+                                continue;
+                            }
+                            Err(e) => {
+                                st.phase = Phase::Buffering { buf, total_secs };
+                                return Some((Err(e), st));
+                            }
+                        }
+                    }
+                    Phase::PassThrough => {
+                        let mut chunk = vec![0u8; 64 * 1024];
+                        match st.stdout.read(&mut chunk).await {
+                            Ok(0) => return None,
+                            Ok(n) => {
+                                chunk.truncate(n);
+                                st.phase = Phase::PassThrough;
+                                return Some((Ok(Bytes::from(chunk)), st));
+                            }
+                            Err(e) => {
+                                st.phase = Phase::PassThrough;
+                                return Some((Err(e), st));
+                            }
+                        }
+                    }
+                }
             }
-            Err(e) => Some((Err(e), st)),
-        }
-    });
+        },
+    );
 
     let body = Body::from_stream(stream);
     let mut headers = HeaderMap::new();
@@ -278,7 +353,196 @@ async fn remux_stream(state: &AppState, id: &str, path: &str) -> Result<Response
     Ok((StatusCode::OK, headers, body).into_response())
 }
 
-struct ReadState {
+struct StreamState {
     stdout: ChildStdout,
     _child: Child,
+    phase: Phase,
+}
+
+enum Phase {
+    /// Accumulating bytes from ffmpeg until we've seen the complete top-level
+    /// `moov` box, which we then patch in-place before emitting.
+    Buffering { buf: Vec<u8>, total_secs: Option<f64> },
+    /// Moov already emitted (or we gave up) — raw pass-through.
+    PassThrough,
+}
+
+/// Scan a byte buffer as a sequence of ISO-BMFF boxes and return the byte
+/// range of the first top-level box whose type matches `fourcc`, if the
+/// buffer contains the complete box. Returns `None` when the target box
+/// hasn't appeared yet or is still being received.
+fn find_top_level_box(buf: &[u8], fourcc: [u8; 4]) -> Option<std::ops::Range<usize>> {
+    let mut p = 0;
+    while p + 8 <= buf.len() {
+        let size = u32::from_be_bytes(buf[p..p + 4].try_into().ok()?) as usize;
+        let name: [u8; 4] = buf[p + 4..p + 8].try_into().ok()?;
+        let (header_len, box_len) = if size == 1 {
+            if p + 16 > buf.len() {
+                return None;
+            }
+            let large = u64::from_be_bytes(buf[p + 8..p + 16].try_into().ok()?) as usize;
+            (16, large)
+        } else if size == 0 {
+            // Size-0 means "to end of file" — not useful for in-stream seeking.
+            return None;
+        } else {
+            (8, size)
+        };
+        if box_len < header_len {
+            return None;
+        }
+        let end = p.checked_add(box_len)?;
+        if end > buf.len() {
+            return None;
+        }
+        if name == fourcc {
+            return Some(p..end);
+        }
+        p = end;
+    }
+    None
+}
+
+/// Walk every box inside the moov payload (recursing into the known container
+/// boxes) and call `visit` with each leaf box's fourcc and payload slice.
+///
+/// Collected-offset-then-mutate style: walking with a `&mut` closure while
+/// handing out `&mut` slices to the same buffer fights the borrow checker.
+/// Instead we collect (name, payload_range) pairs first, then mutate.
+fn collect_leaf_boxes(
+    buf: &[u8],
+    range: std::ops::Range<usize>,
+    out: &mut Vec<([u8; 4], std::ops::Range<usize>)>,
+) {
+    // These are the ISO-BMFF container boxes we need to descend into to reach
+    // the duration-bearing leaves (mvhd, tkhd, mdhd, mehd).
+    const CONTAINERS: &[&[u8; 4]] = &[b"moov", b"trak", b"mdia", b"mvex", b"edts", b"minf", b"stbl"];
+    let mut p = range.start;
+    while p + 8 <= range.end {
+        let Ok(size_bytes) = buf[p..p + 4].try_into() else { return };
+        let size = u32::from_be_bytes(size_bytes) as usize;
+        let Ok(name_bytes) = buf[p + 4..p + 8].try_into() else { return };
+        let name: [u8; 4] = name_bytes;
+        let (header_len, box_len) = if size == 1 {
+            if p + 16 > range.end {
+                return;
+            }
+            let Ok(lb) = buf[p + 8..p + 16].try_into() else { return };
+            (16, u64::from_be_bytes(lb) as usize)
+        } else if size == 0 {
+            (8, range.end - p)
+        } else {
+            (8, size)
+        };
+        if box_len < header_len || p + box_len > range.end {
+            return;
+        }
+        let payload = (p + header_len)..(p + box_len);
+        if CONTAINERS.iter().any(|c| **c == name) {
+            collect_leaf_boxes(buf, payload, out);
+        } else {
+            out.push((name, payload));
+        }
+        p += box_len;
+    }
+}
+
+/// Rewrite mvhd/tkhd/mdhd/mehd duration fields inside a buffered `moov` box
+/// (including its 8-byte header) so they reflect `total_secs`. ffmpeg writes
+/// these as 0 under `empty_moov` (or wrong under `delay_moov` + `-c:v copy`),
+/// but all the boxes are fixed-width: we can patch durations in-place without
+/// disturbing sizes or sibling offsets. Unknown/malformed shapes are skipped
+/// silently — the stream still plays, just with the original (wrong) values.
+fn patch_mp4_moov_durations(moov: &mut [u8], total_secs: f64) {
+    if moov.len() < 8 || &moov[4..8] != b"moov" {
+        return;
+    }
+    let mut leaves = Vec::new();
+    collect_leaf_boxes(moov, 8..moov.len(), &mut leaves);
+
+    // mvhd holds the movie timescale that mvhd/tkhd/mehd durations are
+    // expressed in. Default to ffmpeg's MOV_TIMESCALE (1000) if somehow absent.
+    let movie_timescale = leaves
+        .iter()
+        .find(|(n, _)| n == b"mvhd")
+        .and_then(|(_, r)| read_fullbox_timescale(&moov[r.clone()], FullboxKind::Mvhd))
+        .unwrap_or(1000);
+    let movie_dur = (total_secs * movie_timescale as f64).round().max(0.0) as u64;
+
+    for (name, range) in &leaves {
+        let slice = &mut moov[range.clone()];
+        match name {
+            b"mvhd" => write_fullbox_duration(slice, FullboxKind::Mvhd, movie_dur),
+            b"tkhd" => write_fullbox_duration(slice, FullboxKind::Tkhd, movie_dur),
+            b"mehd" => write_fullbox_duration(slice, FullboxKind::Mehd, movie_dur),
+            b"mdhd" => {
+                // mdhd uses its own per-track timescale (not the movie's).
+                if let Some(ts) = read_fullbox_timescale(slice, FullboxKind::Mdhd) {
+                    let d = (total_secs * ts as f64).round().max(0.0) as u64;
+                    write_fullbox_duration(slice, FullboxKind::Mdhd, d);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FullboxKind { Mvhd, Tkhd, Mdhd, Mehd }
+
+/// Offsets within a fullbox payload (after the 4-byte version+flags prefix),
+/// for both v0 (32-bit time fields) and v1 (64-bit time fields), to reach the
+/// timescale and duration fields. `None` means the field doesn't exist for
+/// that kind.
+fn fullbox_layout(kind: FullboxKind, version: u8) -> (Option<usize>, Option<(usize, bool)>) {
+    // Returns (timescale_offset, Some((duration_offset, is_64bit))).
+    // All offsets are from the start of the fullbox payload (after version+flags).
+    match (kind, version) {
+        // mvhd v0: creation(4) mod(4) timescale(4) duration(4) ...
+        (FullboxKind::Mvhd, 0) => (Some(4 + 4 + 4), Some((4 + 4 + 4 + 4, false))),
+        // mvhd v1: creation(8) mod(8) timescale(4) duration(8) ...
+        (FullboxKind::Mvhd, _) => (Some(8 + 8), Some((8 + 8 + 4, true))),
+        // tkhd v0: creation(4) mod(4) track_id(4) reserved(4) duration(4) ...
+        (FullboxKind::Tkhd, 0) => (None, Some((4 + 4 + 4 + 4, false))),
+        // tkhd v1: creation(8) mod(8) track_id(4) reserved(4) duration(8) ...
+        (FullboxKind::Tkhd, _) => (None, Some((8 + 8 + 4 + 4, true))),
+        // mdhd v0: creation(4) mod(4) timescale(4) duration(4) ...
+        (FullboxKind::Mdhd, 0) => (Some(4 + 4), Some((4 + 4 + 4, false))),
+        // mdhd v1: creation(8) mod(8) timescale(4) duration(8) ...
+        (FullboxKind::Mdhd, _) => (Some(8 + 8), Some((8 + 8 + 4, true))),
+        // mehd v0: fragment_duration(4) ; v1: fragment_duration(8)
+        (FullboxKind::Mehd, 0) => (None, Some((0, false))),
+        (FullboxKind::Mehd, _) => (None, Some((0, true))),
+    }
+}
+
+fn read_fullbox_timescale(payload: &[u8], kind: FullboxKind) -> Option<u32> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let version = payload[0];
+    let (ts, _) = fullbox_layout(kind, version);
+    let off = 4 + ts?;
+    let slice = payload.get(off..off + 4)?;
+    Some(u32::from_be_bytes(slice.try_into().ok()?))
+}
+
+fn write_fullbox_duration(payload: &mut [u8], kind: FullboxKind, duration: u64) {
+    if payload.len() < 4 {
+        return;
+    }
+    let version = payload[0];
+    let (_, dur) = fullbox_layout(kind, version);
+    let Some((dur_off, is_64)) = dur else { return };
+    let off = 4 + dur_off;
+    if is_64 {
+        if let Some(slot) = payload.get_mut(off..off + 8) {
+            slot.copy_from_slice(&duration.to_be_bytes());
+        }
+    } else {
+        let d32: u32 = duration.try_into().unwrap_or(u32::MAX);
+        if let Some(slot) = payload.get_mut(off..off + 4) {
+            slot.copy_from_slice(&d32.to_be_bytes());
+        }
+    }
 }

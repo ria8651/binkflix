@@ -181,6 +181,15 @@ fn SearchDropdown() -> Element {
     let is_open = *open_menu.read() == Some("search");
     let current = query.read().clone();
 
+    // Clear the query whenever the popover is not open. Covers every close
+    // path (toolbar button toggle, outside-click from OpenMenu, navigation)
+    // without threading a clear call through each of them.
+    use_effect(move || {
+        if *open_menu.read() != Some("search") && !query.read().is_empty() {
+            query.set(String::new());
+        }
+    });
+
     rsx! {
         div { class: "search-dd",
             button {
@@ -195,11 +204,37 @@ fn SearchDropdown() -> Element {
             if is_open {
                 div { class: "search-panel",
                     input {
+                        id: "search-input",
                         r#type: "search",
                         placeholder: "Search shows and movies…",
-                        autofocus: true,
                         value: "{current}",
+                        // Dioxus' `autofocus` attribute only works on initial page
+                        // load; this panel mounts dynamically, so explicitly
+                        // focus via JS once the input is in the DOM.
+                        onmounted: move |_| {
+                            spawn(async move {
+                                let _ = document::eval(
+                                    "document.getElementById('search-input')?.focus();",
+                                ).await;
+                            });
+                        },
                         oninput: move |e| query.set(e.value()),
+                    }
+                    if !current.is_empty() {
+                        button {
+                            class: "search-clear",
+                            r#type: "button",
+                            aria_label: "Clear search",
+                            onclick: move |_| {
+                                query.set(String::new());
+                                spawn(async move {
+                                    let _ = document::eval(
+                                        "document.getElementById('search-input')?.focus();",
+                                    ).await;
+                                });
+                            },
+                            "×"
+                        }
                     }
                 }
             }
