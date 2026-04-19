@@ -1,6 +1,8 @@
 use super::error::{Error, Result};
+use super::{subtitles, thumbnails};
 use super::AppState;
 use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -16,6 +18,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/library", get(library))
         .route("/api/media/{id}", get(media))
         .route("/api/media/{id}/stream", get(media_stream))
+        .route("/api/media/{id}/subtitles", get(media_subtitles))
+        .route("/api/media/{id}/subtitle/{track}", get(media_subtitle))
         .route("/api/media/{id}/image", get(media_image))
         .route("/api/media/{id}/fanart", get(media_fanart))
         .route("/api/shows/{id}", get(show))
@@ -202,13 +206,68 @@ async fn media_stream(
     serve(path, req).await
 }
 
+async fn media_subtitles(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::types::SubtitleTrack>>> {
+    let tracks = subtitles::list_from_db(&state.pool, &id).await.map_err(Error::Other)?;
+    Ok(Json(tracks))
+}
+
+async fn media_subtitle(
+    State(state): State<AppState>,
+    Path((id, track_id)): Path<(String, String)>,
+) -> Result<axum::response::Response> {
+    let (body, content_type) = subtitles::get_from_db(&state.pool, &id, &track_id)
+        .await
+        .map_err(Error::Other)?
+        .ok_or(Error::NotFound)?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    // Subtitle content is immutable for a given media row + track_id;
+    // safe to let browsers cache for a while.
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=3600"),
+    );
+    Ok((StatusCode::OK, headers, body).into_response())
+}
+
 async fn media_image(
     State(state): State<AppState>,
     Path(id): Path<String>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    let path = lookup(&state, "SELECT image_path FROM media WHERE id = ?", &id).await?;
-    serve(path, req).await
+    // Prefer the sidecar image the library ships — it's authoritative
+    // (posters, episode thumbnails). Fall back to the DB-cached generated
+    // thumbnail so we don't hit the source drive on every grid render.
+    let sidecar: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT image_path FROM media WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await?;
+    if let Some((Some(path),)) = sidecar {
+        return serve(path, req).await;
+    }
+
+    if let Some((bytes, mime)) = thumbnails::get_from_db(&state.pool, &id)
+        .await
+        .map_err(Error::Other)?
+    {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(&mime).unwrap_or(HeaderValue::from_static("image/jpeg")),
+        );
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=3600"),
+        );
+        return Ok((StatusCode::OK, headers, bytes).into_response());
+    }
+
+    Err(Error::NotFound)
 }
 
 async fn media_fanart(

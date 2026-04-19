@@ -50,3 +50,7 @@ pub async fn get_media(id: &str) -> Result<Media, String> {
 pub async fn get_show(id: &str) -> Result<ShowDetail, String> {
     fetch_json(&format!("/api/shows/{id}")).await
 }
+
+pub async fn get_subtitles(id: &str) -> Result<Vec<SubtitleTrack>, String> {
+    fetch_json(&format!("/api/media/{id}/subtitles")).await
+}

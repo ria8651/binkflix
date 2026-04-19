@@ -112,8 +112,52 @@ main { padding: 1.5rem; max-width: 1400px; margin: 0 auto; }
     background: black;
     border-radius: var(--radius);
     overflow: hidden;
+    position: relative;
 }
 .video-wrap video { width: 100%; display: block; max-height: calc(100vh - 180px); }
+/* JASSUB positions its own canvas to match the video rect — don't override it.
+   Just make sure the overlay doesn't eat clicks on the controls. */
+.video-wrap .JASSUB { pointer-events: none; }
+
+.player-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.8rem 0 0.4rem;
+    font-size: 0.9rem;
+}
+.player-controls select {
+    background: var(--bg-elev);
+    color: var(--fg);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 4px;
+    padding: 0.35rem 0.6rem;
+    font: inherit;
+}
+.player-controls select:disabled { opacity: 0.6; cursor: wait; }
+
+.spinner {
+    display: inline-block;
+    width: 0.9em;
+    height: 0.9em;
+    border: 2px solid rgba(255,255,255,0.18);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spinner-rotate 0.7s linear infinite;
+    vertical-align: -0.15em;
+}
+@keyframes spinner-rotate {
+    to { transform: rotate(360deg); }
+}
+
+.sub-error {
+    color: #f5a66a;
+    font-size: 0.85rem;
+    max-width: 28rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 .muted { color: var(--muted); }
 .empty { padding: 4rem 1rem; text-align: center; color: var(--muted); }

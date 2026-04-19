@@ -6,7 +6,9 @@ pub mod db;
 pub mod error;
 pub mod nfo;
 pub mod scanner;
+pub mod subtitles;
 pub mod syncplay;
+pub mod thumbnails;
 
 use crate::app::App;
 use axum::Router;
@@ -16,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -91,6 +94,15 @@ async fn run_async() -> anyhow::Result<()> {
         scan_jobs.push((id, path.clone()));
     }
 
+    // Drop any library rows no longer in BINKFLIX_LIBRARY — changing the
+    // env var shouldn't leave orphan shows/media in the DB. Cascading FKs
+    // clean up the child rows (shows → media → subtitles/thumbnails).
+    let active_ids: Vec<i64> = scan_jobs.iter().map(|(id, _)| *id).collect();
+    let removed = scanner::prune_libraries(&pool, &active_ids).await?;
+    if removed > 0 {
+        info!(removed, "pruned libraries no longer configured");
+    }
+
     let scan_pool = pool.clone();
     tokio::spawn(async move {
         for (id, root) in scan_jobs {
@@ -109,8 +121,19 @@ async fn run_async() -> anyhow::Result<()> {
         .merge(syncplay::router())
         .with_state(state);
 
+    // Vendored static files that need stable, unhashed URLs — JASSUB's worker
+    // and wasm can't go through Dioxus's asset pipeline because the JS module
+    // references them by literal path at runtime. Served directly from
+    // `assets/jassub/` so the URLs stay same-origin (CORS-safe for Worker).
+    // Vendored static files that need stable, unhashed URLs — JASSUB's worker
+    // and wasm can't go through Dioxus's asset pipeline because the JS module
+    // references them by literal path at runtime. Same for our own player.js:
+    // the asset pipeline was stripping Content-Type, which browsers reject
+    // for `<script type="module">`. ServeDir sets the right MIME.
     let router = axum::Router::new()
         .serve_dioxus_application(ServeConfig::new(), App)
+        .nest_service("/jassub", ServeDir::new("assets/jassub"))
+        .nest_service("/static", ServeDir::new("assets/static"))
         .merge(my_routes)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());

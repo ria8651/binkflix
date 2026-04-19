@@ -1,7 +1,9 @@
 use super::nfo::{self, EpisodeNfo, MovieNfo};
+use super::{subtitles, thumbnails};
 use chrono::NaiveDateTime;
+use futures::stream::{self, StreamExt};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tracing::{debug, info, warn};
@@ -198,6 +200,14 @@ pub async fn ensure_library(pool: &SqlitePool, name: &str, path: &Path) -> anyho
     Ok(id)
 }
 
+/// Work item carried from the index pass into the asset pass.
+struct AssetJob {
+    media_id: String,
+    video: PathBuf,
+    title: String,
+    has_sidecar_image: bool,
+}
+
 pub async fn scan_library(
     pool: &SqlitePool,
     library_id: i64,
@@ -210,11 +220,46 @@ pub async fn scan_library(
     let mut show_ids: HashMap<PathBuf, String> = HashMap::new();
     let mut stats = ScanStats::default();
 
+    // Dev escape hatch: cap the number of videos processed per scan so a huge
+    // library doesn't slow down iteration. Unset/0 means no cap.
+    let max_videos: Option<usize> = std::env::var("BINKFLIX_MAX_SCAN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+
+    // Parallelism for the asset (subs + thumb) pass. Default is conservative
+    // because many users have their media on slow-random-access storage
+    // (NAS, USB disk) where aggressive concurrency thrashes the drive.
+    let concurrency: usize = std::env::var("BINKFLIX_SCAN_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+
+    let mut videos_seen: usize = 0;
+    let mut asset_jobs: Vec<AssetJob> = Vec::new();
+    // Paths we saw during this walk — used after phase 1 to prune rows for
+    // files/shows that no longer exist on disk. Only safe to act on this
+    // when the walk completed naturally (no MAX_SCAN short-circuit).
+    let mut seen_media_paths: HashSet<String> = HashSet::new();
+    let mut walk_completed = true;
+
+    // --- Phase 1: walk the library and upsert every media/show row. Fast;
+    // finishes before the user has loaded the home page. Asset extraction
+    // is deferred to phase 2 so the library becomes browseable immediately.
     for entry in WalkDir::new(&root).follow_links(true).into_iter().flatten() {
         let path = entry.path();
         if !entry.file_type().is_file() || !is_video(path) {
             continue;
         }
+        if let Some(max) = max_videos {
+            if videos_seen >= max {
+                info!(max, "BINKFLIX_MAX_SCAN reached; stopping scan early");
+                walk_completed = false;
+                break;
+            }
+        }
+        videos_seen += 1;
 
         let abs = match path.canonicalize() {
             Ok(p) => p,
@@ -224,8 +269,9 @@ pub async fn scan_library(
             }
         };
         let file_size = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
+        seen_media_paths.insert(abs.to_string_lossy().into_owned());
 
-        match classify(&abs, &root) {
+        let outcome = match classify(&abs, &root) {
             Classification::Episode(show_dir) => {
                 let show_id = match show_ids.get(&show_dir) {
                     Some(id) => id.clone(),
@@ -237,27 +283,202 @@ pub async fn scan_library(
                     }
                 };
                 match upsert_episode(pool, library_id, &show_id, &abs, file_size).await {
-                    Ok(true) => stats.episodes_indexed += 1,
-                    Ok(false) => stats.episodes_skipped += 1,
-                    Err(e) => warn!(path = %abs.display(), %e, "failed to index episode"),
+                    Ok(Some(out)) => {
+                        if out.needs_assets { stats.episodes_indexed += 1; } else { stats.episodes_skipped += 1; }
+                        Some(out)
+                    }
+                    Ok(None) => { stats.episodes_skipped += 1; None }
+                    Err(e) => { warn!(path = %abs.display(), %e, "failed to index episode"); None }
                 }
             }
             Classification::Movie => {
                 match upsert_movie(pool, library_id, &abs, file_size).await {
-                    Ok(true) => stats.movies_indexed += 1,
-                    Ok(false) => stats.movies_skipped += 1,
-                    Err(e) => warn!(path = %abs.display(), %e, "failed to index movie"),
+                    Ok(Some(out)) => {
+                        if out.needs_assets { stats.movies_indexed += 1; } else { stats.movies_skipped += 1; }
+                        Some(out)
+                    }
+                    Ok(None) => { stats.movies_skipped += 1; None }
+                    Err(e) => { warn!(path = %abs.display(), %e, "failed to index movie"); None }
                 }
+            }
+        };
+
+        if let Some(out) = outcome {
+            if out.needs_assets {
+                let title = abs
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                asset_jobs.push(AssetJob {
+                    media_id: out.id,
+                    video: abs,
+                    title,
+                    has_sidecar_image: out.has_sidecar_image,
+                });
             }
         }
     }
 
+    // --- Prune: rows for files (or whole shows) that no longer exist on
+    // disk. Skipped when MAX_SCAN cut the walk short — we can't distinguish
+    // "deleted from disk" from "beyond the dev cap". Cascading FKs handle
+    // subtitles/thumbnails/genres; shows go via a separate pass after media
+    // so we never orphan a referenced show.
+    if walk_completed {
+        let removed = prune_missing(pool, library_id, &seen_media_paths).await?;
+        if removed > 0 {
+            info!(removed, "pruned rows for deleted files");
+        }
+    }
+
+    let index_elapsed_ms = started.elapsed().as_millis() as u64;
+    info!(
+        movies_indexed = stats.movies_indexed,
+        episodes_indexed = stats.episodes_indexed,
+        pending_assets = asset_jobs.len(),
+        index_elapsed_ms,
+        "library indexed — extracting assets",
+    );
+
+    // --- Phase 2: extract subtitles + thumbnails in parallel. Bounded
+    // concurrency so we don't thrash spinning disks; each job is independent
+    // and writes back to the pool directly.
+    let total = asset_jobs.len();
+    if total > 0 {
+        let assets_started = std::time::Instant::now();
+        let pool = pool.clone();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        stream::iter(asset_jobs.into_iter())
+            .for_each_concurrent(concurrency, |job| {
+                let pool = pool.clone();
+                let done = done.clone();
+                async move {
+                    let job_started = std::time::Instant::now();
+                    let sub_count = match subtitles::scan_for_media(&pool, &job.media_id, &job.video).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!(media_id = %job.media_id, %e, "subtitle scan failed");
+                            0
+                        }
+                    };
+                    if !job.has_sidecar_image {
+                        thumbnails::scan_for_media(&pool, &job.media_id, &job.video).await;
+                    }
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    info!(
+                        progress = format!("{n}/{total}"),
+                        title = %job.title,
+                        subs = sub_count,
+                        thumb = !job.has_sidecar_image,
+                        elapsed_ms = job_started.elapsed().as_millis() as u64,
+                        "assets extracted",
+                    );
+                }
+            })
+            .await;
+        info!(
+            total,
+            assets_elapsed_ms = assets_started.elapsed().as_millis() as u64,
+            "asset extraction complete",
+        );
+    }
+
     info!(
         ?stats,
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        total_elapsed_ms = started.elapsed().as_millis() as u64,
         "scan complete"
     );
     Ok(stats)
+}
+
+// --- prune ---
+
+/// Delete `libraries` rows (and via FK cascade their shows + media +
+/// subtitles + thumbnails) whose id isn't in `active_ids`. Called at
+/// startup after registering the currently-configured library paths.
+pub async fn prune_libraries(pool: &SqlitePool, active_ids: &[i64]) -> anyhow::Result<u64> {
+    // Refuse to wipe everything if the env var is empty — callers already
+    // bail before reaching here, but belt-and-braces.
+    if active_ids.is_empty() {
+        return Ok(0);
+    }
+    // Fetch + filter in Rust rather than building a dynamic `NOT IN (?, ?, …)`
+    // binding list. N is tiny (one per configured library path).
+    let all: Vec<(i64,)> = sqlx::query_as("SELECT id FROM libraries")
+        .fetch_all(pool)
+        .await?;
+    let mut removed: u64 = 0;
+    for (id,) in all {
+        if active_ids.contains(&id) {
+            continue;
+        }
+        let res = sqlx::query("DELETE FROM libraries WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        removed += res.rows_affected();
+        debug!(library_id = id, "pruned library");
+    }
+    Ok(removed)
+}
+
+
+/// Delete media rows in this library whose path wasn't seen during the walk,
+/// then drop any show whose entire episode set has vanished.
+///
+/// Returns the total number of rows removed (media + shows). FK cascades
+/// clean up subtitles, thumbnails, and media_genres automatically.
+async fn prune_missing(
+    pool: &SqlitePool,
+    library_id: i64,
+    seen: &HashSet<String>,
+) -> anyhow::Result<u64> {
+    let existing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, path FROM media WHERE library_id = ?",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+
+    let to_delete: Vec<String> = existing
+        .into_iter()
+        .filter(|(_, p)| !seen.contains(p))
+        .map(|(id, _)| id)
+        .collect();
+
+    let mut removed: u64 = 0;
+    for id in &to_delete {
+        let res = sqlx::query("DELETE FROM media WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        removed += res.rows_affected();
+        debug!(media_id = %id, "pruned media");
+    }
+
+    // Shows whose every episode is gone. We don't track seen show dirs
+    // separately because a show can legitimately have zero rows if its
+    // episodes were all just deleted — that's the case we want to act on.
+    let orphan_shows: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM shows
+         WHERE library_id = ?
+           AND NOT EXISTS (SELECT 1 FROM media WHERE media.show_id = shows.id)",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+
+    for (id,) in &orphan_shows {
+        let res = sqlx::query("DELETE FROM shows WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        removed += res.rows_affected();
+        debug!(show_id = %id, "pruned empty show");
+    }
+
+    Ok(removed)
 }
 
 // --- upserts ---
@@ -341,13 +562,25 @@ async fn upsert_show(
     Ok((id, true))
 }
 
+/// Returned by `upsert_episode` / `upsert_movie`.
+///
+/// `needs_assets = true` means we re-indexed the row (new or changed), so
+/// the caller should (re)extract subtitles + thumbnails for it.
+/// `has_sidecar_image` lets the caller skip thumbnail generation when the
+/// library already supplies one.
+pub struct UpsertOutcome {
+    pub id: String,
+    pub needs_assets: bool,
+    pub has_sidecar_image: bool,
+}
+
 async fn upsert_episode(
     pool: &SqlitePool,
     library_id: i64,
     show_id: &str,
     video: &Path,
     file_size: i64,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<UpsertOutcome>> {
     let path_str = video.to_string_lossy().into_owned();
     let base = video.file_stem().and_then(|s| s.to_str()).unwrap_or("episode");
     let nfo_path = video.with_extension("nfo");
@@ -360,13 +593,18 @@ async fn upsert_episode(
             .fetch_optional(pool)
             .await?;
 
-    if let Some((_id, scanned_at, existing_size)) = &existing {
+    if let Some((id, scanned_at, existing_size)) = &existing {
         let mut sources: Vec<&Path> = vec![video];
         if let Some(n) = nfo_opt.as_ref() {
             sources.push(n);
         }
         if *existing_size == file_size && !any_newer_than(&sources, scanned_at) {
-            return Ok(false);
+            // Unchanged — still report the id so the caller can decide.
+            return Ok(Some(UpsertOutcome {
+                id: id.clone(),
+                needs_assets: false,
+                has_sidecar_image: find_episode_thumb(video).is_some(),
+            }));
         }
     }
 
@@ -381,7 +619,7 @@ async fn upsert_episode(
             Some((s, e)) => (s, e),
             None => {
                 warn!(file = base, "cannot determine season/episode; skipping");
-                return Ok(false);
+                return Ok(None);
             }
         },
     };
@@ -441,7 +679,11 @@ async fn upsert_episode(
         .await?;
 
     debug!(title, season, episode, "indexed episode");
-    Ok(true)
+    Ok(Some(UpsertOutcome {
+        id,
+        needs_assets: true,
+        has_sidecar_image: thumb.is_some(),
+    }))
 }
 
 async fn upsert_movie(
@@ -449,7 +691,7 @@ async fn upsert_movie(
     library_id: i64,
     video: &Path,
     file_size: i64,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<UpsertOutcome>> {
     let path_str = video.to_string_lossy().into_owned();
     let base = video.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
     let nfo_path = matching_nfo(video);
@@ -460,13 +702,17 @@ async fn upsert_movie(
             .fetch_optional(pool)
             .await?;
 
-    if let Some((_id, scanned_at, existing_size)) = &existing {
+    if let Some((id, scanned_at, existing_size)) = &existing {
         let mut sources: Vec<&Path> = vec![video];
         if let Some(n) = nfo_path.as_ref() {
             sources.push(n);
         }
         if *existing_size == file_size && !any_newer_than(&sources, scanned_at) {
-            return Ok(false);
+            return Ok(Some(UpsertOutcome {
+                id: id.clone(),
+                needs_assets: false,
+                has_sidecar_image: find_movie_image(video).is_some(),
+            }));
         }
     }
 
@@ -539,5 +785,9 @@ async fn upsert_movie(
     }
 
     debug!(title, "indexed movie");
-    Ok(true)
+    Ok(Some(UpsertOutcome {
+        id,
+        needs_assets: true,
+        has_sidecar_image: image.is_some(),
+    }))
 }

@@ -17,6 +17,7 @@ gloo-net = { version = "0.6", features = ["http"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["HtmlMediaElement", "HtmlVideoElement"] }
 tracing-wasm = { version = "0.2", optional = true }
+tracing = { version = "0.1", optional = true }
 
 # --- server-only (native) ---
 tokio = { version = "1", features = ["full"], optional = true }
@@ -26,7 +27,6 @@ tower-http = { version = "0.6", features = ["fs", "trace", "cors"], optional = t
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize"], optional = true }
 walkdir = { version = "2", optional = true }
-tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
@@ -35,7 +35,7 @@ dotenvy = { version = "0.15", optional = true }
 
 [features]
 default = []
-web    = ["dioxus/web", "dep:gloo-net", "dep:wasm-bindgen", "dep:web-sys", "dep:tracing-wasm"]
+web    = ["dioxus/web", "dep:gloo-net", "dep:wasm-bindgen", "dep:web-sys", "dep:tracing-wasm", "dep:tracing"]
 server = [
     "dioxus/server",
     "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",

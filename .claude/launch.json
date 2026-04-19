@@ -5,13 +5,15 @@
       "name": "dx serve (fullstack, HMR)",
       "runtimeExecutable": "dx",
       "runtimeArgs": ["serve", "--port", "9356"],
-      "port": 9356
+      "port": 9356,
+      "autoPort": true
     },
     {
       "name": "cargo run (server only, no web)",
       "runtimeExecutable": "cargo",
       "runtimeArgs": ["run", "--features", "server"],
-      "port": 9356
+      "port": 9356,
+      "autoPort": true
     }
   ]
 }

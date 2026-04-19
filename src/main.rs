@@ -18,8 +18,16 @@ fn main() {
 
     #[cfg(all(feature = "web", not(feature = "server")))]
     {
+        // Default tracing_wasm is TRACE, which floods the devtools console with
+        // Dioxus-internal diff/signal chatter. Pin to WARN so the console stays
+        // usable.
         #[cfg(target_arch = "wasm32")]
-        tracing_wasm::set_as_global_default();
+        {
+            let config = tracing_wasm::WASMLayerConfigBuilder::new()
+                .set_max_level(tracing::Level::WARN)
+                .build();
+            tracing_wasm::set_as_global_default_with_config(config);
+        }
         dioxus::launch(App);
     }
 }

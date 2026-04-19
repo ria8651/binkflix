@@ -75,10 +75,25 @@ pub struct ShowDetail {
     pub seasons: Vec<Season>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubtitleTrack {
+    pub id: String,
+    /// "ass" (render with JASSUB) or "vtt" (native <track>).
+    pub format: String,
+    pub language: String,
+    pub label: String,
+    pub default: bool,
+    pub forced: bool,
+}
+
 // URL builders — relative paths work through dx proxy and same-origin alike.
 pub fn media_image_url(id: &str) -> String { format!("/api/media/{id}/image") }
 pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") }
+pub fn media_subtitles_url(id: &str) -> String { format!("/api/media/{id}/subtitles") }
+pub fn media_subtitle_url(id: &str, track: &str) -> String {
+    format!("/api/media/{id}/subtitle/{track}")
+}
 
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
 pub fn show_fanart_url(id: &str) -> String { format!("/api/shows/{id}/fanart") }
