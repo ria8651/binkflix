@@ -1,0 +1,10 @@
+**/target
+/data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+.claude/settings.local.json
+.claude/worktrees/

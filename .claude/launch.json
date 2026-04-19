@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dx serve (fullstack, HMR)",
+      "runtimeExecutable": "dx",
+      "runtimeArgs": ["serve", "--port", "9356"],
+      "port": 9356
+    },
+    {
+      "name": "cargo run (server only, no web)",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "--features", "server"],
+      "port": 9356
+    }
+  ]
+}

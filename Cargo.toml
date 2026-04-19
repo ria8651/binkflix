@@ -1,0 +1,50 @@
+[package]
+name = "binkflix"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["fullstack", "router"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+futures = "0.3"
+
+# --- web-only (wasm client) ---
+gloo-net = { version = "0.6", features = ["http"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["HtmlMediaElement", "HtmlVideoElement"] }
+tracing-wasm = { version = "0.2", optional = true }
+
+# --- server-only (native) ---
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", features = ["ws", "macros"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"], optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono"], optional = true }
+quick-xml = { version = "0.37", features = ["serialize"], optional = true }
+walkdir = { version = "2", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
+dashmap = { version = "6", optional = true }
+dotenvy = { version = "0.15", optional = true }
+
+[features]
+default = []
+web    = ["dioxus/web", "dep:gloo-net", "dep:wasm-bindgen", "dep:web-sys", "dep:tracing-wasm"]
+server = [
+    "dioxus/server",
+    "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",
+    "dep:sqlx", "dep:quick-xml", "dep:walkdir",
+    "dep:tracing", "dep:tracing-subscriber",
+    "dep:chrono", "dep:uuid", "dep:dashmap", "dep:dotenvy",
+]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

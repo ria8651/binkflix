@@ -1,0 +1,13 @@
+[application]
+name = "binkflix"
+
+[web.app]
+title = "Binkflix"
+base_path = "/"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+
+# No proxy needed: with fullstack, `dx serve --fullstack` runs the axum server
+# and the WASM client together (same origin). Proxies are only for split dev.
