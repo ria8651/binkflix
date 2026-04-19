@@ -58,7 +58,16 @@ fn Shell() -> Element {
     use_context_provider(|| OpenMenu(Signal::new(None)));
     use_context_provider(|| SearchQuery(Signal::new(String::new())));
 
+    let mut open_menu = use_context::<OpenMenu>().0;
+    let menu_open = open_menu.read().is_some();
+
     rsx! {
+        if menu_open {
+            div {
+                class: "menu-backdrop",
+                onclick: move |_| open_menu.set(None),
+            }
+        }
         header { class: "topbar",
             Link {
                 to: Route::Home {},

@@ -342,6 +342,13 @@ pub fn RoomsDropdown() -> Element {
     };
     let _ = viewers;
 
+    let current_media_title = current_state.as_ref().map(|s| s.media_id.clone());
+    let short_id: Option<String> = ctx
+        .room_id
+        .read()
+        .clone()
+        .map(|id| id.chars().take(6).collect());
+
     rsx! {
         div { class: "rooms-dd",
             button {
@@ -357,37 +364,67 @@ pub fn RoomsDropdown() -> Element {
                     }
                 },
                 span { class: "icon", dangerous_inner_html: crate::app::ICON_GROUP }
+                if in_room {
+                    span { class: "rooms-badge", "{viewers}" }
+                }
             }
             if is_open {
                 div { class: "rooms-panel",
+                    div { class: "rooms-head",
+                        span { class: "rooms-title", "Watch party" }
+                        if in_room {
+                            span { class: "rooms-pill", "Live · {viewers}" }
+                        }
+                    }
+
                     if in_room {
-                        button {
-                            class: "btn ghost",
-                            onclick: move |_| {
-                                ctx.leave();
-                                open_menu.set(None);
-                            },
-                            "Leave room"
+                        div { class: "rooms-current",
+                            div { class: "rooms-current-main",
+                                span { class: "rooms-current-label",
+                                    if let Some(t) = current_media_title.as_deref() {
+                                        "{t}"
+                                    } else {
+                                        "Idle — no media playing"
+                                    }
+                                }
+                                if let Some(sid) = short_id.as_deref() {
+                                    span { class: "rooms-current-id", "Room {sid}…" }
+                                }
+                            }
+                            button {
+                                class: "rooms-leave",
+                                r#type: "button",
+                                onclick: move |_| {
+                                    ctx.leave();
+                                    open_menu.set(None);
+                                },
+                                "Leave"
+                            }
                         }
                     } else {
                         button {
-                            class: "btn",
+                            class: "rooms-create",
+                            r#type: "button",
                             onclick: move |_| {
                                 create_and_join(ctx);
                                 open_menu.set(None);
                             },
-                            "Create new room"
+                            span { class: "rooms-plus", "＋" }
+                            span { "Create new room" }
                         }
-                        div { class: "rooms-sep" }
-                        match &*rooms.read_unchecked() {
-                            None => rsx! { div { class: "muted", "Loading…" } },
-                            Some(Err(e)) => rsx! { div { class: "muted", "Error: {e}" } },
-                            Some(Ok(list)) if list.is_empty() => rsx! {
-                                div { class: "muted", "No rooms yet" }
-                            },
-                            Some(Ok(list)) => rsx! {
-                                for r in list.iter().cloned() {
-                                    RoomRow { key: "{r.id}", room: r }
+
+                        div { class: "rooms-section-label", "Active rooms" }
+                        div { class: "rooms-list",
+                            match &*rooms.read_unchecked() {
+                                None => rsx! { div { class: "rooms-empty", "Loading…" } },
+                                Some(Err(e)) => rsx! { div { class: "rooms-empty error", "Error: {e}" } },
+                                Some(Ok(list)) if list.is_empty() => rsx! {
+                                    div { class: "rooms-empty", "No active rooms" }
+                                },
+                                Some(Ok(list)) => rsx! {
+                                    for r in list.iter().cloned() {
+                                        RoomRow { key: "{r.id}", room: r }
+                                    }
                                 }
                             }
                         }
@@ -401,22 +438,30 @@ pub fn RoomsDropdown() -> Element {
 #[component]
 fn RoomRow(room: RoomListItem) -> Element {
     let ctx = use_room_context();
-    let label = room
-        .current_media_title
-        .clone()
-        .unwrap_or_else(|| "idle".to_string());
+    let (label, is_idle) = match room.current_media_title.clone() {
+        Some(t) => (t, false),
+        None => ("Idle".to_string(), true),
+    };
     let id = room.id.clone();
+    let short: String = room.id.chars().take(6).collect();
     rsx! {
-        div { class: "rooms-row",
-            span { class: "room-label", "{label}" }
-            span { class: "muted", " · {room.viewers} viewer(s)" }
-            button {
-                class: "btn small",
-                onclick: move |_| {
-                    join_room(ctx, id.clone());
-                },
-                "Join"
+        button {
+            class: "rooms-row",
+            r#type: "button",
+            onclick: move |_| {
+                join_room(ctx, id.clone());
+            },
+            span { class: "rooms-row-main",
+                span {
+                    class: if is_idle { "rooms-row-title muted" } else { "rooms-row-title" },
+                    "{label}"
+                }
+                span { class: "rooms-row-meta",
+                    "Room {short}… · {room.viewers} viewer"
+                    if room.viewers != 1 { "s" }
+                }
             }
+            span { class: "rooms-row-join", "Join" }
         }
     }
 }
