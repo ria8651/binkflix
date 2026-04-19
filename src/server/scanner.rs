@@ -1,14 +1,24 @@
 use super::nfo::{self, EpisodeNfo, MovieNfo};
 use super::{subtitles, thumbnails};
+use crate::types::ScanProgress;
 use chrono::NaiveDateTime;
 use futures::stream::{self, StreamExt};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+pub type ProgressHandle = Arc<RwLock<ScanProgress>>;
+
+async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)) {
+    let mut p = handle.write().await;
+    f(&mut p);
+}
 
 const VIDEO_EXTENSIONS: &[&str] =
     &["mkv", "mp4", "m4v", "avi", "mov", "webm", "ts", "m2ts", "wmv", "flv"];
@@ -213,8 +223,27 @@ pub async fn scan_library(
     library_id: i64,
     root: &Path,
 ) -> anyhow::Result<ScanStats> {
+    scan_library_with_progress(pool, library_id, root, None).await
+}
+
+pub async fn scan_library_with_progress(
+    pool: &SqlitePool,
+    library_id: i64,
+    root: &Path,
+    progress: Option<ProgressHandle>,
+) -> anyhow::Result<ScanStats> {
     let started = std::time::Instant::now();
     info!(path = %root.display(), "scanning library");
+    let root_display = root.display().to_string();
+    if let Some(p) = &progress {
+        set_progress(p, |s| {
+            s.phase = "indexing".into();
+            s.done = 0;
+            s.total = 0;
+            s.current = Some(root_display.clone());
+        })
+        .await;
+    }
     let root = root.canonicalize()?;
 
     let mut show_ids: HashMap<PathBuf, String> = HashMap::new();
@@ -260,6 +289,18 @@ pub async fn scan_library(
             }
         }
         videos_seen += 1;
+        if let Some(p) = &progress {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            set_progress(p, |s| {
+                s.done = videos_seen;
+                s.current = Some(name);
+            })
+            .await;
+        }
 
         let abs = match path.canonicalize() {
             Ok(p) => p,
@@ -345,14 +386,25 @@ pub async fn scan_library(
     // concurrency so we don't thrash spinning disks; each job is independent
     // and writes back to the pool directly.
     let total = asset_jobs.len();
+    if let Some(p) = &progress {
+        set_progress(p, |s| {
+            s.phase = "assets".into();
+            s.done = 0;
+            s.total = total;
+            s.current = None;
+        })
+        .await;
+    }
     if total > 0 {
         let assets_started = std::time::Instant::now();
         let pool = pool.clone();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress = progress.clone();
         stream::iter(asset_jobs.into_iter())
             .for_each_concurrent(concurrency, |job| {
                 let pool = pool.clone();
                 let done = done.clone();
+                let progress = progress.clone();
                 async move {
                     let job_started = std::time::Instant::now();
                     let sub_count = match subtitles::scan_for_media(&pool, &job.media_id, &job.video).await {
@@ -366,6 +418,14 @@ pub async fn scan_library(
                         thumbnails::scan_for_media(&pool, &job.media_id, &job.video).await;
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some(p) = &progress {
+                        let title = job.title.clone();
+                        set_progress(p, |s| {
+                            s.done = n;
+                            s.current = Some(title);
+                        })
+                        .await;
+                    }
                     info!(
                         progress = format!("{n}/{total}"),
                         title = %job.title,

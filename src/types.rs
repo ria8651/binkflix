@@ -122,6 +122,25 @@ pub struct CreateRoomResp {
     pub id: String,
 }
 
+/// Live status of a library scan. Polled by the UI to drive the rescan button
+/// and progress bar. `total` is 0 until phase 1 finishes (we don't know the
+/// asset-job count yet).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ScanProgress {
+    pub running: bool,
+    pub phase: String,
+    pub done: usize,
+    pub total: usize,
+    pub current: Option<String>,
+    pub message: Option<String>,
+    /// Unix seconds when the last scan finished. None before the first run.
+    pub last_finished_at: Option<i64>,
+    /// Human summary of the last completed scan (e.g. "12 indexed · 4 skipped").
+    pub last_summary: Option<String>,
+    /// Elapsed time of the last completed scan.
+    pub last_elapsed_ms: Option<u64>,
+}
+
 /// Messages a client sends to the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

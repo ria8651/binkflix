@@ -27,6 +27,38 @@ pub fn router() -> Router<AppState> {
         .route("/api/shows/{id}/fanart", get(show_fanart))
         .route("/api/shows/{id}/seasons/{n}/poster", get(season_poster))
         .route("/api/rooms", get(list_rooms).post(create_room))
+        .route("/api/scan", axum::routing::post(start_scan))
+        .route("/api/scan/status", get(scan_status))
+}
+
+async fn scan_status(State(state): State<AppState>) -> Json<crate::types::ScanProgress> {
+    Json(state.scan_progress.read().await.clone())
+}
+
+async fn start_scan(State(state): State<AppState>) -> Json<crate::types::ScanProgress> {
+    // Already running? Just return current status.
+    if state.scan_progress.read().await.running {
+        return Json(state.scan_progress.read().await.clone());
+    }
+    let pool = state.pool.clone();
+    let progress = state.scan_progress.clone();
+    let lock = state.scan_lock.clone();
+    let libs = state.libraries.clone();
+    // Mark running immediately so the client sees `running: true` on return.
+    {
+        let mut p = progress.write().await;
+        p.running = true;
+        p.phase = "starting".into();
+        p.done = 0;
+        p.total = 0;
+        p.current = None;
+        p.message = None;
+    }
+    tokio::spawn(async move {
+        let _guard = lock.lock().await;
+        super::run_scans(&pool, &libs, progress).await;
+    });
+    Json(state.scan_progress.read().await.clone())
 }
 
 // ---- Syncplay rooms ----

@@ -89,3 +89,11 @@ pub async fn get_rooms() -> Result<Vec<RoomListItem>, String> {
 pub async fn create_room() -> Result<CreateRoomResp, String> {
     post_empty("/api/rooms").await
 }
+
+pub async fn get_scan_status() -> Result<ScanProgress, String> {
+    fetch_json("/api/scan/status").await
+}
+
+pub async fn start_scan() -> Result<ScanProgress, String> {
+    post_empty("/api/scan").await
+}

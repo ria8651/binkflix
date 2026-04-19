@@ -8,6 +8,7 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
 
 - **Library scanning** — walks one or more roots, classifies each video as movie or episode by looking at its NFO root element (`<movie>` / `<tvshow>` / `<episodedetails>`), falls back to ancestor `tvshow.nfo` or `SxxEyy` filenames.
 - **Incremental rescans** — mtime + file_size check per row, so restarts after the first scan are near-instant.
+- **On-demand rescan with live progress** — topbar refresh button triggers a scan without restarting; dropdown shows current phase (indexing / asset extraction), `done/total`, the file being worked on, and a summary of the previous scan.
 - **Shows grouped by show → season** — seasons collapse automatically, with season posters when present.
 - **HTTP range streaming** — proper 206 responses; any browser-native `<video>` client (or VLC) works.
 - **Custom video player** — fullscreen page, overlay controls that auto-hide after 2s of idle playback. Scrubber shows played + buffered ranges; volume slider shows fill. Keyboard shortcuts: space/`k` play-pause, `←`/`→` seek ±5s, `↑`/`↓` volume, `m` mute, `f` fullscreen. Subtitle track picker integrated into the chrome (ASS via JASSUB, VTT via native `<track>`).
@@ -62,6 +63,24 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
 3. Open http://localhost:9356
 
 For a standalone backend (no UI rebuild) use `cargo run --features server`.
+
+## Docker
+
+Build the image and run it, mounting your media read-only and a host dir for the SQLite DB:
+
+```sh
+docker build -t binkflix .
+
+docker run -d --name binkflix \
+  -p 9356:9356 \
+  -v "$PWD/data:/data" \
+  -v /path/to/shows:/media/shows:ro \
+  -v /path/to/movies:/media/movies:ro \
+  -e BINKFLIX_LIBRARY=/media/shows:/media/movies \
+  binkflix
+```
+
+`BINKFLIX_DB` defaults to `/data/binkflix.db` and `BINKFLIX_BIND` to `0.0.0.0:9356` inside the image — override with `-e` if you need to.
 
 ## Layout
 
@@ -129,6 +148,8 @@ See [.env.example](.env.example). Short version:
 - `GET /api/rooms` — active syncplay rooms with viewer counts
 - `POST /api/rooms` — create an empty room, returns `{ id }`
 - `WS  /api/syncplay/:room` — play/pause/seek/set_media/heartbeat hub
+- `POST /api/scan` — trigger a rescan in the background (no-op if already running)
+- `GET /api/scan/status` — live progress `{ running, phase, done, total, current, last_summary, last_elapsed_ms, … }`
 
 ## License
 

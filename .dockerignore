@@ -1,0 +1,12 @@
+target
+data
+.env
+.git
+.claude
+.DS_Store
+**/.DS_Store
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.worktreeinclude

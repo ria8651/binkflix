@@ -11,12 +11,14 @@ pub mod syncplay;
 pub mod thumbnails;
 
 use crate::app::App;
+use crate::types::ScanProgress;
 use axum::Router;
 use dioxus::prelude::{DioxusRouterExt, ServeConfig};
 use sqlx::SqlitePool;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
@@ -27,10 +29,82 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 pub struct AppState {
     pub pool: SqlitePool,
     pub hub: Arc<syncplay::Hub>,
+    pub scan_progress: scanner::ProgressHandle,
+    pub scan_lock: Arc<Mutex<()>>,
+    pub libraries: Arc<Vec<(i64, PathBuf)>>,
 }
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// Runs each library scan serially, updating the shared progress handle so
+/// the UI's rescan button has live feedback. Clears `running` when done.
+pub async fn run_scans(
+    pool: &SqlitePool,
+    jobs: &[(i64, PathBuf)],
+    progress: scanner::ProgressHandle,
+) {
+    let started = std::time::Instant::now();
+    // Preserve last_* across runs so the UI can keep showing the previous
+    // summary until this scan replaces it.
+    let (prev_finished, prev_summary, prev_elapsed) = {
+        let p = progress.read().await;
+        (p.last_finished_at, p.last_summary.clone(), p.last_elapsed_ms)
+    };
+    {
+        let mut p = progress.write().await;
+        *p = ScanProgress {
+            running: true,
+            phase: "starting".into(),
+            done: 0,
+            total: 0,
+            current: None,
+            message: None,
+            last_finished_at: prev_finished,
+            last_summary: prev_summary,
+            last_elapsed_ms: prev_elapsed,
+        };
+    }
+    let mut agg = scanner::ScanStats::default();
+    let mut err: Option<String> = None;
+    for (id, root) in jobs {
+        match scanner::scan_library_with_progress(pool, *id, root, Some(progress.clone())).await {
+            Ok(s) => {
+                agg.movies_indexed += s.movies_indexed;
+                agg.movies_skipped += s.movies_skipped;
+                agg.episodes_indexed += s.episodes_indexed;
+                agg.episodes_skipped += s.episodes_skipped;
+                agg.shows_indexed += s.shows_indexed;
+                agg.shows_skipped += s.shows_skipped;
+            }
+            Err(e) => {
+                tracing::error!(%e, root = %root.display(), "scan failed");
+                err = Some(format!("scan failed: {e}"));
+            }
+        }
+    }
+    let indexed = agg.movies_indexed + agg.episodes_indexed + agg.shows_indexed;
+    let skipped = agg.movies_skipped + agg.episodes_skipped + agg.shows_skipped;
+    let summary = if indexed == 0 && skipped == 0 {
+        "nothing to scan".to_string()
+    } else if indexed == 0 {
+        format!("everything up to date ({skipped} unchanged)")
+    } else {
+        format!("{indexed} indexed · {skipped} unchanged")
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut p = progress.write().await;
+    p.running = false;
+    p.phase = "idle".into();
+    p.current = None;
+    p.message = err;
+    p.last_finished_at = Some(now);
+    p.last_summary = Some(summary);
+    p.last_elapsed_ms = Some(started.elapsed().as_millis() as u64);
 }
 
 pub fn run() {
@@ -103,16 +177,28 @@ async fn run_async() -> anyhow::Result<()> {
         info!(removed, "pruned libraries no longer configured");
     }
 
-    let scan_pool = pool.clone();
-    tokio::spawn(async move {
-        for (id, root) in scan_jobs {
-            if let Err(e) = scanner::scan_library(&scan_pool, id, &root).await {
-                tracing::error!(%e, root = %root.display(), "scan failed");
-            }
-        }
-    });
+    let scan_progress: scanner::ProgressHandle = Arc::new(RwLock::new(ScanProgress::default()));
+    let scan_lock = Arc::new(Mutex::new(()));
+    let libraries = Arc::new(scan_jobs.clone());
 
-    let state = AppState { pool, hub: syncplay::Hub::new() };
+    {
+        let scan_pool = pool.clone();
+        let progress = scan_progress.clone();
+        let lock = scan_lock.clone();
+        let jobs = scan_jobs;
+        tokio::spawn(async move {
+            let _guard = lock.lock().await;
+            run_scans(&scan_pool, &jobs, progress).await;
+        });
+    }
+
+    let state = AppState {
+        pool,
+        hub: syncplay::Hub::new(),
+        scan_progress,
+        scan_lock,
+        libraries,
+    };
 
     // Build the router: our routes first (they take priority), then the Dioxus
     // application mounted as the fallback so `/` and client-side routes work.

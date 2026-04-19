@@ -10,6 +10,7 @@ const ICON_BACK: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill=
 const ICON_PLAY_BTN: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>"#;
 pub const ICON_GROUP: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
 const ICON_SEARCH: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>"#;
+const ICON_REFRESH: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15A9 9 0 0 1 5.64 18.36L1 14"/></svg>"#;
 
 #[derive(Routable, Clone, PartialEq)]
 #[rustfmt::skip]
@@ -67,6 +68,7 @@ fn Shell() -> Element {
             }
             div { class: "top-right",
                 SearchDropdown {}
+                RescanButton {}
                 crate::syncplay_client::RoomsDropdown {}
                 ThemeSwitcher {}
             }
@@ -193,6 +195,163 @@ fn SearchDropdown() -> Element {
                 }
             }
         }
+    }
+}
+
+#[component]
+fn RescanButton() -> Element {
+    let mut status = use_signal(ScanProgress::default);
+    let mut open_menu = use_context::<OpenMenu>().0;
+    let is_open = *open_menu.read() == Some("rescan");
+
+    // Poll status. Fast while running, slow while idle so we catch scans
+    // started from another tab or triggered by startup.
+    use_future(move || async move {
+        #[cfg(feature = "web")]
+        loop {
+            if let Ok(s) = get_scan_status().await {
+                let running = s.running;
+                status.set(s);
+                let ms = if running { 500 } else { 3000 };
+                gloo_timers::future::TimeoutFuture::new(ms).await;
+            } else {
+                gloo_timers::future::TimeoutFuture::new(5000).await;
+            }
+        }
+    });
+
+    let s = status.read().clone();
+    let running = s.running;
+    let pct: Option<u32> = if s.total > 0 {
+        Some(((s.done * 100) / s.total).min(100) as u32)
+    } else {
+        None
+    };
+    let label = if running {
+        if s.total > 0 {
+            format!("Scanning {}/{}", s.done, s.total)
+        } else {
+            format!("Scanning — {}", s.phase)
+        }
+    } else {
+        "Rescan".to_string()
+    };
+
+    rsx! {
+        div { class: "rescan",
+            button {
+                class: if running { "btn-theme btn-icon scanning" } else { "btn-theme btn-icon" },
+                r#type: "button",
+                aria_label: "Rescan library",
+                title: "{label}",
+                onclick: move |_| {
+                    let was_open = is_open;
+                    open_menu.set(if was_open { None } else { Some("rescan") });
+                    if !running && !was_open {
+                        // Optimistic local state so the user sees feedback
+                        // even when the scan finishes before the next poll.
+                        let mut w = status.write();
+                        w.running = true;
+                        w.phase = "starting".into();
+                        w.done = 0;
+                        w.total = 0;
+                        w.current = None;
+                        w.message = None;
+                        drop(w);
+                        spawn(async move {
+                            let _ = start_scan().await;
+                            if let Ok(s) = get_scan_status().await {
+                                status.set(s);
+                            }
+                        });
+                    }
+                },
+                span { class: "icon", dangerous_inner_html: ICON_REFRESH }
+            }
+            if is_open {
+                div { class: "menu rescan-menu",
+                    div { class: "rescan-row",
+                        strong {
+                            if running {
+                                if s.phase == "indexing" { "Indexing library…" }
+                                else if s.phase == "assets" { "Extracting assets…" }
+                                else { "Scanning…" }
+                            } else {
+                                "Library scan"
+                            }
+                        }
+                    }
+                    if running {
+                        div { class: "rescan-row muted",
+                            if s.total > 0 {
+                                "{s.done} / {s.total}"
+                            } else if s.done > 0 {
+                                "Discovering — {s.done} files found"
+                            } else {
+                                "Starting…"
+                            }
+                        }
+                        div { class: "rescan-progress",
+                            div {
+                                class: "rescan-progress-bar",
+                                class: if s.total == 0 { "indeterminate" } else { "" },
+                                style: match pct {
+                                    Some(p) => format!("width: {p}%"),
+                                    None => String::new(),
+                                },
+                            }
+                        }
+                        if let Some(cur) = s.current.as_deref() {
+                            div { class: "rescan-row muted rescan-current", "{cur}" }
+                        }
+                    } else {
+                        if let Some(summary) = s.last_summary.as_deref() {
+                            div { class: "rescan-row muted", "Last scan: {summary}" }
+                            if let Some(ms) = s.last_elapsed_ms {
+                                div { class: "rescan-row muted rescan-time", "Took {format_elapsed(ms)}" }
+                            }
+                        } else {
+                            div { class: "rescan-row muted", "No scan run yet this session." }
+                        }
+                        if let Some(msg) = s.message.as_deref() {
+                            div { class: "rescan-row rescan-error", "{msg}" }
+                        }
+                        button {
+                            class: "rescan-start",
+                            r#type: "button",
+                            onclick: move |_| {
+                                let mut w = status.write();
+                                w.running = true;
+                                w.phase = "starting".into();
+                                w.done = 0;
+                                w.total = 0;
+                                w.current = None;
+                                w.message = None;
+                                drop(w);
+                                spawn(async move {
+                                    let _ = start_scan().await;
+                                    if let Ok(s) = get_scan_status().await {
+                                        status.set(s);
+                                    }
+                                });
+                            },
+                            "Start rescan"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_elapsed(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        format!("{}m {}s", secs / 60, secs % 60)
     }
 }
 
