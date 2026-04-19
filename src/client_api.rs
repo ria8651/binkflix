@@ -54,3 +54,38 @@ pub async fn get_show(id: &str) -> Result<ShowDetail, String> {
 pub async fn get_subtitles(id: &str) -> Result<Vec<SubtitleTrack>, String> {
     fetch_json(&format!("/api/media/{id}/subtitles")).await
 }
+
+#[cfg(feature = "web")]
+async fn post_empty<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
+    let resp = gloo_net::http::Request::post(url)
+        .send()
+        .await
+        .map_err(|e| format!("network error hitting {url}: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read response body from {url}: {e}"))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("{url} returned HTTP {status}: {}", truncate(&text, 300)));
+    }
+    serde_json::from_str::<T>(&text).map_err(|e| {
+        format!(
+            "invalid JSON from {url}: {e}. First bytes: {}",
+            truncate(&text, 200)
+        )
+    })
+}
+
+#[cfg(not(feature = "web"))]
+async fn post_empty<T: serde::de::DeserializeOwned>(_url: &str) -> Result<T, String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}
+
+pub async fn get_rooms() -> Result<Vec<RoomListItem>, String> {
+    fetch_json("/api/rooms").await
+}
+
+pub async fn create_room() -> Result<CreateRoomResp, String> {
+    post_empty("/api/rooms").await
+}

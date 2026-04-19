@@ -230,3 +230,44 @@ h2.section {
     -webkit-box-orient: vertical;
     overflow: hidden;
 }
+
+/* ---- Syncplay rooms dropdown ---- */
+.rooms-dd { position: relative; margin-left: auto; }
+.rooms-btn {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid rgba(255,255,255,0.12);
+    padding: 0.4rem 0.75rem;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+.rooms-btn:hover { background: rgba(255,255,255,0.04); }
+.rooms-btn.in-room {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+.rooms-panel {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 0.5rem);
+    background: var(--bg-elev);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: var(--radius);
+    padding: 0.75rem;
+    min-width: 280px;
+    z-index: 20;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.rooms-sep { height: 1px; background: rgba(255,255,255,0.08); margin: 0.25rem 0; }
+.rooms-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0;
+}
+.rooms-row .room-label { font-weight: 500; }
+.rooms-row .btn.small { padding: 0.25rem 0.6rem; font-size: 0.8rem; margin-left: auto; }

@@ -26,6 +26,44 @@ pub fn router() -> Router<AppState> {
         .route("/api/shows/{id}/poster", get(show_poster))
         .route("/api/shows/{id}/fanart", get(show_fanart))
         .route("/api/shows/{id}/seasons/{n}/poster", get(season_poster))
+        .route("/api/rooms", get(list_rooms).post(create_room))
+}
+
+// ---- Syncplay rooms ----
+
+async fn list_rooms(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::types::RoomListItem>>> {
+    let rooms = state.hub.list_rooms();
+    let mut out = Vec::with_capacity(rooms.len());
+    for (meta, room_state, viewers) in rooms {
+        let (current_media_id, current_media_title) = match room_state {
+            Some(s) => {
+                let title: Option<(String,)> = sqlx::query_as(
+                    "SELECT title FROM media WHERE id = ?",
+                )
+                .bind(&s.media_id)
+                .fetch_optional(&state.pool)
+                .await?;
+                (Some(s.media_id), title.map(|(t,)| t))
+            }
+            None => (None, None),
+        };
+        out.push(crate::types::RoomListItem {
+            id: meta.id,
+            viewers,
+            current_media_id,
+            current_media_title,
+        });
+    }
+    Ok(Json(out))
+}
+
+async fn create_room(
+    State(state): State<AppState>,
+) -> Result<Json<crate::types::CreateRoomResp>> {
+    let meta = state.hub.create_room();
+    Ok(Json(crate::types::CreateRoomResp { id: meta.id }))
 }
 
 async fn health() -> &'static str {

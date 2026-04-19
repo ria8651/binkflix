@@ -229,6 +229,8 @@ dependencies = [
  "dotenvy",
  "futures",
  "gloo-net",
+ "gloo-timers",
+ "js-sys",
  "quick-xml",
  "serde",
  "serde_json",
@@ -243,6 +245,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

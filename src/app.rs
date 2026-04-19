@@ -33,12 +33,16 @@ pub fn App() -> Element {
 
 #[component]
 fn Shell() -> Element {
+    crate::syncplay_client::provide_room_context();
+
     rsx! {
         header { class: "topbar",
             Link { to: Route::Home {}, class: "brand", "BINKFLIX" }
             span { class: "muted", "self-hosted" }
+            crate::syncplay_client::RoomsDropdown {}
         }
         main {
+            crate::syncplay_client::RoomNavigator {}
             Outlet::<Route> {}
         }
     }
@@ -298,6 +302,10 @@ fn MediaPlay(id: String) -> Element {
 
     rsx! {
         VideoPlayer { id: id.clone() }
+        crate::syncplay_client::SyncplayBridge {
+            video_dom_id: "binkflix-video".to_string(),
+            media_id: id.clone(),
+        }
         div { style: "margin-top: 1rem;",
             match &*media.read_unchecked() {
                 Some(Ok(m)) if m.kind == "episode" => {

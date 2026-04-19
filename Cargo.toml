@@ -13,9 +13,15 @@ thiserror = "2"
 futures = "0.3"
 
 # --- web-only (wasm client) ---
-gloo-net = { version = "0.6", features = ["http"], optional = true }
+gloo-net = { version = "0.6", features = ["http", "websocket"], optional = true }
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
-web-sys = { version = "0.3", optional = true, features = ["HtmlMediaElement", "HtmlVideoElement"] }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "HtmlMediaElement", "HtmlVideoElement",
+    "Window", "Location", "Document", "Element", "EventTarget", "Event",
+] }
 tracing-wasm = { version = "0.2", optional = true }
 tracing = { version = "0.1", optional = true }
 
@@ -35,7 +41,13 @@ dotenvy = { version = "0.15", optional = true }
 
 [features]
 default = []
-web    = ["dioxus/web", "dep:gloo-net", "dep:wasm-bindgen", "dep:web-sys", "dep:tracing-wasm", "dep:tracing"]
+web    = [
+    "dioxus/web",
+    "dep:gloo-net", "dep:gloo-timers",
+    "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys",
+    "dep:web-sys",
+    "dep:tracing-wasm", "dep:tracing",
+]
 server = [
     "dioxus/server",
     "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",

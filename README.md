@@ -11,14 +11,13 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
 - **Shows grouped by show → season** — seasons collapse automatically, with season posters when present.
 - **HTTP range streaming** — proper 206 responses; any browser-native `<video>` client (or VLC) works.
 - **Posters / fanart / episode thumbs** with lazy-loaded `<img>` so the home page doesn't nuke your NIC.
-- **SyncPlay hub scaffolded** — WebSocket room at `/api/syncplay/:room` for play/pause/seek/heartbeat fan-out. Client UI not wired yet.
+- **SyncPlay (watch parties)** — topbar Rooms dropdown lets anyone create/join a room from any page. Once joined, hitting play on any media broadcasts to the room, everyone else auto-navigates to the same media, and play/pause/seek stay in sync. Rooms are in-memory and evaporate when empty. No auth — clients are anonymous UUIDs.
 - **Single-origin dev** — `dx serve` runs client + backend together on one port with HMR.
 
 ## Not yet
 
 - No auth. The server is wide open — don't expose it to the internet yet.
-- No on-the-fly transcoding. Direct-play only; the client must natively support the codec/container.
-- No client-side SyncPlay UI (the server hub is there, you'd have to build your own client).
+- No on-the-fly transcoding. Direct-play only; the client must natively support the codec/container. Firefox on macOS in particular tends to stall on HEVC/10-bit sources — use Chrome/Safari for those files.
 - Episodes without both an NFO and an `SxxEyy` filename (e.g. `One Pace` batch files) are skipped — see the warn logs.
 - No filesystem watcher — a scan runs at startup; you restart the server (or it HMR-restarts) to pick up new files.
 
@@ -68,8 +67,9 @@ For a standalone backend (no UI rebuild) use `cargo run --features server`.
 src/
   main.rs            # feature-gated entry (web vs server)
   app.rs             # Dioxus routes + components (compiles on both targets)
-  types.rs           # serde DTOs shared client/server
+  types.rs           # serde DTOs + syncplay protocol shared client/server
   client_api.rs      # gloo-net fetchers (wasm-only bodies)
+  syncplay_client.rs # RoomContext, WS task, topbar dropdown, video bridge
   server/            # #[cfg(feature = "server")] — axum, DB, scanner, NFO, syncplay
 migrations/0001_init.sql
 assets/style.css
@@ -120,7 +120,9 @@ See [.env.example](.env.example). Short version:
 - `GET /api/media/:id/fanart` — movies only
 - `GET /api/shows/:id` — show + `seasons[] { number, episodes[] }`
 - `GET /api/shows/:id/poster` | `/fanart` | `/seasons/:n/poster`
-- `WS  /api/syncplay/:room` — play/pause/seek/heartbeat hub
+- `GET /api/rooms` — active syncplay rooms with viewer counts
+- `POST /api/rooms` — create an empty room, returns `{ id }`
+- `WS  /api/syncplay/:room` — play/pause/seek/set_media/heartbeat hub
 
 ## License
 

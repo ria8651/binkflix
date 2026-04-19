@@ -4,6 +4,8 @@ mod app;
 mod client_api;
 mod types;
 
+mod syncplay_client;
+
 #[cfg(feature = "server")]
 mod server;
 
