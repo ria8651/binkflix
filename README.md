@@ -10,8 +10,9 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
 - **Incremental rescans** — mtime + file_size check per row, so restarts after the first scan are near-instant.
 - **On-demand rescan with live progress** — topbar refresh button triggers a scan without restarting; dropdown shows current phase (indexing / asset extraction), `done/total`, the file being worked on, and a summary of the previous scan.
 - **Shows grouped by show → season** — seasons collapse automatically, with season posters when present.
-- **HTTP range streaming** — proper 206 responses; any browser-native `<video>` client (or VLC) works.
-- **Custom video player** — fullscreen page, overlay controls that auto-hide after 2s of idle playback. Scrubber shows played + buffered ranges; volume slider shows fill. Keyboard shortcuts: space/`k` play-pause, `←`/`→` seek ±5s, `↑`/`↓` volume, `m` mute, `f` fullscreen. Subtitle track picker integrated into the chrome (ASS via JASSUB, VTT via native `<track>`).
+- **HTTP range streaming** — proper 206 responses for direct-served files; any browser-native `<video>` client (or VLC) works.
+- **On-the-fly remux** — files whose video codec a browser can play but whose container (MKV, AVI) or audio codec isn't natively supported get piped through ffmpeg with `-c:v copy` into fragmented MP4 (H.264 sources) or WebM (VP9/VP8/AV1 sources). Audio is copied when native to the target container, else transcoded to AAC or Opus. ffprobe runs at scan time and the verdict is cached on the `media` row — no per-request probe. Explicit `?mode=direct|remux|transcode` overrides are honored. For codecs we can't cheaply handle (HEVC, etc.) the player shows a prompt offering a best-effort remux or direct attempt rather than silently failing.
+- **Custom video player** — fullscreen page, overlay controls that auto-hide after 2s of idle playback. Title bar at the top; scrubber shows played + buffered ranges; volume slider shows fill and persists to localStorage. Keyboard shortcuts: space/`k` play-pause, `←`/`→` seek ±5s, `↑`/`↓` volume, `m` mute, `f` fullscreen. Subtitle track picker integrated into the chrome (ASS via JASSUB, VTT via native `<track>`). Debug panel shows playback runtime stats, source codec info, and the actual delivery mode read from server response headers (`X-Stream-Mode`, `X-Stream-Video`, `X-Stream-Audio`).
 - **Theming** — four themes (default-dark, classic-light, terminal, material) ported from the `boom` token system; switcher in the header and in the player overlay. Persists to localStorage.
 - **Posters / fanart / episode thumbs** with lazy-loaded `<img>` so the home page doesn't nuke your NIC.
 - **SyncPlay (watch parties)** — topbar Rooms dropdown lets anyone create/join a room from any page. Once joined, hitting play on any media broadcasts to the room, everyone else auto-navigates to the same media, and play/pause/seek stay in sync. Rooms are in-memory and evaporate when empty. No auth — clients are anonymous UUIDs.
@@ -20,7 +21,8 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
 ## Not yet
 
 - No auth. The server is wide open — don't expose it to the internet yet.
-- No on-the-fly transcoding. Direct-play only; the client must natively support the codec/container. Firefox on macOS in particular tends to stall on HEVC/10-bit sources — use Chrome/Safari for those files.
+- No real transcode path. Files whose video codec isn't browser-copyable (HEVC, MPEG-2, VC-1, …) fall back to a user-confirmed best-effort remux or direct attempt; a proper `-c:v libx264` path isn't wired up.
+- Remux responses are one-way pipes, so byte-range seeks aren't supported within a remuxed stream. The browser can still scrub inside what it has buffered.
 - Episodes without both an NFO and an `SxxEyy` filename (e.g. `One Pace` batch files) are skipped — see the warn logs.
 - No filesystem watcher — a scan runs at startup; you restart the server (or it HMR-restarts) to pick up new files.
 
@@ -32,7 +34,7 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
 | HTTP               | axum 0.8 + tower-http                               |
 | Database           | SQLite via sqlx (WAL, auto-migrate)                 |
 | Metadata           | Kodi NFO files parsed with quick-xml                |
-| Streaming          | `tower_http::services::ServeFile` (range support)   |
+| Streaming          | `tower_http::services::ServeFile` for direct; ffmpeg pipe for remux (fMP4 / WebM) |
 | Real-time          | axum WebSocket + `tokio::sync::broadcast`           |
 
 ## Requirements
@@ -45,6 +47,7 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
   ```sh
   cargo binstall dioxus-cli
   ```
+- `ffmpeg` + `ffprobe` on `$PATH` — used for subtitle extraction, tech probing, and on-the-fly remux. Any recent build works.
 
 ## Running it
 
@@ -88,11 +91,13 @@ docker run -d --name binkflix \
 src/
   main.rs            # feature-gated entry (web vs server)
   app.rs             # Dioxus routes + layout + theme switcher
-  video_player.rs    # custom overlay player + subtitle picker
+  video_player.rs    # custom overlay player, subtitle picker, transcode prompt
   types.rs           # serde DTOs + syncplay protocol shared client/server
   client_api.rs      # gloo-net fetchers (wasm-only bodies)
   syncplay_client.rs # RoomContext, WS task, topbar dropdown, video bridge
   server/            # #[cfg(feature = "server")] — axum, DB, scanner, NFO, syncplay
+    remux.rs         # /stream dispatcher: direct vs ffmpeg remux into fMP4/WebM
+    media_info.rs    # ffprobe wrapper + BrowserCompat verdict + DB cache
 migrations/0001_init.sql
 assets/
   tokens.css         # design tokens + per-theme overrides
@@ -140,7 +145,8 @@ See [.env.example](.env.example). Short version:
 
 - `GET /api/library` — `{ movies: [...], shows: [...] }`
 - `GET /api/media/:id` — movie or episode metadata (episode fields are null for movies)
-- `GET /api/media/:id/stream` — range-GET enabled
+- `GET /api/media/:id/stream` — server picks direct vs remux from the cached probe verdict. Direct responses are byte-range seekable; remux responses aren't. Query overrides: `?mode=direct`, `?mode=remux`, `?mode=transcode`. Responses include `X-Stream-Mode` and (for remux) `X-Stream-Video` / `X-Stream-Audio` headers so the client knows what actually happened.
+- `GET /api/media/:id/tech` — container, codecs, duration, and `browser_compat` verdict (direct / remux / transcode). Cached on the `media` row at scan time.
 - `GET /api/media/:id/image` — poster (movie) or thumb (episode)
 - `GET /api/media/:id/fanart` — movies only
 - `GET /api/shows/:id` — show + `seasons[] { number, episodes[] }`

@@ -302,6 +302,31 @@ function initControls(videoId) {
     const onPause = () => { setPausedClass(); setPlayIcon(); };
     const onTime = () => syncTime();
     const onMeta = () => { syncDuration(); syncTime(); };
+
+    // Persist volume / mute across sessions. The <video> element starts
+    // at volume=1 / muted=false unless we restore explicitly; apply any
+    // saved preference before any user interaction so there's no
+    // perceptible jump from default to saved level.
+    const VOLUME_KEY = "binkflix:volume";
+    try {
+        const saved = JSON.parse(localStorage.getItem(VOLUME_KEY) || "null");
+        if (saved && typeof saved.volume === "number") {
+            video.volume = Math.min(1, Math.max(0, saved.volume));
+        }
+        if (saved && typeof saved.muted === "boolean") {
+            video.muted = saved.muted;
+        }
+    } catch (_) { /* corrupt entry — ignore */ }
+
+    const persistVolume = () => {
+        try {
+            localStorage.setItem(
+                VOLUME_KEY,
+                JSON.stringify({ volume: video.volume, muted: video.muted }),
+            );
+        } catch (_) { /* storage disabled / full — nothing we can do */ }
+    };
+
     const onVol = () => {
         const v = video.muted ? 0 : video.volume;
         if (volSlider) {
@@ -309,6 +334,7 @@ function initControls(videoId) {
             volSlider.style.setProperty("--vol", (v * 100) + "%");
         }
         setMuteIcon();
+        persistVolume();
     };
 
     const onProgress = () => updateFill();
@@ -559,10 +585,40 @@ function initControls(videoId) {
     });
 }
 
+// Cache of per-URL HEAD probe results. Populated lazily by getDebugStats
+// so we know what the server actually sent back (Content-Type / Accept-
+// Ranges) rather than inferring from a client-side button press. Keyed
+// by currentSrc so re-loading with a different ?mode= fetches fresh.
+const streamInfoCache = new Map(); // src -> { content_type, accept_ranges, content_length }
+const streamInfoPending = new Set();
+
+function ensureStreamInfo(src) {
+    if (!src || streamInfoCache.has(src) || streamInfoPending.has(src)) return;
+    streamInfoPending.add(src);
+    fetch(src, { method: "HEAD" })
+        .then((r) => {
+            streamInfoCache.set(src, {
+                content_type: r.headers.get("content-type"),
+                accept_ranges: r.headers.get("accept-ranges"),
+                content_length: r.headers.get("content-length"),
+                // Explicit mode + per-stream actions set by the server
+                // — read these instead of inferring from Accept-Ranges
+                // so the panel can distinguish remux from transcode.
+                mode: r.headers.get("x-stream-mode"),
+                video_action: r.headers.get("x-stream-video"),
+                audio_action: r.headers.get("x-stream-audio"),
+                status: r.status,
+            });
+        })
+        .catch(() => { /* leave absent; next poll retries */ })
+        .finally(() => streamInfoPending.delete(src));
+}
+
 // Runtime playback stats for the debug menu. ffprobe gives us the
 // authoritative codec/bitrate info server-side; this covers what only
 // the browser knows — the rendered resolution (post-scaling),
-// readyState, buffered ranges, dropped frames, playback rate.
+// readyState, buffered ranges, dropped frames, playback rate, plus
+// observed response headers for the current stream.
 function getDebugStats(videoId) {
     const video = getVideo(videoId);
     if (!video) return null;
@@ -585,6 +641,8 @@ function getDebugStats(videoId) {
         }
     } catch (_) { /* ignore */ }
     const readyStates = ["HAVE_NOTHING", "HAVE_METADATA", "HAVE_CURRENT_DATA", "HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA"];
+    const src = video.currentSrc || video.src;
+    ensureStreamInfo(src);
     return {
         videoWidth: video.videoWidth,
         videoHeight: video.videoHeight,
@@ -598,8 +656,9 @@ function getDebugStats(videoId) {
         total_frames: totalFrames,
         muted: video.muted,
         volume: Number(video.volume.toFixed(2)),
-        current_src: video.currentSrc || video.src,
+        current_src: src,
         error: video.error ? { code: video.error.code, message: video.error.message || null } : null,
+        stream_info: streamInfoCache.get(src) || null,
     };
 }
 

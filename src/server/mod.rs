@@ -6,6 +6,7 @@ pub mod db;
 pub mod error;
 pub mod media_info;
 pub mod nfo;
+pub mod remux;
 pub mod scanner;
 pub mod subtitles;
 pub mod syncplay;

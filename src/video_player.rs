@@ -28,7 +28,7 @@ const ICON_INFO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill=
 const ICON_CHECK: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
 
 #[component]
-pub fn VideoPlayer(id: String) -> Element {
+pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     let id_for_subs = id.clone();
     let tracks = use_resource(move || {
         let id = id_for_subs.clone();
@@ -76,10 +76,98 @@ pub fn VideoPlayer(id: String) -> Element {
     let mut debug_open = use_signal(|| false);
     let mut debug_stats = use_signal(|| None::<serde_json::Value>);
 
+    // Tech probe drives two things: (1) the info panel, and (2) the
+    // transcode-prompt flow below. For Direct/Remux verdicts the server
+    // picks the right mode itself, so the video element can load plain
+    // `/stream` without waiting. For Transcode we need the probe result
+    // before deciding what to show — but that's the slow path, not the
+    // hot path, so the extra beat is fine.
     let id_for_tech = id.clone();
     let tech = use_resource(move || {
         let id = id_for_tech.clone();
         async move { get_media_tech(&id).await }
+    });
+
+    // Title bar data. Movies show their title; episodes show the show
+    // title with the episode number + title as a subtitle line.
+    let id_for_media = id.clone();
+    let media_resource = use_resource(move || {
+        let id = id_for_media.clone();
+        async move { get_media(&id).await }
+    });
+    let show_resource = use_resource(move || {
+        let media = media_resource.read_unchecked().clone();
+        async move {
+            match media {
+                Some(Ok(m)) if m.kind == "episode" => match m.show_id.as_deref() {
+                    Some(sid) => get_show(sid).await.ok().map(|s| s.show.title),
+                    None => None,
+                },
+                _ => None,
+            }
+        }
+    });
+
+    // `None` = use /stream (server picks).
+    // `Some("remux"|"direct")` = user explicitly opted in after the
+    //     transcode prompt; pin that mode on subsequent loads.
+    let mut forced_mode = use_signal(|| None::<&'static str>);
+
+    // Compute the src to hand the video element. Empty string means "don't
+    // load yet" — we're waiting on the tech probe to decide whether to
+    // show the transcode prompt. Rendering with an empty src is harmless
+    // because we render the <video> behind the prompt overlay (it won't
+    // be interacted with until the overlay is dismissed).
+    let id_for_src = id.clone();
+    let stream_src = use_memo(move || -> String {
+        if let Some(mode) = *forced_mode.read() {
+            return media_stream_url_with_mode(&id_for_src, mode);
+        }
+        match &*tech.read_unchecked() {
+            // Wait for the probe before setting a src — otherwise we
+            // hit `/stream` optimistically, the server returns 501 for
+            // transcode-needed files, the <video> fires an error, and
+            // the "Can't play this video" overlay stacks underneath
+            // the transcode prompt that appears once tech does resolve.
+            None => String::new(),
+            // Probe failed: try direct and let the browser's own error
+            // surface if it can't handle it.
+            Some(Err(_)) => media_stream_url(&id_for_src),
+            Some(Ok(info)) => match info.browser_compat {
+                BrowserCompat::Direct | BrowserCompat::Remux => media_stream_url(&id_for_src),
+                // Don't set a src — the overlay below prompts the user
+                // to pick a best-effort mode.
+                BrowserCompat::Transcode => String::new(),
+            },
+        }
+    });
+
+    // True when the probe says we need transcoding and the user hasn't
+    // yet picked remux/direct as a fallback.
+    let show_transcode_prompt = use_memo(move || -> bool {
+        if forced_mode.read().is_some() { return false; }
+        matches!(
+            &*tech.read_unchecked(),
+            Some(Ok(info)) if info.browser_compat == BrowserCompat::Transcode
+        )
+    });
+
+    // What's actually happening on the wire, accounting for user
+    // overrides on top of the server's verdict. Surfaced in the debug
+    // panel's Delivery section so the panel doesn't keep claiming
+    // "transcode required" after the user picked remux/direct.
+    let effective_mode = use_memo(move || -> BrowserCompat {
+        if let Some(mode) = *forced_mode.read() {
+            return match mode {
+                "direct" => BrowserCompat::Direct,
+                "remux" => BrowserCompat::Remux,
+                _ => BrowserCompat::Transcode,
+            };
+        }
+        match &*tech.read_unchecked() {
+            Some(Ok(info)) => info.browser_compat,
+            _ => BrowserCompat::Direct,
+        }
     });
 
     // When the debug menu is open, poll runtime stats (buffered, dropped
@@ -103,8 +191,15 @@ pub fn VideoPlayer(id: String) -> Element {
         });
     });
 
-    // Wire up custom controls once on mount.
+    // Wire up custom controls whenever the <video> src transitions from
+    // empty to populated — the element is conditionally rendered (we wait
+    // on the tech probe + user choice for transcode-needed files), so
+    // initControls must fire *after* the video mounts, not on component
+    // mount when the element doesn't exist yet. `initControls` is
+    // idempotent, so re-running on subsequent src changes is safe.
     use_effect(move || {
+        let src = stream_src.read().clone();
+        if src.is_empty() { return; }
         let js = format!(
             "window.binkflixPlayer?.initControls('{video_dom_id}');"
         );
@@ -132,6 +227,15 @@ pub fn VideoPlayer(id: String) -> Element {
     });
 
     use_effect(move || {
+        // Don't push subtitles to a video element that hasn't mounted
+        // yet (we wait on the tech probe + user choice in transcode
+        // cases). The player.js setters throw "video element not found"
+        // otherwise, which bubbles up as a banner at the bottom of the
+        // page. When src eventually becomes non-empty this effect re-
+        // runs because both signals are read here.
+        if stream_src.read().is_empty() {
+            return;
+        }
         let cmd = sub_command.read().clone();
         if matches!(&*last_applied.peek(), Some(p) if p == &cmd) {
             return;
@@ -216,11 +320,82 @@ pub fn VideoPlayer(id: String) -> Element {
 
     rsx! {
         div { class: "video-wrap",
-            video {
-                id: "{video_dom_id}",
-                src: "{media_stream_url(&id)}",
-                autoplay: true,
-                preload: "metadata",
+            // Title overlay — auto-hides with the bottom chrome.
+            {
+                let media_snapshot = media_resource.read_unchecked().clone();
+                let show_snapshot = show_resource.read_unchecked().clone().flatten();
+                match media_snapshot {
+                    Some(Ok(m)) => {
+                        let (primary, secondary) = if m.kind == "episode" {
+                            let ep_label = match (m.season_number, m.episode_number) {
+                                (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02} · {}", m.title)),
+                                _ => Some(m.title.clone()),
+                            };
+                            let primary = show_snapshot.unwrap_or_else(|| m.title.clone());
+                            (primary, ep_label)
+                        } else {
+                            (m.title.clone(), m.year.map(|y| y.to_string()))
+                        };
+                        rsx! {
+                            div { class: "player-title",
+                                div { class: "player-title-primary", "{primary}" }
+                                if let Some(sec) = secondary {
+                                    div { class: "player-title-secondary", "{sec}" }
+                                }
+                            }
+                        }
+                    }
+                    _ => rsx! {},
+                }
+            }
+            // Only mount the <video> once we have a real src. Rendering
+            // it with an empty src makes some browsers fire an error
+            // event, which toggles `.errored` on the wrap and shows the
+            // "Can't play this video" overlay *on top of* the transcode
+            // prompt — two warnings fighting for attention.
+            {
+                let src = stream_src.read().clone();
+                if !src.is_empty() {
+                    rsx! {
+                        video {
+                            id: "{video_dom_id}",
+                            src: "{src}",
+                            autoplay: true,
+                            preload: "metadata",
+                        }
+                    }
+                } else {
+                    rsx! {}
+                }
+            }
+            // Transcode prompt: source codec isn't natively playable and
+            // we don't have a real transcode path yet. Offer remux
+            // (cheap, video-copy into fMP4/WebM — may or may not decode)
+            // and direct (serve the raw file — browser plays if it can).
+            if *show_transcode_prompt.read() {
+                div { class: "player-transcode-prompt", role: "dialog",
+                    div { class: "player-transcode-icon", "⚠" }
+                    div { class: "player-transcode-title", "This file needs transcoding" }
+                    div { class: "player-transcode-body",
+                        "The source codec isn't one we can reliably play in a browser. "
+                        "Transcoding isn't implemented yet — you can try remuxing (fast, may fail to decode) or direct streaming (browser decides)."
+                    }
+                    div { class: "player-transcode-actions",
+                        button {
+                            class: "player-transcode-btn primary",
+                            r#type: "button",
+                            onclick: move |_| forced_mode.set(Some("remux")),
+                            "Try remux"
+                        }
+                        button {
+                            class: "player-transcode-btn",
+                            r#type: "button",
+                            onclick: move |_| forced_mode.set(Some("direct")),
+                            "Try direct"
+                        }
+                        Link { to: back_route.clone(), class: "player-transcode-btn", "Back" }
+                    }
+                }
             }
             // Loading spinner overlay — shown while `.loading` is on the
             // wrap (initial load / buffering / stalled). The class is
@@ -235,6 +410,7 @@ pub fn VideoPlayer(id: String) -> Element {
                 div { class: "player-error-body",
                     div { class: "player-error-title", "Can't play this video" }
                     div { class: "player-error-msg" }
+                    Link { to: back_route.clone(), class: "player-error-back", "← Back" }
                 }
             }
             div { class: "player-chrome",
@@ -379,6 +555,7 @@ pub fn VideoPlayer(id: String) -> Element {
                                 DebugMenuBody {
                                     tech: tech_snapshot,
                                     stats: stats_snapshot,
+                                    effective_mode: *effective_mode.read(),
                                 }
                             }
                         }
@@ -404,7 +581,16 @@ struct SubCommand {
 fn DebugMenuBody(
     tech: Option<Result<MediaTechInfo, String>>,
     stats: Option<serde_json::Value>,
+    effective_mode: BrowserCompat,
 ) -> Element {
+    // Prefer what the server actually told us over our inference: if we
+    // saw `Accept-Ranges: bytes` in the response, it's a direct serve;
+    // `none` is remux. The content type tells us the output container.
+    // Fall back to the effective-mode hint while the HEAD probe is in
+    // flight.
+    let observed: Option<ObservedStream> = stats.as_ref().and_then(ObservedStream::from_stats);
+    let observed_mode = observed.as_ref().map(|o| o.mode);
+    let observed_container = observed.as_ref().and_then(|o| o.container());
     rsx! {
         div { class: "debug-section",
             div { class: "debug-section-title", "Playback" }
@@ -421,6 +607,134 @@ fn DebugMenuBody(
                 Some(Ok(info)) => rsx! { TechInfoRows { info: info.clone() } },
             }
         }
+        div { class: "debug-section",
+            div { class: "debug-section-title", "Delivery" }
+            match &tech {
+                None => rsx! { div { class: "debug-row muted", "—" } },
+                Some(Err(_)) => rsx! { div { class: "debug-row muted", "—" } },
+                Some(Ok(info)) => rsx! {
+                    DeliveryRows {
+                        info: info.clone(),
+                        effective_mode: observed_mode.unwrap_or(effective_mode),
+                        observed_container: observed_container.clone(),
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// What the HEAD probe in player.js saw on the actual stream response —
+/// the authoritative signal for how the server chose to deliver the
+/// file, independent of any client-side state. The mode comes from an
+/// explicit `X-Stream-Mode` header rather than `Accept-Ranges`, since
+/// a future transcode path would also be non-seekable and thus
+/// indistinguishable from remux at the protocol level.
+struct ObservedStream {
+    mode: BrowserCompat,
+    content_type: Option<String>,
+}
+
+impl ObservedStream {
+    fn from_stats(v: &serde_json::Value) -> Option<Self> {
+        let info = v.get("stream_info")?;
+        if info.is_null() { return None; }
+        let mode_hdr = info
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_ascii_lowercase());
+        let content_type = info.get("content_type").and_then(|v| v.as_str()).map(String::from);
+        let mode = match mode_hdr.as_deref() {
+            Some("direct") => BrowserCompat::Direct,
+            Some("remux") => BrowserCompat::Remux,
+            Some("transcode") => BrowserCompat::Transcode,
+            _ => return None,
+        };
+        Some(Self { mode, content_type })
+    }
+
+    /// Human-readable container derived from the observed Content-Type.
+    fn container(&self) -> Option<String> {
+        let ct = self.content_type.as_deref()?;
+        // Strip params like `; charset=...` just in case.
+        let main = ct.split(';').next()?.trim();
+        Some(match main {
+            "video/mp4" => "fragmented MP4".to_string(),
+            "video/webm" => "WebM".to_string(),
+            "video/x-matroska" => "Matroska".to_string(),
+            other => other.to_string(),
+        })
+    }
+}
+
+#[component]
+fn DeliveryRows(
+    info: MediaTechInfo,
+    effective_mode: BrowserCompat,
+    observed_container: Option<String>,
+) -> Element {
+    // Describe what the browser is actually receiving on the wire, as a
+    // complement to the Source section above. `effective_mode` reflects
+    // user overrides ("Try remux"/"Try direct") on top of the server
+    // verdict — otherwise a user who picked remux for a transcode-needed
+    // file would still see "transcode required" here, which is wrong.
+    match effective_mode {
+        BrowserCompat::Direct => rsx! {
+            DebugRow { label: "Mode", value: "direct".to_string() }
+            DebugRow {
+                label: "Container",
+                value: observed_container
+                    .clone()
+                    .or_else(|| info.container.clone())
+                    .unwrap_or_else(|| "—".into()),
+            }
+            DebugRow {
+                label: "Video",
+                value: info.video.as_ref().map(|v| v.codec.clone()).unwrap_or_else(|| "none".into()),
+            }
+            DebugRow {
+                label: "Audio",
+                value: info.audio.first().map(|a| a.codec.clone()).unwrap_or_else(|| "none".into()),
+            }
+        },
+        BrowserCompat::Remux => {
+            // Mirror the server's family-choice logic in remux.rs so the
+            // panel describes what's actually being streamed. Observed
+            // container (from Content-Type) overrides our inference when
+            // available.
+            let source_video = info
+                .video
+                .as_ref()
+                .map(|v| v.codec.clone())
+                .unwrap_or_else(|| "none".into());
+            let source_audio = info
+                .audio
+                .iter()
+                .find(|a| a.default)
+                .or_else(|| info.audio.first())
+                .map(|a| a.codec.clone());
+            let webm_family = matches!(source_video.as_str(), "vp9" | "vp8" | "av1");
+            let inferred_container = if webm_family { "WebM" } else { "fragmented MP4" };
+            let container_label = observed_container
+                .clone()
+                .unwrap_or_else(|| inferred_container.to_string());
+            let audio_label = match (webm_family, source_audio.as_deref()) {
+                (false, Some("aac" | "mp3")) => format!("{} (copy)", source_audio.clone().unwrap()),
+                (false, _) => "AAC · stereo · 192 kbps".to_string(),
+                (true, Some("opus" | "vorbis")) => format!("{} (copy)", source_audio.clone().unwrap()),
+                (true, _) => "Opus · stereo · 160 kbps".to_string(),
+            };
+            rsx! {
+                DebugRow { label: "Mode", value: "remux (ffmpeg)".to_string() }
+                DebugRow { label: "Container", value: container_label }
+                DebugRow { label: "Video", value: format!("{source_video} (copy)") }
+                DebugRow { label: "Audio", value: audio_label }
+            }
+        }
+        BrowserCompat::Transcode => rsx! {
+            DebugRow { label: "Mode", value: "transcode required".to_string() }
+            DebugRow { label: "Status", value: "not implemented".to_string() }
+        },
     }
 }
 

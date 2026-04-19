@@ -635,7 +635,7 @@ fn MediaPlay(id: String) -> Element {
 
     rsx! {
         div { class: "player-fullpage",
-            Link { to: back_route, class: "player-back",
+            Link { to: back_route.clone(), class: "player-back",
                 span { dangerous_inner_html: ICON_BACK }
                 span { "Back" }
             }
@@ -643,7 +643,7 @@ fn MediaPlay(id: String) -> Element {
                 crate::syncplay_client::RoomsDropdown {}
                 ThemeSwitcher {}
             }
-            VideoPlayer { id: id.clone() }
+            VideoPlayer { id: id.clone(), back_route: back_route.clone() }
             crate::syncplay_client::SyncplayBridge {
                 video_dom_id: "binkflix-video".to_string(),
                 media_id: id.clone(),

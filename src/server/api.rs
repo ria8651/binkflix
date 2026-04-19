@@ -17,7 +17,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/health", get(health))
         .route("/api/library", get(library))
         .route("/api/media/{id}", get(media))
-        .route("/api/media/{id}/stream", get(media_stream))
+        .route("/api/media/{id}/stream", get(super::remux::media_stream))
         .route("/api/media/{id}/subtitles", get(media_subtitles))
         .route("/api/media/{id}/subtitle/{track}", get(media_subtitle))
         .route("/api/media/{id}/tech", get(media_tech))
@@ -268,15 +268,6 @@ async fn lookup(state: &AppState, sql: &str, id: &str) -> Result<String> {
     row.and_then(|(p,)| p).ok_or(Error::NotFound)
 }
 
-async fn media_stream(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    req: Request,
-) -> Result<axum::response::Response> {
-    let path = lookup(&state, "SELECT path FROM media WHERE id = ?", &id).await?;
-    serve(path, req).await
-}
-
 async fn media_subtitles(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -309,10 +300,17 @@ async fn media_tech(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::types::MediaTechInfo>> {
+    // Hit the cached probe first (written at scan time). Fall back to a live
+    // ffprobe if the cache is empty — e.g. scan hasn't reached this row yet,
+    // or the probe failed the first time and we want to retry.
+    if let Some(info) = media_info::load(&state.pool, &id).await.map_err(Error::Other)? {
+        return Ok(Json(info));
+    }
     let path = lookup(&state, "SELECT path FROM media WHERE id = ?", &id).await?;
     let info = media_info::probe(std::path::Path::new(&path))
         .await
         .map_err(Error::Other)?;
+    let _ = media_info::store(&state.pool, &id, &info).await;
     Ok(Json(info))
 }
 

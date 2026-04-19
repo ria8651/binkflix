@@ -84,6 +84,23 @@ pub struct MediaTechInfo {
     pub file_size: Option<u64>,
     pub video: Option<VideoTrackInfo>,
     pub audio: Vec<AudioTrackInfo>,
+    /// What the browser can do with this file: play it as-is, remux into
+    /// fragmented MP4, or (not yet implemented) full transcode.
+    pub browser_compat: BrowserCompat,
+}
+
+/// How we expect to deliver this media to a modern browser.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserCompat {
+    /// Source is already browser-friendly — serve the file directly.
+    Direct,
+    /// Container and/or audio codec needs repackaging, but video stream
+    /// can be copied (cheap). Served via ffmpeg `-c:v copy` into fMP4.
+    Remux,
+    /// Video codec isn't browser-playable — needs real transcode. Not
+    /// implemented yet; served endpoint returns 501.
+    Transcode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,6 +141,9 @@ pub struct SubtitleTrack {
 pub fn media_image_url(id: &str) -> String { format!("/api/media/{id}/image") }
 pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") }
+pub fn media_stream_url_with_mode(id: &str, mode: &str) -> String {
+    format!("/api/media/{id}/stream?mode={mode}")
+}
 pub fn media_subtitles_url(id: &str) -> String { format!("/api/media/{id}/subtitles") }
 pub fn media_tech_url(id: &str) -> String { format!("/api/media/{id}/tech") }
 pub fn media_subtitle_url(id: &str, track: &str) -> String {

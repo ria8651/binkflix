@@ -56,6 +56,11 @@ CREATE TABLE media (
     season_number   INTEGER,
     episode_number  INTEGER,
 
+    -- Cached `MediaTechInfo` (container/codecs/duration/browser_compat) from
+    -- ffprobe, populated at scan time. NULL until first successful probe.
+    -- Read by /tech and the remux endpoint so we don't re-probe per request.
+    tech_json       TEXT,
+
     scanned_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

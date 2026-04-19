@@ -5,10 +5,39 @@
 //! probe at request time and don't persist. Results are small — a single
 //! ffprobe call takes well under a second on local storage.
 
-use crate::types::{AudioTrackInfo, MediaTechInfo, VideoTrackInfo};
+use crate::types::{AudioTrackInfo, BrowserCompat, MediaTechInfo, VideoTrackInfo};
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use std::path::Path;
 use tokio::process::Command;
+
+/// Read the cached probe for `media_id`, if the scanner has populated it.
+pub async fn load(pool: &SqlitePool, media_id: &str) -> anyhow::Result<Option<MediaTechInfo>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT tech_json FROM media WHERE id = ?")
+            .bind(media_id)
+            .fetch_optional(pool)
+            .await?;
+    match row.and_then(|(s,)| s) {
+        None => Ok(None),
+        // Corrupt/incompatible cached JSON (e.g. after a struct change) —
+        // treat as absent so the caller falls back to a live probe rather
+        // than 500ing.
+        Some(s) => Ok(serde_json::from_str(&s).ok()),
+    }
+}
+
+/// Persist probe results on the `media` row. Best-effort: errors are logged
+/// by the caller rather than propagated, since a missing cache is recoverable.
+pub async fn store(pool: &SqlitePool, media_id: &str, info: &MediaTechInfo) -> anyhow::Result<()> {
+    let json = serde_json::to_string(info)?;
+    sqlx::query("UPDATE media SET tech_json = ? WHERE id = ?")
+        .bind(json)
+        .bind(media_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
 pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
     let output = Command::new("ffprobe")
@@ -70,14 +99,76 @@ pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
         }
     }
 
+    let container = parsed.format.format_name.clone().filter(|s| !s.is_empty());
+    let browser_compat = compute_compat(video_track.as_ref(), &audio_tracks, container.as_deref());
+
     Ok(MediaTechInfo {
-        container: parsed.format.format_name.clone().filter(|s| !s.is_empty()),
+        container,
         duration_seconds: parsed.format.duration.as_deref().and_then(|s| s.parse().ok()),
         bitrate_kbps: parse_bitrate_kbps(parsed.format.bit_rate.as_deref()),
         file_size: parsed.format.size.as_deref().and_then(|s| s.parse().ok()),
         video: video_track,
         audio: audio_tracks,
+        browser_compat,
     })
+}
+
+/// Decide whether a file can be served as-is, remuxed cheaply, or needs
+/// a full transcode. The remux pipeline picks its output container
+/// (fMP4 vs WebM) based on the input video codec, so we accept both
+/// H.264 (→ MP4 path) and VP9/AV1 (→ WebM path) as copyable.
+///
+/// - `Direct`: container + codecs already match what a browser plays
+///             natively over HTTP — MP4/MOV with H.264+AAC/MP3, or
+///             WebM with VP9/VP8/AV1+Opus/Vorbis.
+/// - `Remux`:  video codec is copyable but container and/or audio need
+///             repackaging. Audio gets copied where browsers accept it
+///             in the chosen output container, else transcoded to a
+///             container-native codec (AAC in MP4, Opus in WebM).
+/// - `Transcode`: video codec isn't browser-playable (HEVC here for
+///                cross-browser safety, MPEG-2, VC-1, …). Not yet wired
+///                up — the stream endpoint falls back to attempting
+///                remux as a last-ditch effort.
+fn compute_compat(
+    video: Option<&VideoTrackInfo>,
+    audio: &[AudioTrackInfo],
+    container: Option<&str>,
+) -> BrowserCompat {
+    let Some(v) = video else { return BrowserCompat::Direct };
+
+    let video_in_mp4 = matches!(v.codec.as_str(), "h264");
+    let video_in_webm = matches!(v.codec.as_str(), "vp9" | "vp8" | "av1");
+    if !video_in_mp4 && !video_in_webm {
+        return BrowserCompat::Transcode;
+    }
+
+    // Pick the default audio track if present, else the first. Zero-audio
+    // files can still be direct/remuxed.
+    let a = audio.iter().find(|a| a.default).or_else(|| audio.first());
+
+    // If the container format name already matches the target family AND
+    // the audio is something that family plays natively, the browser can
+    // stream the file as-is without any repackaging.
+    let container_formats: Vec<&str> = container
+        .map(|c| c.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    let container_is_mp4 = container_formats
+        .iter()
+        .any(|p| matches!(*p, "mp4" | "mov" | "m4a" | "m4v"));
+    let container_is_webm = container_formats.iter().any(|p| *p == "webm");
+
+    if video_in_mp4 && container_is_mp4
+        && a.map_or(true, |a| matches!(a.codec.as_str(), "aac" | "mp3"))
+    {
+        return BrowserCompat::Direct;
+    }
+    if video_in_webm && container_is_webm
+        && a.map_or(true, |a| matches!(a.codec.as_str(), "opus" | "vorbis"))
+    {
+        return BrowserCompat::Direct;
+    }
+
+    BrowserCompat::Remux
 }
 
 fn parse_bitrate_kbps(s: Option<&str>) -> Option<u64> {

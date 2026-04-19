@@ -323,7 +323,7 @@ pub async fn scan_library_with_progress(
                         id
                     }
                 };
-                match upsert_episode(pool, library_id, &show_id, &abs, file_size).await {
+                match upsert_episode(pool, library_id, &show_id, &show_dir, &abs, file_size).await {
                     Ok(Some(out)) => {
                         if out.needs_assets { stats.episodes_indexed += 1; } else { stats.episodes_skipped += 1; }
                         Some(out)
@@ -416,6 +416,16 @@ pub async fn scan_library_with_progress(
                     };
                     if !job.has_sidecar_image {
                         thumbnails::scan_for_media(&pool, &job.media_id, &job.video).await;
+                    }
+                    // Probe + cache container/codec/duration info so /tech
+                    // and the remux endpoint don't each re-run ffprobe.
+                    match super::media_info::probe(&job.video).await {
+                        Ok(info) => {
+                            if let Err(e) = super::media_info::store(&pool, &job.media_id, &info).await {
+                                warn!(media_id = %job.media_id, %e, "failed to cache tech info");
+                            }
+                        }
+                        Err(e) => warn!(media_id = %job.media_id, %e, "ffprobe failed"),
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
@@ -634,10 +644,57 @@ pub struct UpsertOutcome {
     pub has_sidecar_image: bool,
 }
 
+/// First contiguous run of ASCII digits parsed as i64. Used by the
+/// folder/filename fallback when no SxxEyy tag or nfo is present.
+fn first_int(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            return s[start..i].parse().ok();
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Fallback when SxxEyy / nfo don't give us S+E: season comes from the
+/// immediate parent folder name (first integer), episode from the first
+/// integer in the filename. Files directly in the show folder get season 1.
+/// If no integer is present in the filename, derive a stable pseudo-number
+/// from its byte hash so episodes still sort deterministically.
+fn infer_season_episode(video: &Path, show_dir: &Path) -> (i64, i64) {
+    let parent = video.parent().unwrap_or(show_dir);
+    let season = if parent == show_dir {
+        1
+    } else {
+        parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(first_int)
+            .unwrap_or(1)
+    };
+    let stem = video.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let episode = first_int(stem).unwrap_or_else(|| {
+        let mut h: u64 = 1469598103934665603;
+        for byte in stem.bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        1000 + (h % 9000) as i64
+    });
+    (season, episode)
+}
+
 async fn upsert_episode(
     pool: &SqlitePool,
     library_id: i64,
     show_id: &str,
+    show_dir: &Path,
     video: &Path,
     file_size: i64,
 ) -> anyhow::Result<Option<UpsertOutcome>> {
@@ -675,13 +732,16 @@ async fn upsert_episode(
 
     let (season, episode) = match (nfo.season, nfo.episode) {
         (Some(s), Some(e)) => (s, e),
-        _ => match nfo::parse_sxxeyy(base) {
-            Some((s, e)) => (s, e),
-            None => {
-                warn!(file = base, "cannot determine season/episode; skipping");
-                return Ok(None);
-            }
-        },
+        _ => nfo::parse_sxxeyy(base).unwrap_or_else(|| {
+            let inferred = infer_season_episode(video, show_dir);
+            debug!(
+                file = base,
+                season = inferred.0,
+                episode = inferred.1,
+                "no SxxEyy/nfo — inferred from folder + filename"
+            );
+            inferred
+        }),
     };
 
     let title = nfo.title.clone().unwrap_or_else(|| base.to_string());
