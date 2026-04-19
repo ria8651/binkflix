@@ -10,6 +10,8 @@ Metadata comes from Kodi-style NFO sidecar files (whatever sonarr/radarr drops n
 - **Incremental rescans** — mtime + file_size check per row, so restarts after the first scan are near-instant.
 - **Shows grouped by show → season** — seasons collapse automatically, with season posters when present.
 - **HTTP range streaming** — proper 206 responses; any browser-native `<video>` client (or VLC) works.
+- **Custom video player** — fullscreen page, overlay controls that auto-hide after 2s of idle playback. Scrubber shows played + buffered ranges; volume slider shows fill. Keyboard shortcuts: space/`k` play-pause, `←`/`→` seek ±5s, `↑`/`↓` volume, `m` mute, `f` fullscreen. Subtitle track picker integrated into the chrome (ASS via JASSUB, VTT via native `<track>`).
+- **Theming** — four themes (default-dark, classic-light, terminal, material) ported from the `boom` token system; switcher in the header and in the player overlay. Persists to localStorage.
 - **Posters / fanart / episode thumbs** with lazy-loaded `<img>` so the home page doesn't nuke your NIC.
 - **SyncPlay hub scaffolded** — WebSocket room at `/api/syncplay/:room` for play/pause/seek/heartbeat fan-out. Client UI not wired yet.
 - **Single-origin dev** — `dx serve` runs client + backend together on one port with HMR.
@@ -67,12 +69,16 @@ For a standalone backend (no UI rebuild) use `cargo run --features server`.
 ```
 src/
   main.rs            # feature-gated entry (web vs server)
-  app.rs             # Dioxus routes + components (compiles on both targets)
+  app.rs             # Dioxus routes + layout + theme switcher
+  video_player.rs    # custom overlay player + subtitle picker
   types.rs           # serde DTOs shared client/server
   client_api.rs      # gloo-net fetchers (wasm-only bodies)
   server/            # #[cfg(feature = "server")] — axum, DB, scanner, NFO, syncplay
 migrations/0001_init.sql
-assets/style.css
+assets/
+  tokens.css         # design tokens + per-theme overrides
+  style.css          # component styles, all via tokens
+  static/player.js   # JASSUB + custom control wiring
 Dioxus.toml
 .env.example
 ```
