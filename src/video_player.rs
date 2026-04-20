@@ -134,7 +134,14 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             // surface if it can't handle it.
             Some(Err(_)) => media_stream_url(&id_for_src),
             Some(Ok(info)) => match info.browser_compat {
-                BrowserCompat::Direct | BrowserCompat::Remux => media_stream_url(&id_for_src),
+                // Remux goes through the new HLS pipeline (real random
+                // access + keyframe-aligned fMP4 segments). Direct stays
+                // on the byte-range `/stream` path for now — HLS with
+                // `-c:v copy` can't repackage VP9/AV1 into fMP4, and most
+                // Direct-compat files are plain MP4 that ServeFile handles
+                // natively.
+                BrowserCompat::Direct => media_stream_url(&id_for_src),
+                BrowserCompat::Remux => media_hls_url(&id_for_src),
                 // Don't set a src — the overlay below prompts the user
                 // to pick a best-effort mode.
                 BrowserCompat::Transcode => String::new(),
@@ -200,8 +207,12 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     use_effect(move || {
         let src = stream_src.read().clone();
         if src.is_empty() { return; }
+        // Attach the source first (native or hls.js, decided by the JS
+        // side based on canPlayType), then wire up the custom controls.
+        // `attach` is idempotent and re-attaches cleanly when `src`
+        // changes (e.g. user picks `?mode=remux` in the transcode prompt).
         let js = format!(
-            "window.binkflixPlayer?.initControls('{video_dom_id}');"
+            "(async () => {{ await window.binkflixPlayer?.attach('{video_dom_id}', '{src}'); window.binkflixPlayer?.initControls('{video_dom_id}'); }})();"
         );
         spawn(async move {
             let _ = document::eval(&js).await;
@@ -213,15 +224,11 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // through a soft route change, which is jarring when navigating back
     // to the library from the player.
     use_drop(move || {
+        // `detach` tears down any hls.js instance attached to this video
+        // element in addition to clearing src/pausing — without it the
+        // hls.js xhr loop keeps running after a soft nav.
         let js = format!(
-            r#"
-            const v = document.getElementById('{video_dom_id}');
-            if (v) {{
-                try {{ v.pause(); }} catch (_) {{}}
-                v.removeAttribute('src');
-                try {{ v.load(); }} catch (_) {{}}
-            }}
-            "#
+            "window.binkflixPlayer?.detach('{video_dom_id}');"
         );
         spawn(async move { let _ = document::eval(&js).await; });
     });
@@ -348,18 +355,18 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     _ => rsx! {},
                 }
             }
-            // Only mount the <video> once we have a real src. Rendering
-            // it with an empty src makes some browsers fire an error
-            // event, which toggles `.errored` on the wrap and shows the
-            // "Can't play this video" overlay *on top of* the transcode
-            // prompt — two warnings fighting for attention.
+            // Only mount the <video> once we have a real src. We don't
+            // set the `src` attribute in markup — `binkflixPlayer.attach`
+            // picks between native playback (Safari's HLS support) and
+            // hls.js based on browser capability, and needs to own the
+            // element's source. Rendering a .m3u8 via bare `src=` fails
+            // immediately on Chrome/Firefox.
             {
                 let src = stream_src.read().clone();
                 if !src.is_empty() {
                     rsx! {
                         video {
                             id: "{video_dom_id}",
-                            src: "{src}",
                             autoplay: true,
                             preload: "metadata",
                         }

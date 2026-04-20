@@ -144,6 +144,7 @@ pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") 
 pub fn media_stream_url_with_mode(id: &str, mode: &str) -> String {
     format!("/api/media/{id}/stream?mode={mode}")
 }
+pub fn media_hls_url(id: &str) -> String { format!("/api/media/{id}/hls/index.m3u8") }
 pub fn media_subtitles_url(id: &str) -> String { format!("/api/media/{id}/subtitles") }
 pub fn media_tech_url(id: &str) -> String { format!("/api/media/{id}/tech") }
 pub fn media_subtitle_url(id: &str, track: &str) -> String {
