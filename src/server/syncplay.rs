@@ -251,8 +251,17 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String) {
         _ = &mut outbound => { inbound.abort(); }
         _ = &mut inbound => { outbound.abort(); }
     }
+    // Wait for the aborted task's future to actually drop before we sample
+    // `receiver_count` — the outbound task owns `rx`, and `abort()` only
+    // signals cancellation; the captured receiver lives until the future
+    // is dropped. Skipping this caused viewer counts to leak across quick
+    // leave/rejoin cycles: the new client subscribed while the previous
+    // socket's ghost rx was still alive, so the Peer broadcast reported
+    // N+1 and kept climbing.
+    let _ = outbound.await;
+    let _ = inbound.await;
 
-    let viewers = tx.receiver_count().saturating_sub(1);
+    let viewers = tx.receiver_count();
     let _ = tx.send(Broadcast::Peer {
         client_id: client_id.clone(),
         joined: false,

@@ -444,8 +444,11 @@ function initControls(videoId) {
     };
     const onVolBtn = () => { video.muted = !video.muted; };
     const onFsBtn = () => {
+        // Fullscreen the whole document so the app chrome (back, topbar)
+        // stays reachable in FS. Fullscreening just `wrap` was more
+        // "cinematic" but hid the back button and theme/room controls.
         if (document.fullscreenElement) document.exitFullscreen();
-        else wrap.requestFullscreen?.();
+        else document.documentElement.requestFullscreen?.();
     };
 
     playBtn?.addEventListener("click", onPlayBtn);
@@ -484,6 +487,10 @@ function initControls(videoId) {
         if (!video.paused) wrap.classList.remove("active");
     };
     wrap.addEventListener("mousemove", bumpActive);
+    // Count a click as activity too — otherwise a paused user tapping the
+    // video area to resume sees the chrome snap away immediately because
+    // the idle timer was already near zero.
+    wrap.addEventListener("pointerdown", bumpActive);
     wrap.addEventListener("mouseleave", onLeave);
 
     // Keyboard shortcuts (document-level so the user doesn't have to click the
@@ -578,6 +585,7 @@ function initControls(videoId) {
         fsBtn?.removeEventListener("pointerup", blurSelf);
         wrap.removeEventListener("click", onVideoClick);
         wrap.removeEventListener("mousemove", bumpActive);
+        wrap.removeEventListener("pointerdown", bumpActive);
         wrap.removeEventListener("mouseleave", onLeave);
         document.removeEventListener("keydown", onKey);
         if (activeTimer) clearTimeout(activeTimer);
