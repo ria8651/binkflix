@@ -497,46 +497,97 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
             });
         }
 
-        // Attach DOM event listeners AFTER commit. `use_effect` fires post-mount,
-        // so `<video>` exists by then; `use_hook` would run too early and miss it.
+        // Attach DOM event listeners. The <video> element is now conditionally
+        // rendered — VideoPlayer holds off mounting it until the tech probe
+        // resolves (and, for HLS-needed files, until `attach` has wired up
+        // hls.js). That means a single post-commit `use_effect` often fires
+        // before the element exists. Poll for it from a spawned task so we
+        // attach as soon as it lands, and stop the moment we succeed or the
+        // component unmounts.
         {
             let video_dom_id = video_dom_id.clone();
             let suppress_l = suppress.clone();
             let slot = handle_slot.clone();
-            use_effect(move || {
-                if slot.borrow().is_some() {
-                    return; // already attached
-                }
-                let Some(video) = lookup_video(&video_dom_id) else { return };
-                let mut handle = ListenerHandle::new(video.clone());
-                let video_for_cb = video.clone();
-
-                let make = |mapper: Box<dyn Fn(i64) -> ClientMsg>| -> Closure<dyn FnMut()> {
-                    let suppress = suppress_l.clone();
-                    let video = video_for_cb.clone();
-                    Closure::wrap(Box::new(move || {
-                        let n = suppress.get();
-                        if n > 0 {
-                            suppress.set(n - 1);
+            use_hook(|| {
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Cap polling at ~60s — well past any realistic probe +
+                    // first-segment wait. If we haven't seen the element by
+                    // then, the bridge will stay silent rather than spin.
+                    for _ in 0..600 {
+                        if slot.borrow().is_some() {
                             return;
                         }
-                        let pos_ms = (video.current_time() * 1000.0) as i64;
-                        ctx.send(mapper(pos_ms));
-                    }) as Box<dyn FnMut()>)
-                };
+                        if let Some(video) = lookup_video(&video_dom_id) {
+                            let mut handle = ListenerHandle::new(video.clone());
+                            let video_for_cb = video.clone();
+                            let make = |mapper: Box<dyn Fn(i64) -> ClientMsg>|
+                                -> Closure<dyn FnMut()>
+                            {
+                                let suppress = suppress_l.clone();
+                                let video = video_for_cb.clone();
+                                Closure::wrap(Box::new(move || {
+                                    let n = suppress.get();
+                                    if n > 0 {
+                                        suppress.set(n - 1);
+                                        return;
+                                    }
+                                    let pos_ms = (video.current_time() * 1000.0) as i64;
+                                    ctx.send(mapper(pos_ms));
+                                }) as Box<dyn FnMut()>)
+                            };
+                            let on_play = make(Box::new(|p| ClientMsg::Play { position_ms: p }));
+                            let on_pause = make(Box::new(|p| ClientMsg::Pause { position_ms: p }));
+                            let on_seek = make(Box::new(|p| ClientMsg::Seek { position_ms: p }));
+                            let _ = video.add_event_listener_with_callback(
+                                "play", on_play.as_ref().unchecked_ref());
+                            let _ = video.add_event_listener_with_callback(
+                                "pause", on_pause.as_ref().unchecked_ref());
+                            let _ = video.add_event_listener_with_callback(
+                                "seeked", on_seek.as_ref().unchecked_ref());
+                            handle.push("play", on_play);
+                            handle.push("pause", on_pause);
+                            handle.push("seeked", on_seek);
+                            *slot.borrow_mut() = Some(handle);
 
-                let on_play = make(Box::new(|p| ClientMsg::Play { position_ms: p }));
-                let on_pause = make(Box::new(|p| ClientMsg::Pause { position_ms: p }));
-                let on_seek = make(Box::new(|p| ClientMsg::Seek { position_ms: p }));
-
-                let _ = video.add_event_listener_with_callback("play", on_play.as_ref().unchecked_ref());
-                let _ = video.add_event_listener_with_callback("pause", on_pause.as_ref().unchecked_ref());
-                let _ = video.add_event_listener_with_callback("seeked", on_seek.as_ref().unchecked_ref());
-
-                handle.push("play", on_play);
-                handle.push("pause", on_pause);
-                handle.push("seeked", on_seek);
-                *slot.borrow_mut() = Some(handle);
+                            // Initial catch-up: when a user is pulled into
+                            // a room mid-playback, the Welcome carries the
+                            // current position + playing state but nothing
+                            // pushes it to the fresh video element. Apply
+                            // it here once, at the time the listeners are
+                            // wired, so the new viewer lands at the right
+                            // moment instead of starting from 0. Wait for
+                            // the element to be ready to seek — calling
+                            // set_current_time before loadedmetadata queues
+                            // the seek silently on some browsers.
+                            if let Some(state) = ctx.current.peek().clone() {
+                                let kind = if state.playing {
+                                    RemoteKind::Play { position_ms: state.position_ms }
+                                } else {
+                                    RemoteKind::Pause { position_ms: state.position_ms }
+                                };
+                                let video_for_sync = video.clone();
+                                let suppress_sync = suppress_l.clone();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    // `readyState >= 1` (HAVE_METADATA) is
+                                    // the minimum for a seek to land on a
+                                    // real keyframe; poll briefly, then
+                                    // apply even if we time out so a stall
+                                    // in metadata load doesn't leave the
+                                    // late joiner at t=0 forever.
+                                    for _ in 0..100 {
+                                        if video_for_sync.ready_state() >= 1 {
+                                            break;
+                                        }
+                                        gloo_timers::future::TimeoutFuture::new(100).await;
+                                    }
+                                    apply_remote(&video_for_sync, &kind, &suppress_sync);
+                                });
+                            }
+                            return;
+                        }
+                        gloo_timers::future::TimeoutFuture::new(100).await;
+                    }
+                });
             });
         }
 
