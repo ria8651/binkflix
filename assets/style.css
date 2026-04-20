@@ -1031,7 +1031,6 @@ h2.section {
 .search-panel input:focus {
     border-color: var(--border-accent);
 }
-.search-panel { position: relative; }
 .search-panel input { padding-right: calc(var(--space-6) + 24px); }
 .search-clear {
     position: absolute;
