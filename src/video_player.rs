@@ -22,6 +22,7 @@ use crate::types::*;
 use dioxus::prelude::*;
 
 const ICON_PLAY: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>"#;
+const ICON_BACK: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>"#;
 const ICON_CAPTIONS: &str = r#"<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 7H9.5v-.5h-2v3h2V13H11v1c0 .55-.45 1-1 1H7c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1zm7 0h-1.5v-.5h-2v3h2V13H18v1c0 .55-.45 1-1 1h-3c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1z"/></svg>"#;
 const ICON_FULLSCREEN: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9V4h5M21 9V4h-5M3 15v5h5M21 15v5h-5"/></svg>"#;
 const ICON_INFO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5M12 8h.01"/></svg>"#;
@@ -320,32 +321,45 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
 
     rsx! {
         div { class: "video-wrap",
-            // Title overlay — auto-hides with the bottom chrome.
-            {
-                let media_snapshot = media_resource.read_unchecked().clone();
-                let show_snapshot = show_resource.read_unchecked().clone().flatten();
-                match media_snapshot {
-                    Some(Ok(m)) => {
-                        let (primary, secondary) = if m.kind == "episode" {
-                            let ep_label = match (m.season_number, m.episode_number) {
-                                (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02} · {}", m.title)),
-                                _ => Some(m.title.clone()),
+            // Unified top bar: back link on the left, title in the middle,
+            // rooms + theme controls on the right. Lives inside
+            // `.video-wrap` so it auto-hides with the rest of the chrome
+            // and stays visible when the wrap itself is fullscreened.
+            div { class: "player-topbar",
+                Link { to: back_route.clone(), class: "player-topbar-back",
+                    span { dangerous_inner_html: ICON_BACK }
+                    span { "Back" }
+                }
+                {
+                    let media_snapshot = media_resource.read_unchecked().clone();
+                    let show_snapshot = show_resource.read_unchecked().clone().flatten();
+                    match media_snapshot {
+                        Some(Ok(m)) => {
+                            let (primary, secondary) = if m.kind == "episode" {
+                                let ep_label = match (m.season_number, m.episode_number) {
+                                    (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02} · {}", m.title)),
+                                    _ => Some(m.title.clone()),
+                                };
+                                let primary = show_snapshot.unwrap_or_else(|| m.title.clone());
+                                (primary, ep_label)
+                            } else {
+                                (m.title.clone(), m.year.map(|y| y.to_string()))
                             };
-                            let primary = show_snapshot.unwrap_or_else(|| m.title.clone());
-                            (primary, ep_label)
-                        } else {
-                            (m.title.clone(), m.year.map(|y| y.to_string()))
-                        };
-                        rsx! {
-                            div { class: "player-title",
-                                div { class: "player-title-primary", "{primary}" }
-                                if let Some(sec) = secondary {
-                                    div { class: "player-title-secondary", "{sec}" }
+                            rsx! {
+                                div { class: "player-topbar-title",
+                                    div { class: "player-topbar-primary", "{primary}" }
+                                    if let Some(sec) = secondary {
+                                        div { class: "player-topbar-secondary", "{sec}" }
+                                    }
                                 }
                             }
                         }
+                        _ => rsx! { div { class: "player-topbar-title" } },
                     }
-                    _ => rsx! {},
+                }
+                div { class: "player-topbar-right",
+                    crate::syncplay_client::RoomsDropdown {}
+                    crate::app::ThemeSwitcher {}
                 }
             }
             // Only mount the <video> once we have a real src. Rendering

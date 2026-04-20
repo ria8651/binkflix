@@ -444,11 +444,11 @@ function initControls(videoId) {
     };
     const onVolBtn = () => { video.muted = !video.muted; };
     const onFsBtn = () => {
-        // Fullscreen the whole document so the app chrome (back, topbar)
-        // stays reachable in FS. Fullscreening just `wrap` was more
-        // "cinematic" but hid the back button and theme/room controls.
+        // Fullscreen just the wrap — back / title / room / theme controls
+        // live inside it as .player-topbar, so they come along and stay
+        // reachable without dragging the rest of the page into FS.
         if (document.fullscreenElement) document.exitFullscreen();
-        else document.documentElement.requestFullscreen?.();
+        else wrap.requestFullscreen?.();
     };
 
     playBtn?.addEventListener("click", onPlayBtn);

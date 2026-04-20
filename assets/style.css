@@ -408,11 +408,29 @@ h2.section {
     object-fit: contain;
 }
 
-.player-back {
+/* Unified player top bar: back link, title, and room/theme controls. */
+.player-topbar {
     position: absolute;
-    top: var(--space-7);
-    left: var(--space-7);
-    z-index: 4;
+    left: 0;
+    right: 0;
+    top: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-6);
+    padding: var(--space-6) var(--space-7) var(--space-10);
+    background: linear-gradient(to bottom, rgb(0 0 0 / 0.75) 0%, rgb(0 0 0 / 0.3) 60%, transparent 100%);
+    color: #fff;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 250ms ease;
+    z-index: 3;
+}
+.video-wrap.paused .player-topbar,
+.video-wrap.active .player-topbar {
+    opacity: 1;
+    pointer-events: auto;
+}
+.player-topbar-back {
     display: inline-flex;
     align-items: center;
     gap: var(--space-4);
@@ -422,53 +440,52 @@ h2.section {
     border-radius: var(--radius-button);
     font-size: var(--text-sm);
     font-weight: var(--weight-medium);
-    opacity: 0;
-    transition: opacity 250ms ease, background var(--motion-hover);
+    transition: background var(--motion-hover);
     backdrop-filter: blur(8px);
+    flex: 0 0 auto;
 }
-.player-back:hover { background: rgb(0 0 0 / 0.7); }
-.player-back > span { display: inline-flex; align-items: center; line-height: 1; }
-.player-back svg { display: block; }
-.player-fullpage:has(.video-wrap.paused) .player-back,
-.player-fullpage:has(.video-wrap.active) .player-back,
-.player-fullpage:has(.video-wrap.paused) .player-theme,
-.player-fullpage:has(.video-wrap.active) .player-theme {
-    opacity: 1;
-    pointer-events: auto;
+.player-topbar-back:hover { background: rgb(0 0 0 / 0.7); }
+.player-topbar-back > span { display: inline-flex; align-items: center; line-height: 1; }
+.player-topbar-back svg { display: block; }
+.player-topbar-title {
+    flex: 1 1 auto;
+    min-width: 0;
 }
-
-.player-theme {
-    position: absolute;
-    top: var(--space-7);
-    right: var(--space-7);
-    z-index: 4;
+.player-topbar-primary {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.player-topbar-secondary {
+    font-size: var(--text-sm);
+    color: rgb(255 255 255 / 0.72);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.player-topbar-right {
     display: flex;
     align-items: center;
     gap: var(--space-5);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 250ms ease;
+    flex: 0 0 auto;
 }
-.player-theme .theme-switcher .btn-theme {
+.player-topbar-right .theme-switcher .btn-theme,
+.player-topbar-right .rooms-btn {
     background: rgb(0 0 0 / 0.45);
     color: #fff;
     border-color: rgb(255 255 255 / 0.2);
     backdrop-filter: blur(8px);
 }
-.player-theme .theme-switcher .btn-theme:hover {
+.player-topbar-right .theme-switcher .btn-theme:hover,
+.player-topbar-right .rooms-btn:hover {
     background: rgb(0 0 0 / 0.7);
 }
-.player-theme .theme-switcher .caret { color: rgb(255 255 255 / 0.7); }
-.player-theme .rooms-btn {
-    background: rgb(0 0 0 / 0.45);
-    color: #fff;
-    border-color: rgb(255 255 255 / 0.2);
-    backdrop-filter: blur(8px);
-}
-.player-theme .rooms-btn:hover {
-    background: rgb(0 0 0 / 0.7);
-}
-.player-theme .rooms-btn.in-room {
+.player-topbar-right .theme-switcher .caret { color: rgb(255 255 255 / 0.7); }
+.player-topbar-right .rooms-btn.in-room {
     border-color: var(--border-accent);
     color: var(--text-accent);
 }
@@ -501,39 +518,6 @@ h2.section {
 .video-wrap.active .player-chrome {
     opacity: 1;
     pointer-events: auto;
-}
-
-/* Title bar at the top of the player. Mirrors .player-chrome's auto-hide
- * behaviour so it fades out with the rest of the controls during playback. */
-.player-title {
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: 0;
-    padding: var(--space-6) var(--space-7) var(--space-10);
-    background: linear-gradient(to bottom, rgb(0 0 0 / 0.75) 0%, rgb(0 0 0 / 0.3) 60%, transparent 100%);
-    color: #fff;
-    opacity: 0;
-    transition: opacity 250ms ease;
-    pointer-events: none;
-    z-index: 2;
-    /* Leave room for the fullpage-level chrome: the absolute-positioned
-     * Back link at top-left and the theme switcher / rooms dropdown
-     * anchored at top-right. */
-    padding-left: calc(var(--space-7) + 110px);
-    padding-right: calc(var(--space-7) + 140px);
-}
-.video-wrap.paused .player-title,
-.video-wrap.active .player-title { opacity: 1; }
-.player-title-primary {
-    font-size: var(--text-lg);
-    font-weight: 600;
-    line-height: 1.25;
-}
-.player-title-secondary {
-    font-size: var(--text-sm);
-    color: rgb(255 255 255 / 0.72);
-    margin-top: 2px;
 }
 
 /* Hide the cursor while the chrome is hidden (playing + idle) so nothing
