@@ -33,7 +33,7 @@ header.topbar {
     position: sticky;
     top: 0;
     z-index: 10;
-    border-bottom: var(--stroke-default) solid var(--border-default);
+    border-bottom: var(--stroke-default);
     box-shadow: var(--shadow-raised);
     gap: var(--space-7);
 }
@@ -69,7 +69,7 @@ header.topbar .top-right {
     padding: var(--space-4) var(--space-6);
     background: var(--bg-button);
     color: var(--text-secondary);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     border-radius: var(--radius-button);
     font: inherit;
     font-size: var(--text-sm);
@@ -95,7 +95,7 @@ header.topbar .top-right {
     right: 0;
     min-width: 180px;
     background: var(--bg-surface-raised);
-    border: var(--stroke-default) solid var(--border-dialog);
+    border: var(--stroke-dialog);
     border-radius: var(--radius-dialog);
     box-shadow: var(--shadow-dialog);
     padding: var(--space-3);
@@ -171,7 +171,7 @@ header.topbar .top-right {
     right: 0;
     width: 320px;
     background: var(--bg-surface-raised);
-    border: var(--stroke-default) solid var(--border-dialog);
+    border: var(--stroke-dialog);
     border-radius: var(--radius-dialog);
     box-shadow: var(--shadow-dialog);
     padding: var(--space-6);
@@ -220,7 +220,7 @@ header.topbar .top-right {
     padding: var(--space-4) var(--space-6);
     background: var(--bg-button);
     color: var(--text-primary);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     border-radius: var(--radius-button);
     font: inherit;
     font-size: var(--text-sm);
@@ -257,7 +257,7 @@ h2.section {
 
 .card {
     background: var(--bg-tile);
-    border: var(--stroke-default) solid var(--border-tile);
+    border: var(--stroke-tile);
     border-radius: var(--radius-tile);
     overflow: hidden;
     transition: transform var(--motion-hover), box-shadow var(--motion-hover), border-color var(--motion-hover);
@@ -321,7 +321,7 @@ h2.section {
     aspect-ratio: 2 / 3;
     background: var(--bg-surface-hover) center/cover no-repeat;
     border-radius: var(--radius-tile);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     box-shadow: var(--shadow-tile);
 }
 .detail h1 {
@@ -375,7 +375,7 @@ h2.section {
 .btn.ghost {
     background: transparent;
     color: var(--text-primary);
-    border: var(--stroke-default) solid var(--border-raised);
+    border: var(--stroke-raised);
     box-shadow: none;
 }
 .btn.ghost:hover {
@@ -945,7 +945,7 @@ h2.section {
     background: var(--bg-surface-hover) center/cover no-repeat;
     border-radius: var(--radius-row);
     flex-shrink: 0;
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
 }
 
 .episode-list {
@@ -960,7 +960,7 @@ h2.section {
     padding: var(--space-5);
     border-radius: var(--radius-tile);
     background: var(--bg-tile);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     color: inherit;
     transition: background var(--motion-hover), border-color var(--motion-hover);
     box-shadow: var(--shadow-tile);
@@ -1010,7 +1010,7 @@ h2.section {
     right: 0;
     top: calc(100% + var(--space-3));
     background: var(--bg-surface-raised);
-    border: 1px solid var(--border-default);
+    border: var(--stroke-default);
     border-radius: var(--radius-dialog);
     padding: var(--space-4);
     min-width: 280px;
@@ -1022,7 +1022,7 @@ h2.section {
     padding: var(--space-5) var(--space-6);
     background: var(--bg-input, var(--bg-surface));
     color: var(--text-primary);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     border-radius: var(--radius-button);
     font: inherit;
     font-size: var(--text-md);
@@ -1059,7 +1059,7 @@ h2.section {
 .rooms-btn {
     background: var(--bg-button);
     color: var(--text-secondary);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     padding: var(--space-4) var(--space-6);
     border-radius: var(--radius-button);
     font: inherit;
@@ -1102,7 +1102,7 @@ h2.section {
     right: 0;
     top: calc(100% + var(--space-4));
     background: var(--bg-surface-raised);
-    border: var(--stroke-default) solid var(--border-dialog);
+    border: var(--stroke-dialog);
     border-radius: var(--radius-dialog);
     padding: var(--space-5);
     width: 320px;
@@ -1153,7 +1153,7 @@ h2.section {
     gap: var(--space-4);
     padding: var(--space-5);
     background: var(--bg-surface-hover);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     border-radius: var(--radius-row);
 }
 .rooms-current-main {
@@ -1179,7 +1179,7 @@ h2.section {
     padding: var(--space-3) var(--space-5);
     background: transparent;
     color: var(--text-secondary);
-    border: var(--stroke-default) solid var(--border-default);
+    border: var(--stroke-default);
     border-radius: var(--radius-button);
     font: inherit;
     font-size: var(--text-sm);

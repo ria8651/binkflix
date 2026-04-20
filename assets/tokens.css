@@ -98,7 +98,13 @@
   --radius-toast: 6px;
   --radius-radio: 8px;
 
-  --stroke-default: 1px;
+  /* Border shorthands — width + style + color bundled so a theme can kill
+   * a whole border (including its layout gap) with a single `none`, rather
+   * than just making the color transparent and leaving a 1px slot behind. */
+  --stroke-default: 1px solid var(--border-default);
+  --stroke-dialog: 1px solid var(--border-dialog);
+  --stroke-tile: 1px solid var(--border-tile);
+  --stroke-raised: 1px solid var(--border-raised);
 
   /* Motion */
   --motion-hover: 150ms cubic-bezier(0.33, 1, 0.68, 1);
@@ -216,7 +222,10 @@
   --radius-toast: 0;
   --radius-radio: 0;
 
-  --stroke-default: 2px;
+  --stroke-default: 2px solid var(--border-default);
+  --stroke-dialog: 2px solid var(--border-dialog);
+  --stroke-tile: 2px solid var(--border-tile);
+  --stroke-raised: 2px solid var(--border-raised);
 
   --motion-hover: 0ms;
   --motion-focus-appear: 0ms;
@@ -267,6 +276,14 @@
   --border-error: #b00020;
   --border-tile: transparent;
   --border-tile-hover: transparent;
+
+  /* Material elevates via shadow, not rules — collapse the default/tile/
+   * dialog strokes to `none` so the 1px layout gap goes with the color.
+   * `--stroke-raised` keeps a real border since `--border-raised` is a
+   * visible divider here (used for e.g. playback debug panel chrome). */
+  --stroke-default: none;
+  --stroke-dialog: none;
+  --stroke-tile: none;
 
   --accent: #6200ee;
   --accent-hover: #7722ff;
