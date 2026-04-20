@@ -37,7 +37,17 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
+
+/// Uuid (with dashes) and "word"-safe ids only. `cache_dir_for` joins `id` into
+/// the cache root, so anything that escapes (`..`, slashes, absolute paths)
+/// would let callers point ffmpeg/remove_dir_all at arbitrary places.
+fn id_is_safe(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() < 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
 
 /// Root of the HLS cache on disk. Each media id gets its own subdir.
 fn cache_root() -> PathBuf {
@@ -59,14 +69,57 @@ pub struct HlsCache {
 }
 
 struct PendingState {
-    /// Fires when the first segment has been written (so the playlist has
-    /// at least one entry and the initial file read will succeed).
-    first_segment: Notify,
-    /// Fires when ffmpeg exits, success or failure. Signals that nothing
-    /// more will be appended to the playlist.
-    finished: Notify,
-    /// Error message if ffmpeg failed. Read once `finished` fires.
+    /// Latched "the first segment (or a terminal error) is ready". Waiters
+    /// check this before arming the Notify below so a Notify firing in
+    /// between the map lookup and the await can't leave them stuck. A
+    /// plain `Notify::notify_waiters` only wakes tasks that are currently
+    /// parked — the atomic bridges the gap.
+    ready: AtomicBool,
+    /// Fires when `ready` flips to true OR when ffmpeg finishes (either
+    /// outcome — error or success — unblocks waiters).
+    notify: Notify,
+    /// Set to true once ffmpeg exited; watcher uses this to stop polling.
+    ffmpeg_done: AtomicBool,
+    /// Error message if ffmpeg failed. Checked by every waiter after
+    /// `ready` flips — without this, the second request into a failed
+    /// generation would return a cache dir that has no playlist and the
+    /// subsequent file read would surface as a misleading 404.
     error: tokio::sync::Mutex<Option<String>>,
+}
+
+impl PendingState {
+    fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            notify: Notify::new(),
+            ffmpeg_done: AtomicBool::new(false),
+            error: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_ready(&self) -> std::result::Result<(), String> {
+        if !self.ready.load(Ordering::Acquire) {
+            // `Notified::enable` synchronously registers interest so a
+            // `notify_waiters` that fires between this line and `.await`
+            // still wakes us. Without it the check-then-park pattern has
+            // a hole.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.ready.load(Ordering::Acquire) {
+                notified.await;
+            }
+        }
+        if let Some(msg) = self.error.lock().await.clone() {
+            return Err(msg);
+        }
+        Ok(())
+    }
 }
 
 impl HlsCache {
@@ -79,26 +132,45 @@ impl HlsCache {
 /// the cache dir once there's at least a playlist + first segment on disk.
 /// Concurrent callers all block on the same Notify and share the one job.
 async fn ensure_started(state: &AppState, id: &str) -> Result<PathBuf> {
+    // Validate *before* doing anything with the id on the filesystem — the
+    // two disk operations below (`remove_dir_all` the cache dir, later
+    // `cache_dir_for` for ffmpeg output) would otherwise honour any `..`
+    // segments a caller managed to sneak in.
+    if !id_is_safe(id) {
+        return Err(Error::BadRequest("invalid media id".into()));
+    }
+
     let cache = cache_dir_for(id);
     let done = cache.join(".done");
     if done.exists() {
         return Ok(cache);
     }
 
-    // If someone else is already generating, just wait for their first
-    // segment and return the shared cache dir.
+    // If someone else is already generating, wait on the shared state and
+    // surface any error they hit. Without the error check, a second
+    // request into a failed generation would silently return the empty
+    // cache dir.
     if let Some(existing) = state.hls_cache.pending.get(id).map(|e| e.clone()) {
-        existing.first_segment.notified().await;
+        existing
+            .wait_ready()
+            .await
+            .map_err(|msg| Error::Other(anyhow::anyhow!(msg)))?;
         return Ok(cache);
     }
 
-    // We're the leader. Register the notify BEFORE spawning so any racer
-    // that checks the map in between sees us.
-    let pending = Arc::new(PendingState {
-        first_segment: Notify::new(),
-        finished: Notify::new(),
-        error: tokio::sync::Mutex::new(None),
-    });
+    // We're the leader. Resolve the source path and probe *before* we
+    // touch the cache dir — wiping and re-creating an unknown id's cache
+    // on every NotFound would be silly.
+    let row: (String,) = sqlx::query_as("SELECT path FROM media WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let src = row.0;
+
+    // Register the PendingState before spawning so any racer that checks
+    // the map in between sees us.
+    let pending = Arc::new(PendingState::new());
     state
         .hls_cache
         .pending
@@ -107,18 +179,12 @@ async fn ensure_started(state: &AppState, id: &str) -> Result<PathBuf> {
     // Wipe any half-written state from an earlier aborted run. If ffmpeg
     // left old segments around the playlist would reference stale bytes.
     let _ = tokio::fs::remove_dir_all(&cache).await;
-    tokio::fs::create_dir_all(&cache)
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("create hls cache: {e}")))?;
-
-    // Resolve source path while we're still on the request task so any
-    // db error surfaces as a clean 4xx rather than a background panic.
-    let row: (String,) = sqlx::query_as("SELECT path FROM media WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(Error::NotFound)?;
-    let src = row.0;
+    if let Err(e) = tokio::fs::create_dir_all(&cache).await {
+        // Don't leave a zombie PendingState if we can't even create the
+        // cache — later callers would wait on a `ready` that never flips.
+        state.hls_cache.pending.remove(id);
+        return Err(Error::Other(anyhow::anyhow!("create hls cache: {e}")));
+    }
 
     // Decide audio handling from the cached probe. No probe = transcode
     // to AAC, which always works. With a probe, copy AAC through and
@@ -137,9 +203,12 @@ async fn ensure_started(state: &AppState, id: &str) -> Result<PathBuf> {
         .and_then(|i| i.video.as_ref())
         .map(|v| v.codec.clone());
     if matches!(video_codec.as_deref(), Some("vp9" | "vp8" | "av1")) {
+        // These codecs don't fit in fMP4 — they need a WebM/DASH
+        // pipeline instead, which isn't implemented. Fail fast so the
+        // caller falls back to the byte-range /stream path.
         state.hls_cache.pending.remove(id);
         return Err(Error::NotImplemented(format!(
-            "HLS transcode from {} not implemented yet",
+            "{} isn't supported in HLS (needs WebM/DASH)",
             video_codec.as_deref().unwrap_or("?")
         )));
     }
@@ -149,17 +218,21 @@ async fn ensure_started(state: &AppState, id: &str) -> Result<PathBuf> {
     let watcher_pending = pending.clone();
     let watcher_cache = cache.clone();
     tokio::spawn(async move {
-        // Watch for the first segment file to appear and fire the notify.
-        // We poll because inotify/kqueue would add a platform-specific
-        // dependency for a tiny one-time signal. 100ms cadence is a
-        // one-off cost before playback starts.
+        // Poll for the first segment on disk. We stop as soon as the
+        // ffmpeg task flips `ffmpeg_done` (it's already marked ready for
+        // us in that case, so nothing left to watch for) — without that
+        // check this task would keep stat-ing a wiped cache dir for up
+        // to the full ceiling after an early ffmpeg failure.
         for _ in 0..6000 {
+            if watcher_pending.ffmpeg_done.load(Ordering::Acquire) {
+                return;
+            }
             if let Ok(mut rd) = tokio::fs::read_dir(&watcher_cache).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
                     let name = entry.file_name();
                     if let Some(s) = name.to_str() {
                         if s.starts_with("seg-") && s.ends_with(".m4s") {
-                            watcher_pending.first_segment.notify_waiters();
+                            watcher_pending.mark_ready();
                             return;
                         }
                     }
@@ -189,20 +262,24 @@ async fn ensure_started(state: &AppState, id: &str) -> Result<PathBuf> {
                 *err = Some(e.to_string());
             }
         }
-        ffmpeg_pending.first_segment.notify_waiters();
-        ffmpeg_pending.finished.notify_waiters();
+        // Tell the watcher it can stop polling and release waiters.
+        // `mark_ready` is idempotent — the watcher may already have
+        // fired it once the first segment landed.
+        ffmpeg_pending.ffmpeg_done.store(true, Ordering::Release);
+        ffmpeg_pending.mark_ready();
         // Leave the entry in the pending map for a moment so late joiners
-        // still see the Notify and can read any error — then remove it.
+        // still see the Arc and can read any error — then remove it.
+        // Without the linger, a waiter that lost the race to our Arc
+        // clone above would fall through and spawn a second ffmpeg for
+        // the same id, wiping our output from under us.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         hls_cache.pending.remove(&id_for_task);
     });
 
-    // Block this request until ffmpeg has written the first segment (so
-    // the playlist read below returns at least one entry) or failed.
-    pending.first_segment.notified().await;
-    if let Some(msg) = pending.error.lock().await.clone() {
-        return Err(Error::Other(anyhow::anyhow!(msg)));
-    }
+    pending
+        .wait_ready()
+        .await
+        .map_err(|msg| Error::Other(anyhow::anyhow!(msg)))?;
     Ok(cache)
 }
 

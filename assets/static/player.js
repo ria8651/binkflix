@@ -690,7 +690,16 @@ function loadHlsJs() {
 // videoId -> { hls: Hls | null, url: string }
 const attached = new Map();
 
-async function attach(videoId, url) {
+function attach(videoId, url) {
+    // Serialize attach/detach through the same per-video queue the
+    // subtitle code uses so a second `attach` arriving mid-`loadHlsJs`
+    // can't race past the first and leave a second Hls instance
+    // `attachMedia`-d to the same element (the first one's xhr loop +
+    // event listeners would leak forever).
+    return run(videoId, () => attachInner(videoId, url));
+}
+
+async function attachInner(videoId, url) {
     const video = getVideo(videoId);
     if (!video) return;
     const existing = attached.get(videoId);
@@ -707,7 +716,8 @@ async function attach(videoId, url) {
 
     // Non-HLS URL (e.g. `?mode=direct` fallback from the transcode prompt,
     // which still hits the old `/stream` endpoint): set src directly.
-    if (!/\.m3u8($|\?)/.test(url)) {
+    // `#`-frag URLs count as HLS too — don't regress into `video.src`.
+    if (!/\.m3u8($|[?#])/.test(url)) {
         video.src = url;
         attached.set(videoId, { hls: null, url });
         return;
