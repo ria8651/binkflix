@@ -4,6 +4,7 @@
 pub mod api;
 pub mod db;
 pub mod error;
+pub mod hls;
 pub mod media_info;
 pub mod nfo;
 pub mod remux;
@@ -34,6 +35,7 @@ pub struct AppState {
     pub scan_progress: scanner::ProgressHandle,
     pub scan_lock: Arc<Mutex<()>>,
     pub libraries: Arc<Vec<(i64, PathBuf)>>,
+    pub hls_cache: Arc<hls::HlsCache>,
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -200,6 +202,7 @@ async fn run_async() -> anyhow::Result<()> {
         scan_progress,
         scan_lock,
         libraries,
+        hls_cache: hls::HlsCache::new(),
     };
 
     // Build the router: our routes first (they take priority), then the Dioxus
@@ -207,6 +210,7 @@ async fn run_async() -> anyhow::Result<()> {
     let my_routes: Router = Router::new()
         .merge(api::router())
         .merge(syncplay::router())
+        .merge(hls::router())
         .with_state(state);
 
     // Vendored static files that need stable, unhashed URLs — JASSUB's worker

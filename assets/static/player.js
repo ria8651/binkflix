@@ -670,12 +670,98 @@ function getDebugStats(videoId) {
     };
 }
 
+// ── HLS attachment ─────────────────────────────────────────────
+//
+// All playback goes through an HLS VOD playlist. Safari can play .m3u8
+// natively via <video src="...">; other browsers need hls.js, which is
+// lazy-loaded from a CDN on first use. Either way we own setting the
+// source on the element — the Rust component renders the <video>
+// without a `src` attribute and calls `attach(videoId, url)` instead.
+
+const HLS_ESM = "https://cdn.jsdelivr.net/npm/hls.js@1/+esm";
+let hlsPromise = null;
+function loadHlsJs() {
+    if (!hlsPromise) {
+        hlsPromise = import(HLS_ESM).then((m) => m.default || m.Hls || m);
+    }
+    return hlsPromise;
+}
+
+// videoId -> { hls: Hls | null, url: string }
+const attached = new Map();
+
+async function attach(videoId, url) {
+    const video = getVideo(videoId);
+    if (!video) return;
+    const existing = attached.get(videoId);
+    if (existing && existing.url === url) return; // already attached to this url
+    detachSource(videoId);
+
+    // Native HLS (Safari / iOS). Just set the src and let the browser
+    // handle playlist parsing + segment fetching.
+    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = url;
+        attached.set(videoId, { hls: null, url });
+        return;
+    }
+
+    // Non-HLS URL (e.g. `?mode=direct` fallback from the transcode prompt,
+    // which still hits the old `/stream` endpoint): set src directly.
+    if (!/\.m3u8($|\?)/.test(url)) {
+        video.src = url;
+        attached.set(videoId, { hls: null, url });
+        return;
+    }
+
+    const Hls = await loadHlsJs();
+    if (!Hls?.isSupported?.()) {
+        // No HLS support at all — surface a recognisable error so the
+        // wrap's error overlay appears instead of silent failure.
+        video.dispatchEvent(new Event("error"));
+        return;
+    }
+    const hls = new Hls({
+        // Playlist is event-type until ffmpeg finishes, so hls.js will
+        // keep refreshing it. Keep the refresh interval snappy so seeks
+        // into newly-generated territory become available quickly.
+        lowLatencyMode: false,
+        backBufferLength: 90,
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    attached.set(videoId, { hls, url });
+}
+
+function detachSource(videoId) {
+    const entry = attached.get(videoId);
+    if (!entry) return;
+    try { entry.hls?.destroy(); } catch (_) { /* ignore */ }
+    const video = getVideo(videoId);
+    if (video) {
+        try { video.pause(); } catch (_) { /* ignore */ }
+        video.removeAttribute("src");
+        try { video.load(); } catch (_) { /* ignore */ }
+    }
+    attached.delete(videoId);
+}
+
+// Full teardown: subs + controls + source. Called from the Dioxus
+// component's drop hook so soft-nav away from the player doesn't leave
+// xhr loops or audio playing.
+function fullDetach(videoId) {
+    detach(videoId);
+    controllers.get(videoId)?.();
+    detachSource(videoId);
+}
+
 const realApi = {
     setAss,
     setVtt,
     clear: detach,
     initControls,
     getDebugStats,
+    attach,
+    detach: fullDetach,
 };
 
 const pending = (window.binkflixPlayer && window.binkflixPlayer.__queue) || [];
