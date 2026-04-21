@@ -60,13 +60,54 @@ fn Shell() -> Element {
     let mut open_menu = use_context::<OpenMenu>().0;
     let menu_open = open_menu.read().is_some();
 
-    rsx! {
-        if menu_open {
-            div {
-                class: "menu-backdrop",
-                onclick: move |_| open_menu.set(None),
-            }
+    // Close any open popover when the user clicks outside one. The old
+    // `.menu-backdrop` div only worked in the Shell's stacking context;
+    // on the video-player route the fullpage layer sits above it, so
+    // clicks there never reached the backdrop. A document-level
+    // pointerdown listener doesn't care about z-index at all — if the
+    // click target isn't inside a registered dropdown wrapper, we close.
+    //
+    // The listener is installed by JS (easier to reach document events
+    // from there) and dispatches a custom window event back to Rust;
+    // the Rust side then flips the signal. The JS half is installed
+    // once and stays; it's a no-op while no menu is open because the
+    // Rust side ignores the event unless `menu_open` is true.
+    use_effect(move || {
+        let currently_open = *open_menu.read();
+        if currently_open.is_none() {
+            return;
         }
+        spawn(async move {
+            let mut eval = document::eval(
+                r#"
+                if (!window.__binkflixOutsideClickInstalled) {
+                    document.addEventListener('pointerdown', (e) => {
+                        if (!e.target.closest('[data-popover]')) {
+                            window.dispatchEvent(new CustomEvent('binkflix-close-popover'));
+                        }
+                    }, true);
+                    window.__binkflixOutsideClickInstalled = true;
+                }
+                // Resolve this eval on the next outside-click so the Rust
+                // side can close the menu. Each `use_effect` run gets its
+                // own one-shot listener, removed after fire.
+                await new Promise((res) => {
+                    const once = () => {
+                        window.removeEventListener('binkflix-close-popover', once);
+                        res();
+                    };
+                    window.addEventListener('binkflix-close-popover', once);
+                });
+                dioxus.send(true);
+                "#,
+            );
+            if eval.recv::<serde_json::Value>().await.is_ok() {
+                open_menu.set(None);
+            }
+        });
+    });
+
+    rsx! {
         header { class: "topbar",
             Link {
                 to: Route::Home {},
@@ -134,7 +175,7 @@ pub fn ThemeSwitcher() -> Element {
     let current_id = theme.read().clone();
 
     rsx! {
-        div { class: "theme-switcher",
+        div { class: "theme-switcher", "data-popover": "theme",
             button {
                 class: "btn-theme btn-icon",
                 r#type: "button",
@@ -190,7 +231,7 @@ fn SearchDropdown() -> Element {
     });
 
     rsx! {
-        div { class: "search-dd",
+        div { class: "search-dd", "data-popover": "search",
             button {
                 class: "btn-theme btn-icon",
                 r#type: "button",
@@ -292,7 +333,7 @@ fn RescanButton() -> Element {
     };
 
     rsx! {
-        div { class: "rescan",
+        div { class: "rescan", "data-popover": "rescan",
             button {
                 class: if running { "btn-theme btn-icon scanning" } else { "btn-theme btn-icon" },
                 r#type: "button",

@@ -375,7 +375,7 @@ pub fn RoomsDropdown() -> Element {
         .map(|id| id.chars().take(6).collect());
 
     rsx! {
-        div { class: "rooms-dd",
+        div { class: "rooms-dd", "data-popover": "rooms",
             button {
                 class: if in_room { "rooms-btn btn-icon in-room" } else { "rooms-btn btn-icon" },
                 aria_label: "Rooms",
