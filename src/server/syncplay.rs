@@ -251,17 +251,21 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String) {
         _ = &mut outbound => { inbound.abort(); }
         _ = &mut inbound => { outbound.abort(); }
     }
-    // Wait for the aborted task's future to actually drop before we sample
-    // `receiver_count` — the outbound task owns `rx`, and `abort()` only
-    // signals cancellation; the captured receiver lives until the future
-    // is dropped. Skipping this caused viewer counts to leak across quick
-    // leave/rejoin cycles: the new client subscribed while the previous
-    // socket's ghost rx was still alive, so the Peer broadcast reported
-    // N+1 and kept climbing.
-    let _ = outbound.await;
-    let _ = inbound.await;
 
-    let viewers = tx.receiver_count();
+    // Awaiting the aborted task to force its rx drop sounds cleaner but
+    // can deadlock: if the outbound task was parked inside `ws_sink.send`
+    // against a half-closed socket, `abort()` doesn't always force an
+    // immediate drop, and the await never returns. That leaves
+    // `handle_socket` stuck and rx subscribed, so `receiver_count` stays
+    // at N and /api/rooms reports ghost viewers forever.
+    //
+    // Instead: eat the -1 for the ghost rx the aborted task may still
+    // hold, broadcast, and return. The scheduler drops the aborted
+    // task's future at the next poll; the room's receiver_count
+    // catches up a tick later, which is fine for the UI — the only
+    // observable cost is that a new client joining *during* that tick
+    // sees N+1 once and self-heals on the next join/leave.
+    let viewers = tx.receiver_count().saturating_sub(1);
     let _ = tx.send(Broadcast::Peer {
         client_id: client_id.clone(),
         joined: false,

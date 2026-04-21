@@ -122,7 +122,15 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     let id_for_src = id.clone();
     let stream_src = use_memo(move || -> String {
         if let Some(mode) = *forced_mode.read() {
-            return media_stream_url_with_mode(&id_for_src, mode);
+            // "Try remux" now goes through the HLS pipeline so the user
+            // gets real random-access seeking instead of the fMP4-over-
+            // pipe workaround. "Try direct" still hits byte-range serve
+            // so source containers that are already browser-friendly
+            // skip the ffmpeg round-trip entirely.
+            return match mode {
+                "remux" => media_hls_url(&id_for_src),
+                _ => media_stream_url_with_mode(&id_for_src, mode),
+            };
         }
         match &*tech.read_unchecked() {
             // Wait for the probe before setting a src — otherwise we

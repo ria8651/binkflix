@@ -174,7 +174,7 @@ pub fn join_room(ctx: RoomContext, room_id: String) {
     room_id_sig.set(Some(room_id));
 
     wasm_bindgen_futures::spawn_local(async move {
-        let ws = match WebSocket::open(&url) {
+        let mut ws = match WebSocket::open(&url) {
             Ok(ws) => ws,
             Err(e) => {
                 tracing::warn!(?e, "ws open failed");
@@ -182,24 +182,49 @@ pub fn join_room(ctx: RoomContext, room_id: String) {
                 return;
             }
         };
-        let (mut write, mut read) = ws.split();
 
-        // Outbound pump — owns the receiver. Exits when the last sender drops.
-        wasm_bindgen_futures::spawn_local(async move {
-            while let Some(msg) = rx.next().await {
-                let Ok(text) = serde_json::to_string(&msg) else { continue };
-                if write.send(Message::Text(text)).await.is_err() {
-                    break;
-                }
-            }
-            let _ = write.close().await;
-        });
-
+        // We used to ws.split() into (write, read) and put the outbound
+        // pump in its own task, but gloo-net 0.6's `SplitSink::poll_close`
+        // is a no-op — calling `write.close().await` does nothing to the
+        // underlying browser WebSocket, so the server never sees a close
+        // frame when the user hit "Leave", receiver_count stayed at 1,
+        // and the room lingered with a ghost viewer. Keeping the
+        // WebSocket unsplit means dropping it here triggers gloo-net's
+        // `PinnedDrop`, which calls `ws.ws.close()` for real. Read + write
+        // both happen on the same value, raced via `tokio::select!`.
+        use futures::future::Either;
         let mut seq: u64 = 0;
-        while let Some(Ok(Message::Text(text))) = read.next().await {
-            let Ok(b) = serde_json::from_str::<Broadcast>(&text) else { continue };
-            handle_broadcast(ctx, b, &mut seq);
+        loop {
+            let incoming = ws.next();
+            let outgoing = rx.next();
+            futures::pin_mut!(incoming, outgoing);
+            match futures::future::select(incoming, outgoing).await {
+                Either::Left((incoming, _)) => match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(b) = serde_json::from_str::<Broadcast>(&text) {
+                            handle_broadcast(ctx, b, &mut seq);
+                        }
+                    }
+                    // Close, binary, or error — either way the socket
+                    // is done. Fall out so we drop `ws` and notify the
+                    // app.
+                    _ => break,
+                },
+                Either::Right((outgoing, _)) => match outgoing {
+                    Some(msg) => {
+                        let Ok(text) = serde_json::to_string(&msg) else { continue };
+                        if ws.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // `tx` was dropped (ctx.leave). Break so `ws` falls
+                    // out of scope → PinnedDrop closes the WebSocket →
+                    // server cleans up and broadcasts the leave Peer.
+                    None => break,
+                },
+            }
         }
+        drop(ws);
         ctx.leave();
     });
 }
