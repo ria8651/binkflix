@@ -379,17 +379,29 @@ function initControls(videoId) {
         return e.message ? `${base} (${e.message})` : base;
     };
 
+    // `waiting`/`stalled` sometimes fire without a matching `playing`/
+    // `canplay` when the browser recovers on its own — leaving the spinner
+    // stuck until the user pokes pause/play. Guard the "on" side by
+    // readyState so we only show the spinner when the video genuinely
+    // doesn't have future data, and use `timeupdate` (only fires when
+    // currentTime advances) as an always-on clear so we recover even if
+    // the browser never emits the matching ready event.
+    const HAVE_FUTURE_DATA = 3;
     const onLoadStart = () => { setError(null); setLoading(true); };
-    const onWaiting = () => setLoading(true);
+    const onWaiting = () => { if (video.readyState < HAVE_FUTURE_DATA) setLoading(true); };
     const onCanPlay = () => setLoading(false);
     const onPlaying = () => setLoading(false);
     const onLoadedData = () => setLoading(false);
-    const onStalled = () => setLoading(true);
+    const onStalled = () => { if (video.readyState < HAVE_FUTURE_DATA) setLoading(true); };
     const onError = () => setError(describeError());
+    const onTimeClearLoading = () => {
+        if (!video.paused && video.readyState >= HAVE_FUTURE_DATA) setLoading(false);
+    };
 
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
     video.addEventListener("timeupdate", onTime);
+    video.addEventListener("timeupdate", onTimeClearLoading);
     video.addEventListener("loadedmetadata", onMeta);
     video.addEventListener("durationchange", onMeta);
     video.addEventListener("volumechange", onVol);
@@ -556,6 +568,7 @@ function initControls(videoId) {
         video.removeEventListener("play", onPlay);
         video.removeEventListener("pause", onPause);
         video.removeEventListener("timeupdate", onTime);
+        video.removeEventListener("timeupdate", onTimeClearLoading);
         video.removeEventListener("loadedmetadata", onMeta);
         video.removeEventListener("durationchange", onMeta);
         video.removeEventListener("volumechange", onVol);
