@@ -90,6 +90,7 @@ pub async fn get_rooms() -> Result<Vec<RoomListItem>, String> {
     fetch_json("/api/rooms").await
 }
 
+#[allow(dead_code)]
 pub async fn create_room() -> Result<CreateRoomResp, String> {
     post_empty("/api/rooms").await
 }

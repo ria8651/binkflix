@@ -75,6 +75,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     let mut last_applied = use_signal(|| None::<Option<SubCommand>>);
     let mut menu_open = use_signal(|| false);
     let mut debug_open = use_signal(|| false);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut debug_stats = use_signal(|| None::<serde_json::Value>);
 
     // Tech probe drives two things: (1) the info panel, and (2) the

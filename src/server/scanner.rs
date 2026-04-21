@@ -218,14 +218,6 @@ struct AssetJob {
     has_sidecar_image: bool,
 }
 
-pub async fn scan_library(
-    pool: &SqlitePool,
-    library_id: i64,
-    root: &Path,
-) -> anyhow::Result<ScanStats> {
-    scan_library_with_progress(pool, library_id, root, None).await
-}
-
 pub async fn scan_library_with_progress(
     pool: &SqlitePool,
     library_id: i64,

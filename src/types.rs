@@ -139,14 +139,11 @@ pub struct SubtitleTrack {
 
 // URL builders — relative paths work through dx proxy and same-origin alike.
 pub fn media_image_url(id: &str) -> String { format!("/api/media/{id}/image") }
-pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") }
 pub fn media_stream_url_with_mode(id: &str, mode: &str) -> String {
     format!("/api/media/{id}/stream?mode={mode}")
 }
 pub fn media_hls_url(id: &str) -> String { format!("/api/media/{id}/hls/index.m3u8") }
-pub fn media_subtitles_url(id: &str) -> String { format!("/api/media/{id}/subtitles") }
-pub fn media_tech_url(id: &str) -> String { format!("/api/media/{id}/tech") }
 pub fn media_subtitle_url(id: &str, track: &str) -> String {
     format!("/api/media/{id}/subtitle/{track}")
 }
@@ -174,6 +171,7 @@ pub struct RoomListItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(dead_code)]
 pub struct CreateRoomResp {
     pub id: String,
 }
@@ -218,6 +216,7 @@ pub enum ClientMsg {
 /// Messages the server fans out to all clients in a room.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum Broadcast {
     Welcome { client_id: String, server_ts: i64, current: Option<RoomState> },
     Peer { client_id: String, joined: bool, viewers: usize },
@@ -230,7 +229,6 @@ pub enum Broadcast {
 }
 
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
-pub fn show_fanart_url(id: &str) -> String { format!("/api/shows/{id}/fanart") }
 pub fn season_poster_url(show_id: &str, season: i64) -> String {
     format!("/api/shows/{show_id}/seasons/{season}/poster")
 }

@@ -50,6 +50,7 @@ pub struct RemoteEvent {
 }
 
 #[derive(Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum RemoteKind {
     Play { position_ms: i64 },
     Pause { position_ms: i64 },
@@ -80,10 +81,6 @@ pub struct RoomContext {
 }
 
 impl RoomContext {
-    pub fn is_in_room(&self) -> bool {
-        self.room_id.peek().is_some()
-    }
-
     #[cfg(feature = "web")]
     pub fn send(&self, msg: ClientMsg) {
         if let Some(tx) = self.tx.peek().as_ref() {
@@ -92,6 +89,7 @@ impl RoomContext {
     }
 
     #[cfg(not(feature = "web"))]
+    #[allow(dead_code)]
     pub fn send(&self, _msg: ClientMsg) {}
 
     /// Local Leave: clears all signals, which drops the sender and stops the task.
@@ -688,9 +686,6 @@ struct ListenerHandle {
 
 #[cfg(feature = "web")]
 impl ListenerHandle {
-    fn empty() -> Self {
-        Self { target: None, listeners: Vec::new() }
-    }
     fn new(target: HtmlVideoElement) -> Self {
         Self { target: Some(target), listeners: Vec::new() }
     }
