@@ -2,6 +2,7 @@
 //! Everything in this tree is `#[cfg(feature = "server")]` — never compiled for the WASM client.
 
 pub mod api;
+pub mod auth;
 pub mod db;
 pub mod error;
 pub mod hls;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub scan_lock: Arc<Mutex<()>>,
     pub libraries: Arc<Vec<(i64, PathBuf)>>,
     pub hls_cache: Arc<hls::HlsCache>,
+    /// `None` disables bastion auth entirely — set `BASTION_ORIGIN` to enable.
+    pub auth: Option<auth::AuthState>,
 }
 
 fn env_or(name: &str, default: &str) -> String {
@@ -196,6 +199,12 @@ async fn run_async() -> anyhow::Result<()> {
         });
     }
 
+    let auth_state = auth::AuthConfig::from_env().map(auth::AuthState::new);
+    match &auth_state {
+        Some(a) => info!(cfg = ?a.cfg, "bastion auth enabled"),
+        None => info!("bastion auth disabled (set BASTION_ORIGIN to enable); using dev identity"),
+    }
+
     let state = AppState {
         pool,
         hub: syncplay::Hub::new(),
@@ -203,15 +212,17 @@ async fn run_async() -> anyhow::Result<()> {
         scan_lock,
         libraries,
         hls_cache: hls::HlsCache::new(),
+        auth: auth_state.clone(),
     };
 
     // Build the router: our routes first (they take priority), then the Dioxus
     // application mounted as the fallback so `/` and client-side routes work.
-    let my_routes: Router = Router::new()
-        .merge(api::router())
-        .merge(syncplay::router())
-        .merge(hls::router())
-        .with_state(state);
+    let mut my_routes: Router<AppState> =
+        Router::new().merge(api::router()).merge(syncplay::router()).merge(hls::router());
+    if auth_state.is_some() {
+        my_routes = my_routes.merge(auth::router());
+    }
+    let my_routes = my_routes.with_state(state.clone());
 
     // Vendored static files that need stable, unhashed URLs — JASSUB's worker
     // and wasm can't go through Dioxus's asset pipeline because the JS module
@@ -227,6 +238,10 @@ async fn run_async() -> anyhow::Result<()> {
         .nest_service("/jassub", ServeDir::new("assets/jassub"))
         .nest_service("/static", ServeDir::new("assets/static"))
         .merge(my_routes)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
