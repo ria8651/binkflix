@@ -51,7 +51,10 @@ impl AuthConfig {
 #[derive(Clone)]
 #[allow(dead_code)] // fields are read by downstream handlers via request extensions
 pub struct Session {
-    pub user_id: u64,
+    /// Stable identity hash from bastion (JWT `sub`). Safe to persist — survives
+    /// bastion DB wipes as long as the user signs back in with the same first
+    /// auth provider.
+    pub user_sub: String,
     pub login: String,
     pub created_at: Instant,
 }
@@ -114,11 +117,14 @@ impl AuthState {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct Claims {
+    /// Stable identity hash. Bastion-owned, portable across DB wipes.
     sub: String,
     iss: String,
     aud: String,
     exp: i64,
-    gh_login: Option<String>,
+    /// Bastion-owned display name. Seeded from the auth provider's login at
+    /// signup but may diverge later (user can rename themselves on bastion).
+    username: Option<String>,
     svc: String,
 }
 
@@ -169,8 +175,10 @@ async fn bastion_callback(
         }
     };
 
-    let user_id: u64 = claims.sub.parse().unwrap_or(0);
-    let login_name = claims.gh_login.unwrap_or_else(|| format!("user:{user_id}"));
+    let user_sub = claims.sub.clone();
+    let login_name = claims
+        .username
+        .unwrap_or_else(|| format!("user:{}", &user_sub[..8.min(user_sub.len())]));
     let sid = new_sid();
 
     {
@@ -178,14 +186,14 @@ async fn bastion_callback(
         sessions.insert(
             sid.clone(),
             Session {
-                user_id,
+                user_sub: user_sub.clone(),
                 login: login_name.clone(),
                 created_at: Instant::now(),
             },
         );
     }
 
-    info!(%login_name, %user_id, "bastion auth success");
+    info!(%login_name, %user_sub, "bastion auth success");
 
     let cookie = Cookie::build((COOKIE_NAME, sid))
         .path("/")
@@ -231,8 +239,8 @@ async fn verify_token(state: &AuthState, token: &str) -> anyhow::Result<Claims> 
 }
 
 /// Hardcoded dev identity injected when bastion auth is disabled. Handlers
-/// always see a `Session`, so they can read user_id/login without branching.
-const DEV_USER_ID: u64 = 0;
+/// always see a `Session`, so they can read user_sub/login without branching.
+const DEV_USER_SUB: &str = "dev";
 const DEV_LOGIN: &str = "dev";
 
 /// Middleware: when bastion is configured, require a session cookie and
@@ -251,7 +259,7 @@ pub async fn require_session(
     let Some(auth) = state.auth.as_ref() else {
         let mut req = req;
         req.extensions_mut().insert(Session {
-            user_id: DEV_USER_ID,
+            user_sub: DEV_USER_SUB.into(),
             login: DEV_LOGIN.into(),
             created_at: Instant::now(),
         });
