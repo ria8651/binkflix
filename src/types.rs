@@ -156,11 +156,18 @@ pub struct HlsState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HlsProducerState {
     pub start_idx: u32,
+    /// Highest segment ffmpeg has finished writing to canonical.
     pub head: u32,
-    pub high_water: u32,
+    /// Highest segment ffmpeg is *allowed* to produce in this pull.
+    /// Only advances when a request arrives — pull-driven backpressure.
+    pub target_head: u32,
     pub paused: bool,
     pub idle_for_secs: f64,
-    pub buffer_ahead: u32,
+    /// How many segments past the most recently requested one ffmpeg
+    /// is permitted to read ahead.
+    pub lookahead_buffer: u32,
+    /// Far-ahead-request relaunch threshold; not part of the
+    /// backpressure loop, just exposed for the debug panel.
     pub lookahead_window: u32,
 }
 

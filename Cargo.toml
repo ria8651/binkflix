@@ -29,7 +29,7 @@ tracing = { version = "0.1", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 axum = { version = "0.8", features = ["ws", "macros"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"], optional = true }
+tower-http = { version = "0.6", features = ["fs", "trace", "cors", "set-header"], optional = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono"], optional = true }
 quick-xml = { version = "0.37", features = ["serialize"], optional = true }
 walkdir = { version = "2", optional = true }

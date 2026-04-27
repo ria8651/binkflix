@@ -216,19 +216,20 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     });
 
     // Same idea but for the HLS pipeline state (producer head, cached
-    // segments). Only relevant when the file is actually being remuxed,
-    // and only worth fetching while the panel is open. Endpoint is
-    // 1-2 KB for typical movies — fine to poll once a second.
+    // segments). Polled whenever the file is being remuxed — we use
+    // `producer.head` to drive the "Remuxing… seg N/total" label inside
+    // the loading overlay, so the user can tell whether ffmpeg is
+    // making progress while the player buffers. A `poll_alive` gate
+    // lets the component drop the loop on unmount.
+    let mut poll_alive = use_signal(|| true);
+    use_drop(move || poll_alive.set(false));
     let id_for_hls_state = id.clone();
     use_effect(move || {
-        if !*debug_open.read() {
-            return;
-        }
-        if !matches!(
+        let in_remux = matches!(
             &*tech.read_unchecked(),
             Some(Ok(info)) if info.browser_compat == BrowserCompat::Remux
-        ) && !matches!(*forced_mode.read(), Some("remux"))
-        {
+        ) || matches!(*forced_mode.read(), Some("remux"));
+        if !in_remux {
             return;
         }
         // Captured for the web-only polling loop below; non-web build
@@ -238,7 +239,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         spawn(async move {
             #[cfg(feature = "web")]
             loop {
-                if !*debug_open.peek() { break; }
+                if !*poll_alive.peek() { break; }
                 match get_hls_state(&id).await {
                     Ok(s) => hls_state.set(Some(s)),
                     Err(_) => { /* leave previous; next tick retries */ }
@@ -427,8 +428,16 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     let current = effective_id.read().clone().unwrap_or_default();
     let is_loading = *loading.read();
 
+    let wrap_class = if stream_src.read().is_empty() {
+        // No <video> mounted yet — JS isn't there to toggle .loading,
+        // so apply it from Rust so the spinner overlay still shows.
+        "video-wrap loading"
+    } else {
+        "video-wrap"
+    };
+
     rsx! {
-        div { class: "video-wrap",
+        div { class: wrap_class,
             // Unified top bar: back link on the left, title in the middle,
             // rooms + theme controls on the right. Lives inside
             // `.video-wrap` so it auto-hides with the rest of the chrome
@@ -521,9 +530,39 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             }
             // Loading spinner overlay — shown while `.loading` is on the
             // wrap (initial load / buffering / stalled). The class is
-            // toggled from player.js.
-            div { class: "player-loading", aria_hidden: "true",
-                span { class: "spinner" }
+            // toggled from player.js while the video is mounted, and
+            // forced on from Rust above when stream_src is empty (so
+            // the user gets feedback while waiting on the tech probe).
+            //
+            // The label under the spinner narrates *why* we're waiting:
+            //   * empty src      → "Preparing playback…"
+            //   * remux + producer running → "Remuxing… seg N / total"
+            // This makes a stalled pipeline visible from the UI alone
+            // instead of needing the debug panel.
+            {
+                let src_empty = stream_src.read().is_empty();
+                let in_remux = matches!(*effective_mode.read(), BrowserCompat::Remux);
+                let label: Option<String> = if src_empty {
+                    Some("Preparing playback…".to_string())
+                } else if in_remux {
+                    hls_state.read().as_ref().and_then(|s| {
+                        let p = s.producer.as_ref()?;
+                        Some(format!(
+                            "Remuxing… seg {} / {}",
+                            p.head.max(p.start_idx), s.total_segments
+                        ))
+                    })
+                } else {
+                    None
+                };
+                rsx! {
+                    div { class: "player-loading", aria_hidden: "true",
+                        span { class: "spinner" }
+                        if let Some(text) = label {
+                            div { class: "player-loading-label", "{text}" }
+                        }
+                    }
+                }
             }
             // Codec / playback error overlay — shown while `.errored` is
             // on the wrap. player.js fills the inner `.player-error-msg`.
@@ -1081,12 +1120,15 @@ fn HlsTimeline(
         }
     });
     let window_rect = producer.as_ref().and_then(|p| {
-        let end = p.head.saturating_add(p.lookahead_window);
-        if p.start_idx == 0 || end == 0 {
+        // Pull-driven window: from start_idx up to `target_head` —
+        // the range ffmpeg is currently *allowed* to produce. Beyond
+        // target_head ffmpeg is SIGSTOP'd until a new request pulls
+        // it further.
+        if p.start_idx == 0 || p.target_head == 0 {
             return None;
         }
         let (l1, _) = seg_rect(p.start_idx.max(1));
-        let (l2, w2) = seg_rect(end.min(state.total_segments));
+        let (l2, w2) = seg_rect(p.target_head.min(state.total_segments));
         Some((l1, (l2 + w2 - l1).max(0.0)))
     });
 
@@ -1178,8 +1220,8 @@ fn HlsPipelineRows(state: HlsState) -> Element {
     let window_label = match &state.producer {
         None => "—".to_string(),
         Some(p) => format!(
-            "start {} → head {} (hw {}, lookahead {})",
-            p.start_idx, p.head, p.high_water, p.lookahead_window
+            "start {} → head {} → target {} (lookahead +{})",
+            p.start_idx, p.head, p.target_head, p.lookahead_buffer
         ),
     };
     let idle_label = state

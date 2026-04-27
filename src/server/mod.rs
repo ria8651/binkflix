@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -41,6 +42,23 @@ pub struct AppState {
     /// `None` disables bastion auth entirely — set `BASTION_ORIGIN` to enable.
     pub auth: Option<auth::AuthState>,
 }
+
+/// Permissive CSP that explicitly allows the resources this app uses.
+/// The critical bit is `media-src 'self' blob:` — hls.js attaches MSE
+/// by setting `video.src = URL.createObjectURL(mediaSource)`, which is
+/// a `blob:` URL. Without `blob:` listed, Firefox blocks the attach
+/// (visible as `Content at .../play may not load data from blob:...`)
+/// and playback never starts even though segments arrive. Multiple
+/// CSP headers combine restrictively, so a strict downstream proxy
+/// will need this same relaxation.
+const CSP_POLICY: &str = "default-src 'self'; \
+    script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; \
+    style-src 'self' 'unsafe-inline'; \
+    img-src 'self' data: blob: https:; \
+    media-src 'self' blob:; \
+    worker-src 'self' blob:; \
+    connect-src 'self' ws: wss: https://cdn.jsdelivr.net; \
+    font-src 'self' data:";
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -250,6 +268,10 @@ async fn run_async() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static(CSP_POLICY),
         ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());

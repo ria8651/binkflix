@@ -47,8 +47,6 @@ function getVideo(videoId) {
 function clearNativeTracks(video) {
     // Remove every <track> we added; don't touch tracks embedded in the media.
     for (const node of Array.from(video.querySelectorAll("track[data-binkflix]"))) {
-        const url = node.dataset.blobUrl;
-        if (url) URL.revokeObjectURL(url);
         node.remove();
     }
 }
@@ -175,21 +173,17 @@ async function setVttInner(videoId, url, label, language) {
 
     await detachInner(videoId);
 
-    // Fetch + blob-url so we can revoke it on teardown and so cross-origin
-    // edge cases (shouldn't apply here but future-proof) are avoided.
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`vtt fetch failed: ${resp.status}`);
-    const blob = await resp.blob();
-    const blobUrl = URL.createObjectURL(blob);
-
+    // Use the URL directly. The subtitle endpoint is same-origin, so the
+    // blob round-trip we used to do bought nothing — and Firefox treats
+    // <track src="blob:..."> as a security violation under strict
+    // media-src CSP, surfacing as "may not load data from blob:".
     const track = document.createElement("track");
     track.kind = "subtitles";
-    track.src = blobUrl;
+    track.src = url;
     track.label = label || "Subtitles";
     if (language) track.srclang = language;
     track.default = true;
     track.dataset.binkflix = "1";
-    track.dataset.blobUrl = blobUrl;
     video.appendChild(track);
 
     // Force-enable once the browser has registered it.

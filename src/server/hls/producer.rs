@@ -59,8 +59,13 @@
 //!   bump high_water and wait for ffmpeg to catch up.
 //! * **Out of range** (seek backward, or far seek forward): kill the
 //!   current run and relaunch at the new target.
-//! * **Backpressure**: when `head - high_water ≥ BUFFER_AHEAD` ffmpeg
-//!   gets SIGSTOP'd; resumed on the next request.
+//! * **Backpressure (pull-driven)**: ffmpeg is SIGSTOP'd whenever
+//!   `head ≥ target_head`. `target_head` only advances when a request
+//!   arrives — each request bumps it to `max(target_head, idx +
+//!   LOOKAHEAD_BUFFER)`. So if the client stops fetching (e.g. its
+//!   buffer is full, or MSE got detached by a strict CSP), the
+//!   producer stalls within ≤LOOKAHEAD_BUFFER segments instead of
+//!   racing to EOF.
 //! * **Idle**: 30s of no requests reaps the producer entirely.
 
 use super::cache;
@@ -76,13 +81,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-/// How many segments ahead of `high_water` ffmpeg may run before SIGSTOP.
-const BUFFER_AHEAD: u32 = 10;
+/// How many segments past the most recently requested one ffmpeg is
+/// allowed to read ahead before SIGSTOP. Small enough that a stalled
+/// client (broken MSE, paused playback, etc.) doesn't waste CPU; large
+/// enough that sequential hls.js fetches don't ping-pong the producer
+/// stop/start on every segment.
+const LOOKAHEAD_BUFFER: u32 = 3;
 
 /// How many segments past `head` a request can target before we abandon
-/// the current run and relaunch at the request. Smaller than
-/// BUFFER_AHEAD because waiting on sequential decode is slower than
-/// killing+relaunching with a fresh fast input seek.
+/// the current run and relaunch at the new target. A normal hls.js
+/// playback never asks more than `LOOKAHEAD_BUFFER` ahead, so this only
+/// trips on real seeks across a wide gap — at which point a fresh fast
+/// input seek beats sequential decode.
 const LOOKAHEAD_WINDOW: u32 = 8;
 
 /// Pre-roll: how many plan-segments before the user's target ffmpeg
@@ -116,16 +126,16 @@ impl ProducerRegistry {
         let h = guard.as_ref()?;
         let start_idx = h.start_idx;
         let head = h.head.load(Ordering::Acquire);
-        let high_water = h.high_water.load(Ordering::Acquire);
+        let target_head = h.target_head.load(Ordering::Acquire);
         let paused = h.paused.load(Ordering::Acquire);
         let idle_for_secs = h.last_request_at.read().await.elapsed().as_secs_f64();
         Some(crate::types::HlsProducerState {
             start_idx,
             head,
-            high_water,
+            target_head,
             paused,
             idle_for_secs,
-            buffer_ahead: BUFFER_AHEAD,
+            lookahead_buffer: LOOKAHEAD_BUFFER,
             lookahead_window: LOOKAHEAD_WINDOW,
         })
     }
@@ -144,8 +154,12 @@ pub struct ProducerHandle {
     /// Highest segment such that all of `[start_idx ..= head]` exist
     /// in canonical. Advanced by the watcher.
     pub head: Arc<AtomicU32>,
-    /// Highest segment any caller has asked for.
-    pub high_water: Arc<AtomicU32>,
+    /// Highest segment ffmpeg is allowed to advance to in this pull.
+    /// Bumped by `ensure_segment` on each request to `idx +
+    /// LOOKAHEAD_BUFFER`; ffmpeg is SIGSTOP'd whenever
+    /// `head ≥ target_head`. Server defends itself instead of trusting
+    /// the client to push back.
+    pub target_head: Arc<AtomicU32>,
     pub paused: Arc<AtomicBool>,
     pub last_request_at: Arc<RwLock<Instant>>,
     pub child: Child,
@@ -189,11 +203,14 @@ pub async fn ensure_segment(
     if idx == 0 || idx as usize > ctx.plan.segments.len() {
         anyhow::bail!("segment index {idx} out of range");
     }
+    let total = ctx.plan.segments.len() as u32;
     let seg_path = ctx.plan_dir.join(cache::segment_filename(idx));
 
-    // Fast path: cached on disk.
+    // Fast path: cached on disk. Still bump target_head so a running
+    // producer keeps its read-ahead window aligned with where the
+    // client actually is.
     if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
-        bump_high_water(registry, &ctx.media_id, idx).await;
+        bump_target_head(registry, &ctx.media_id, idx, total).await;
         return Ok(seg_path);
     }
 
@@ -216,7 +233,8 @@ pub async fn ensure_segment(
             *guard = Some(launch_producer(ctx.clone(), idx, slot.clone()).await?);
         } else {
             let h = guard.as_mut().expect("checked above");
-            h.high_water.fetch_max(idx, Ordering::AcqRel);
+            let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
+            h.target_head.fetch_max(new_target, Ordering::AcqRel);
             *h.last_request_at.write().await = Instant::now();
             if h.paused.load(Ordering::Acquire) {
                 if let Some(pid) = h.child.id() {
@@ -231,11 +249,12 @@ pub async fn ensure_segment(
     Ok(seg_path)
 }
 
-async fn bump_high_water(registry: &ProducerRegistry, media_id: &str, idx: u32) {
+async fn bump_target_head(registry: &ProducerRegistry, media_id: &str, idx: u32, total: u32) {
     if let Some(slot) = registry.by_media.get(media_id).map(|e| e.clone()) {
         let guard = slot.lock().await;
         if let Some(h) = guard.as_ref() {
-            h.high_water.fetch_max(idx, Ordering::AcqRel);
+            let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
+            h.target_head.fetch_max(new_target, Ordering::AcqRel);
             *h.last_request_at.write().await = Instant::now();
         }
     }
@@ -301,8 +320,15 @@ async fn launch_producer(
         });
     }
 
+    let total_segments = ctx.plan.segments.len() as u32;
     let head = Arc::new(AtomicU32::new(target_idx.saturating_sub(1)));
-    let high_water = Arc::new(AtomicU32::new(target_idx));
+    // Initial pull window: serve the requested segment plus a small
+    // read-ahead. ffmpeg will produce up to here and then SIGSTOP until
+    // another request bumps target_head further.
+    let initial_target = target_idx
+        .saturating_add(LOOKAHEAD_BUFFER)
+        .min(total_segments);
+    let target_head = Arc::new(AtomicU32::new(initial_target));
     let paused = Arc::new(AtomicBool::new(false));
     let last_request_at = Arc::new(RwLock::new(Instant::now()));
 
@@ -310,14 +336,14 @@ async fn launch_producer(
         ctx.plan_dir.clone(),
         run_dir.clone(),
         head.clone(),
-        ctx.plan.segments.len() as u32,
+        total_segments,
         target_idx,
     );
     let reaper = spawn_reaper(
         ctx.media_id.clone(),
         slot,
         head.clone(),
-        high_water.clone(),
+        target_head.clone(),
         paused.clone(),
         last_request_at.clone(),
     );
@@ -325,7 +351,7 @@ async fn launch_producer(
     Ok(ProducerHandle {
         start_idx: target_idx,
         head,
-        high_water,
+        target_head,
         paused,
         last_request_at,
         child,
@@ -549,10 +575,15 @@ fn spawn_reaper(
     media_id: String,
     slot: Arc<Mutex<Option<ProducerHandle>>>,
     head: Arc<AtomicU32>,
-    high_water: Arc<AtomicU32>,
+    target_head: Arc<AtomicU32>,
     paused: Arc<AtomicBool>,
     last_request_at: Arc<RwLock<Instant>>,
 ) -> JoinHandle<()> {
+    // Pull-driven backpressure: ffmpeg may advance only as far as
+    // `target_head`. `target_head` only moves when a request arrives,
+    // so a stalled client (broken MSE, paused playback) leaves ffmpeg
+    // SIGSTOP'd within ≤LOOKAHEAD_BUFFER segments instead of racing
+    // to EOF.
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -572,21 +603,20 @@ fn spawn_reaper(
             }
 
             let h = head.load(Ordering::Acquire);
-            let hw = high_water.load(Ordering::Acquire);
-            let lead = h.saturating_sub(hw);
+            let target = target_head.load(Ordering::Acquire);
             let is_paused = paused.load(Ordering::Acquire);
-            if !is_paused && lead >= BUFFER_AHEAD {
+            if !is_paused && h >= target {
                 if let Some(pid) = current_pid(&slot, &head).await {
                     if signal_pause(pid).await.is_ok() {
                         paused.store(true, Ordering::Release);
-                        tracing::debug!(media = %media_id, head = h, hw, "paused producer");
+                        tracing::debug!(media = %media_id, head = h, target, "paused producer");
                     }
                 }
-            } else if is_paused && hw > h {
+            } else if is_paused && target > h {
                 if let Some(pid) = current_pid(&slot, &head).await {
                     if signal_resume(pid).await.is_ok() {
                         paused.store(false, Ordering::Release);
-                        tracing::debug!(media = %media_id, "resumed producer");
+                        tracing::debug!(media = %media_id, head = h, target, "resumed producer");
                     }
                 }
             }
