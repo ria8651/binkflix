@@ -38,17 +38,19 @@ pub fn media_dir(id: &str) -> PathBuf {
 
 /// Subdirectory within `media_dir` whose name encodes the plan's invalidation
 /// keys. Changes if the source file changes (mtime/size), the plan algorithm
-/// is bumped (`PLAN_VERSION`), or the user picks a different audio track.
-/// Audio index is part of the key because each track's segments contain a
-/// different muxed audio stream — the video timeline is identical, but the
-/// fragment bytes differ, so they need separate cache entries.
+/// is bumped (`PLAN_VERSION`), the user picks a different audio track, or
+/// the encode mode/quality differs. Audio index is part of the key because
+/// each track's segments contain a different muxed audio stream; the
+/// `mode_tag` (e.g. `remux` or `tx4000h720`) is part of the key because
+/// transcoded segments at one bitrate aren't interchangeable with another.
 pub fn plan_dir_name(
     plan_version: u32,
     source_mtime: i64,
     source_size: i64,
     audio_idx: u32,
+    mode_tag: &str,
 ) -> String {
-    format!("v{plan_version}-m{source_mtime}-s{source_size}-a{audio_idx}")
+    format!("v{plan_version}-m{source_mtime}-s{source_size}-a{audio_idx}-{mode_tag}")
 }
 
 pub fn plan_dir(
@@ -57,8 +59,15 @@ pub fn plan_dir(
     source_mtime: i64,
     source_size: i64,
     audio_idx: u32,
+    mode_tag: &str,
 ) -> PathBuf {
-    media_dir(id).join(plan_dir_name(plan_version, source_mtime, source_size, audio_idx))
+    media_dir(id).join(plan_dir_name(
+        plan_version,
+        source_mtime,
+        source_size,
+        audio_idx,
+        mode_tag,
+    ))
 }
 
 /// Remove every subdirectory of `media_dir(id)` whose name doesn't share

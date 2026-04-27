@@ -127,7 +127,8 @@ pub async fn probe_full(
     }
 
     let container = parsed.format.format_name.clone().filter(|s| !s.is_empty());
-    let browser_compat = compute_compat(video_track.as_ref(), &audio_tracks, container.as_deref());
+    let (browser_compat, compat_reason) =
+        compute_compat(video_track.as_ref(), &audio_tracks, container.as_deref());
 
     let info = MediaTechInfo {
         container,
@@ -137,6 +138,7 @@ pub async fn probe_full(
         video: video_track,
         audio: audio_tracks,
         browser_compat,
+        compat_reason,
     };
     Ok((info, subtitle_streams))
 }
@@ -161,22 +163,25 @@ fn compute_compat(
     video: Option<&VideoTrackInfo>,
     audio: &[AudioTrackInfo],
     container: Option<&str>,
-) -> BrowserCompat {
-    let Some(v) = video else { return BrowserCompat::Direct };
+) -> (BrowserCompat, Option<String>) {
+    let Some(v) = video else { return (BrowserCompat::Direct, None) };
 
     let video_in_mp4 = matches!(v.codec.as_str(), "h264");
     let video_in_webm = matches!(v.codec.as_str(), "vp9" | "vp8" | "av1");
     if !video_in_mp4 && !video_in_webm {
-        return BrowserCompat::Transcode;
+        return (
+            BrowserCompat::Transcode,
+            Some(format!(
+                "video codec {} isn't supported by browsers — needs full transcode",
+                v.codec
+            )),
+        );
     }
 
     // Pick the default audio track if present, else the first. Zero-audio
     // files can still be direct/remuxed.
     let a = audio.iter().find(|a| a.default).or_else(|| audio.first());
 
-    // If the container format name already matches the target family AND
-    // the audio is something that family plays natively, the browser can
-    // stream the file as-is without any repackaging.
     let container_formats: Vec<&str> = container
         .map(|c| c.split(',').map(str::trim).collect())
         .unwrap_or_default();
@@ -188,15 +193,33 @@ fn compute_compat(
     if video_in_mp4 && container_is_mp4
         && a.map_or(true, |a| matches!(a.codec.as_str(), "aac" | "mp3"))
     {
-        return BrowserCompat::Direct;
+        return (BrowserCompat::Direct, None);
     }
     if video_in_webm && container_is_webm
         && a.map_or(true, |a| matches!(a.codec.as_str(), "opus" | "vorbis"))
     {
-        return BrowserCompat::Direct;
+        return (BrowserCompat::Direct, None);
     }
 
-    BrowserCompat::Remux
+    // Remux verdict — pick the most informative reason. Container mismatch
+    // dominates audio mismatch since fixing the container is what forces
+    // ffmpeg into the loop in the first place.
+    let target_family = if video_in_mp4 { "MP4" } else { "WebM" };
+    let target_audio = if video_in_mp4 { "AAC/MP3" } else { "Opus/Vorbis" };
+    let container_label = container.unwrap_or("unknown");
+    let reason = if video_in_mp4 && !container_is_mp4 {
+        format!("container {container_label} needs repackaging to {target_family}")
+    } else if video_in_webm && !container_is_webm {
+        format!("container {container_label} needs repackaging to {target_family}")
+    } else if let Some(a) = a {
+        format!(
+            "audio codec {} isn't supported in {target_family} — needs {target_audio}",
+            a.codec
+        )
+    } else {
+        format!("source needs repackaging to {target_family}")
+    };
+    (BrowserCompat::Remux, Some(reason))
 }
 
 fn parse_bitrate_kbps(s: Option<&str>) -> Option<u64> {

@@ -37,16 +37,24 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Query string carried on every HLS endpoint. `?a=N` selects which
-/// source audio stream to mux into the output. Defaults to 0
-/// (first stream — preserves the pre-multi-audio behavior).
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
-pub struct AudioParam {
+/// Query string carried on every HLS endpoint:
+/// * `?a=N` — source audio stream index (defaults to 0).
+/// * `?mode=remux|transcode` — encode strategy (defaults to the cached
+///   compat verdict — `Direct`-classed files can still be requested via
+///   HLS by passing an explicit mode).
+/// * `?bitrate=K` — target video bitrate in kbps for `mode=transcode`.
+///   Ignored for remux. None means "auto" (derived from source bitrate).
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct HlsParams {
     #[serde(default)]
     pub a: Option<u32>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub bitrate: Option<u32>,
 }
 
-impl AudioParam {
+impl HlsParams {
     fn idx(&self) -> u32 {
         self.a.unwrap_or(0)
     }
@@ -55,6 +63,20 @@ impl AudioParam {
 /// Cap on the audio index a request can ask for. Sanity bound; real
 /// files have at most a handful of audio streams.
 const MAX_AUDIO_IDX: u32 = 64;
+
+/// Allowed transcode bitrate range. Below 200 kbps libx264 produces
+/// unwatchable mush; above 20 Mbps the cost outpaces what any
+/// reasonable display profits from.
+const MIN_BITRATE_KBPS: u32 = 200;
+const MAX_BITRATE_KBPS: u32 = 20_000;
+/// Fallback when the source has no probed bitrate and the user picked
+/// "Auto". Comfortable 720p territory; the height ladder downscales
+/// accordingly.
+const AUTO_BITRATE_FALLBACK_KBPS: u32 = 4000;
+/// Auto bitrate ceiling — never spend more than this even if the source
+/// is a 30 Mbps Blu-ray rip. Users wanting more detail can pick an
+/// explicit preset.
+const AUTO_BITRATE_CEILING_KBPS: u32 = 6000;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -72,16 +94,19 @@ pub fn router() -> Router<AppState> {
 async fn state(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(audio): Query<AudioParam>,
+    Query(params): Query<HlsParams>,
 ) -> Result<axum::Json<crate::types::HlsState>> {
-    let audio_idx = validate_audio_idx(audio.idx())?;
-    let (plan, plan_dir, _src, _info) = resolve_plan(&state, &id, audio_idx).await?;
-    let cached_segments = scan_cached_segments(&plan_dir, plan.segments.len() as u32).await;
-    let producer = state.hls_producers.snapshot(&id, audio_idx).await;
+    let audio_idx = validate_audio_idx(params.idx())?;
+    let resolved = resolve_plan(&state, &id, audio_idx, &params).await?;
+    let cached_segments = scan_cached_segments(&resolved.plan_dir, resolved.plan.segments.len() as u32).await;
+    let producer = state
+        .hls_producers
+        .snapshot(&id, audio_idx, &resolved.mode_tag)
+        .await;
     Ok(axum::Json(crate::types::HlsState {
-        duration: plan.duration,
-        total_segments: plan.segments.len() as u32,
-        segment_durations: plan.segments.iter().map(|s| s.d).collect(),
+        duration: resolved.plan.duration,
+        total_segments: resolved.plan.segments.len() as u32,
+        segment_durations: resolved.plan.segments.iter().map(|s| s.d).collect(),
         cached_segments,
         producer,
     }))
@@ -114,16 +139,28 @@ fn validate_audio_idx(idx: u32) -> Result<u32> {
     Ok(idx)
 }
 
+struct ResolvedPlan {
+    plan: Arc<plan::StreamPlan>,
+    plan_dir: PathBuf,
+    src: PathBuf,
+    info: MediaTechInfo,
+    /// Cache-key tag derived from the chosen mode + bitrate. Same shape
+    /// as `mode_tag` in `cache::plan_dir_name`.
+    mode_tag: String,
+}
+
 /// Resolve the plan + on-disk plan dir + tech info for a media. Builds +
-/// persists the plan on cache miss; sweeps stale sibling dirs after a
-/// rebuild. The plan itself is shared across audio tracks (the segment
-/// timeline doesn't depend on audio); `audio_idx` only affects the
-/// returned `plan_dir` so each track's segments cache separately.
+/// persists the remux plan on cache miss; transcode plans are built on
+/// demand without DB caching (cheap — duration only). Sweeps stale
+/// sibling dirs after a rebuild. The remux plan timeline is shared
+/// across audio tracks; `audio_idx` and `mode_tag` only affect the
+/// returned `plan_dir` so each (track, mode, bitrate) caches separately.
 async fn resolve_plan(
     state: &AppState,
     id: &str,
     audio_idx: u32,
-) -> Result<(Arc<plan::StreamPlan>, PathBuf, PathBuf, MediaTechInfo)> {
+    params: &HlsParams,
+) -> Result<ResolvedPlan> {
     if !id_is_safe(id) {
         return Err(Error::BadRequest("invalid media id".into()));
     }
@@ -134,9 +171,6 @@ async fn resolve_plan(
         .ok_or(Error::NotFound)?;
     let src = PathBuf::from(row.0);
 
-    // Probe is needed even on the plan cache hit so we can derive the
-    // per-request `AudioPlan` from the right source stream. Both probe
-    // and plan have their own caches on the media row, so this stays cheap.
     let info = match super::media_info::load(&state.pool, id)
         .await
         .ok()
@@ -152,56 +186,102 @@ async fn resolve_plan(
         }
     };
 
-    if let Some(loaded) = plan::load_if_fresh(&state.pool, id, &src)
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
-    {
-        let plan_dir = cache::plan_dir(
-            id,
-            loaded.plan.version,
-            loaded.source_mtime,
-            loaded.source_size,
-            audio_idx,
-        );
-        return Ok((Arc::new(loaded.plan), plan_dir, src, info));
+    let chosen_mode = match params.mode.as_deref() {
+        Some("remux") => RequestedMode::Remux,
+        Some("transcode") => RequestedMode::Transcode,
+        Some(other) => {
+            return Err(Error::BadRequest(format!("unknown hls mode: {other}")));
+        }
+        None => match info.browser_compat {
+            crate::types::BrowserCompat::Transcode => RequestedMode::Transcode,
+            _ => RequestedMode::Remux,
+        },
+    };
+
+    let (mtime, size) = cache::stat_source(&src).await.map_err(Error::Io)?;
+
+    match chosen_mode {
+        RequestedMode::Remux => {
+            let plan = match plan::load_if_fresh(&state.pool, id, &src)
+                .await
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
+            {
+                Some(loaded) => loaded,
+                None => {
+                    let p = plan::build_remux_plan(&src, &info)
+                        .await
+                        .map_err(|e| Error::NotImplemented(format!("hls plan: {e}")))?;
+                    plan::store(&state.pool, id, &p, mtime, size)
+                        .await
+                        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+                    let keep_prefix = cache::plan_dir_prefix(p.version, mtime, size);
+                    cache::sweep_stale_plan_dirs(id, &keep_prefix).await;
+                    p
+                }
+            };
+            let mode_tag = "remux".to_string();
+            let plan_dir = cache::plan_dir(id, plan.version, mtime, size, audio_idx, &mode_tag);
+            Ok(ResolvedPlan {
+                plan: Arc::new(plan),
+                plan_dir,
+                src,
+                info,
+                mode_tag,
+            })
+        }
+        RequestedMode::Transcode => {
+            let bitrate = resolve_bitrate(params.bitrate, info.bitrate_kbps);
+            let plan = plan::build_transcode_plan(&info, bitrate)
+                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+            let max_height = match plan.mode {
+                plan::Mode::Transcode { max_height, .. } => max_height,
+                plan::Mode::Remux => unreachable!("build_transcode_plan returns Transcode"),
+            };
+            let mode_tag = format!("tx{bitrate}h{max_height}");
+            let plan_dir = cache::plan_dir(id, plan.version, mtime, size, audio_idx, &mode_tag);
+            Ok(ResolvedPlan {
+                plan: Arc::new(plan),
+                plan_dir,
+                src,
+                info,
+                mode_tag,
+            })
+        }
     }
+}
 
-    // Cache miss → build a fresh plan. Viability is decided by
-    // `build_remux_plan` and surfaces as 501 if the source can't be
-    // copy-muxed.
-    let plan = plan::build_remux_plan(&src, &info)
-        .await
-        .map_err(|e| Error::NotImplemented(format!("hls plan: {e}")))?;
-    let (mtime, size) = cache::stat_source(&src)
-        .await
-        .map_err(Error::Io)?;
-    plan::store(&state.pool, id, &plan, mtime, size)
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+#[derive(Copy, Clone)]
+enum RequestedMode {
+    Remux,
+    Transcode,
+}
 
-    let dir_name = cache::plan_dir_name(plan.version, mtime, size, audio_idx);
-    let plan_dir = cache::media_dir(id).join(&dir_name);
-    let keep_prefix = cache::plan_dir_prefix(plan.version, mtime, size);
-    cache::sweep_stale_plan_dirs(id, &keep_prefix).await;
-
-    Ok((Arc::new(plan), plan_dir, src, info))
+fn resolve_bitrate(explicit: Option<u32>, source_kbps: Option<u64>) -> u32 {
+    if let Some(b) = explicit {
+        return b.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+    }
+    let auto = source_kbps
+        .and_then(|b| u32::try_from(b).ok())
+        .unwrap_or(AUTO_BITRATE_FALLBACK_KBPS);
+    auto.clamp(MIN_BITRATE_KBPS, AUTO_BITRATE_CEILING_KBPS)
 }
 
 async fn serve(
     State(state): State<AppState>,
     Path((id, file)): Path<(String, String)>,
-    Query(audio): Query<AudioParam>,
+    Query(params): Query<HlsParams>,
 ) -> Result<Response> {
     if !is_allowed_name(&file) {
         return Err(Error::BadRequest(format!("invalid hls file: {file}")));
     }
 
-    let audio_idx = validate_audio_idx(audio.idx())?;
-    let (plan, plan_dir, src, info) = resolve_plan(&state, &id, audio_idx).await?;
+    let audio_idx = validate_audio_idx(params.idx())?;
+    let resolved = resolve_plan(&state, &id, audio_idx, &params).await?;
+    let ResolvedPlan { plan, plan_dir, src, info, mode_tag } = resolved;
     let path = plan_dir.join(&file);
 
     if file == "index.m3u8" {
-        let body = playlist::render_m3u8(&plan, audio_idx);
+        let body = playlist::render_m3u8(&plan, audio_idx, params.mode.as_deref(), params.bitrate);
         return Ok(text_response(body, "application/vnd.apple.mpegurl", false));
     }
 
@@ -211,6 +291,7 @@ async fn serve(
         plan: plan.clone(),
         plan_dir: plan_dir.clone(),
         audio_idx,
+        mode_tag,
         audio: plan::derive_audio_plan(&info, audio_idx),
     };
 

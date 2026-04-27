@@ -607,7 +607,6 @@ h2.section {
 .player-fullpage .video-wrap:not(.paused):not(.active) {
     cursor: none;
 }
-.player-fullpage .video-wrap:has(.player-transcode-prompt),
 .player-fullpage .video-wrap.errored {
     /* !important because .video-wrap:not(.paused):not(.active) above has
      * higher specificity (3 classes+pseudos vs 2) and would otherwise
@@ -875,57 +874,20 @@ h2.section {
 }
 .player-error-btn:hover { background: rgb(255 255 255 / 0.22); }
 
-/* Transcode-needed prompt. Sits on top of the (unloaded) video element
- * and blocks interaction until the user picks a fallback mode. */
-.player-transcode-prompt {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-4);
-    padding: var(--space-8);
-    background: rgb(0 0 0 / 0.88);
-    color: #fff;
-    text-align: center;
-    z-index: 5;
+/* Section header inside .player-menu (used by the video settings menu
+ * to label the "Mode" / "Quality" subgroups). Non-interactive — just a
+ * thin caption between groups of menu buttons. */
+.player-menu-section {
+    padding: var(--space-2) var(--space-3) var(--space-1);
+    font-size: var(--text-xs, 11px);
+    color: rgb(255 255 255 / 0.55);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
 }
-.player-transcode-icon {
-    font-size: 36px;
-    color: var(--text-warning, #ffb454);
-    line-height: 1;
+.player-menu-section:not(:first-child) {
+    border-top: 1px solid rgb(255 255 255 / 0.08);
+    margin-top: var(--space-1);
 }
-.player-transcode-title {
-    font-size: var(--text-lg);
-    font-weight: 600;
-}
-.player-transcode-body {
-    font-size: var(--text-sm);
-    color: rgb(255 255 255 / 0.78);
-    max-width: 34rem;
-    line-height: 1.4;
-}
-.player-transcode-actions {
-    display: flex;
-    gap: var(--space-3);
-    margin-top: var(--space-2);
-}
-.player-transcode-btn {
-    padding: var(--space-2) var(--space-5);
-    background: rgb(255 255 255 / 0.14);
-    color: #fff;
-    border: 1px solid rgb(255 255 255 / 0.28);
-    border-radius: var(--radius-dialog);
-    font-size: var(--text-sm);
-    cursor: pointer;
-}
-.player-transcode-btn:hover { background: rgb(255 255 255 / 0.22); }
-.player-transcode-btn.primary {
-    background: var(--text-accent, #4a9eff);
-    border-color: transparent;
-}
-.player-transcode-btn.primary:hover { filter: brightness(1.1); }
 
 /* ── Debug / playback info floating panel ────────────────── */
 .debug-panel {

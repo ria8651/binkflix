@@ -69,7 +69,7 @@
 //! * **Idle**: 30s of no requests reaps the producer entirely.
 
 use super::cache;
-use super::plan::{AudioPlan, StreamPlan};
+use super::plan::{AudioPlan, Mode, StreamPlan};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -103,11 +103,11 @@ const PREROLL_SEGMENTS: u32 = 1;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SEGMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Registry key: `(media_id, audio_idx)`. Different audio tracks for the
-/// same media run as independent producers because each writes a
-/// different segment cache dir; killing one to start another would
-/// destroy any other client's playback on the same file.
-type ProducerKey = (String, u32);
+/// Registry key: `(media_id, audio_idx, mode_tag)`. Different audio tracks
+/// AND different encode modes/bitrates run as independent producers because
+/// each writes a different segment cache dir; killing one to start another
+/// would destroy any other client's playback on the same file.
+type ProducerKey = (String, u32, String);
 
 #[derive(Default)]
 pub struct ProducerRegistry {
@@ -119,15 +119,15 @@ impl ProducerRegistry {
         Arc::new(Self::default())
     }
 
-    fn slot(&self, media_id: &str, audio_idx: u32) -> Arc<Mutex<Option<ProducerHandle>>> {
+    fn slot(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Arc<Mutex<Option<ProducerHandle>>> {
         self.by_media
-            .entry((media_id.to_string(), audio_idx))
+            .entry((media_id.to_string(), audio_idx, mode_tag.to_string()))
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     }
 
-    pub async fn snapshot(&self, media_id: &str, audio_idx: u32) -> Option<crate::types::HlsProducerState> {
-        let slot = self.by_media.get(&(media_id.to_string(), audio_idx)).map(|e| e.clone())?;
+    pub async fn snapshot(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Option<crate::types::HlsProducerState> {
+        let slot = self.by_media.get(&(media_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone())?;
         let guard = slot.lock().await;
         let h = guard.as_ref()?;
         let start_idx = h.start_idx;
@@ -200,6 +200,11 @@ pub struct ProducerCtx {
     pub plan: Arc<StreamPlan>,
     pub plan_dir: PathBuf,
     pub audio_idx: u32,
+    /// Cache key for the registry — the same `(media_id, audio_idx)`
+    /// running with different `mode_tag`s are independent producers so a
+    /// remux client and a transcode client can coexist without one
+    /// killing the other's ffmpeg.
+    pub mode_tag: String,
     /// `None` when the requested audio index doesn't exist on the source.
     /// ffmpeg gets `-map 0:a:N?` either way; the optional flag just means
     /// "no audio in the output" if the stream is missing.
@@ -221,13 +226,13 @@ pub async fn ensure_segment(
     // producer keeps its read-ahead window aligned with where the
     // client actually is.
     if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
-        bump_target_head(registry, &ctx.media_id, ctx.audio_idx, idx, total).await;
+        bump_target_head(registry, &ctx.media_id, ctx.audio_idx, &ctx.mode_tag, idx, total).await;
         return Ok(seg_path);
     }
 
     // Slot mutex serialises start/restart so concurrent seek-back-to-back
-    // can't fire two ffmpegs on the same (media, audio_idx).
-    let slot = registry.slot(&ctx.media_id, ctx.audio_idx);
+    // can't fire two ffmpegs on the same (media, audio_idx, mode).
+    let slot = registry.slot(&ctx.media_id, ctx.audio_idx, &ctx.mode_tag);
     {
         let mut guard = slot.lock().await;
         let needs_restart = match guard.as_ref() {
@@ -242,6 +247,11 @@ pub async fn ensure_segment(
                 old.shutdown().await;
             }
             *guard = Some(launch_producer(ctx.clone(), idx, slot.clone()).await?);
+            // Drop the slot lock before sweeping siblings — they take
+            // their own slot locks, and holding two at once invites
+            // deadlock if a concurrent request races on a sibling.
+            drop(guard);
+            shutdown_siblings(registry, &ctx.media_id, ctx.audio_idx, &ctx.mode_tag).await;
         } else {
             let h = guard.as_mut().expect("checked above");
             let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
@@ -260,8 +270,46 @@ pub async fn ensure_segment(
     Ok(seg_path)
 }
 
-async fn bump_target_head(registry: &ProducerRegistry, media_id: &str, audio_idx: u32, idx: u32, total: u32) {
-    if let Some(slot) = registry.by_media.get(&(media_id.to_string(), audio_idx)).map(|e| e.clone()) {
+/// Kill any other producer for the same `media_id` whose `(audio_idx,
+/// mode_tag)` differs from the active one. Called when a fresh
+/// producer launches: switching mode (Remux ↔ Transcode), bitrate, or
+/// audio track from the player UI is the same user replacing their
+/// previous pull, so the old ffmpeg shouldn't keep burning CPU until
+/// its 30s idle reaper trips. A second user simultaneously playing
+/// the same file in a different mode is rare on a self-hosted setup,
+/// and they'd recover automatically — `ensure_segment` just relaunches
+/// their producer on their next segment fetch.
+async fn shutdown_siblings(
+    registry: &ProducerRegistry,
+    media_id: &str,
+    keep_audio_idx: u32,
+    keep_mode_tag: &str,
+) {
+    let siblings: Vec<(ProducerKey, Arc<Mutex<Option<ProducerHandle>>>)> = registry
+        .by_media
+        .iter()
+        .filter_map(|entry| {
+            let (mid, aidx, tag) = entry.key();
+            if mid != media_id {
+                return None;
+            }
+            if *aidx == keep_audio_idx && tag == keep_mode_tag {
+                return None;
+            }
+            Some((entry.key().clone(), entry.value().clone()))
+        })
+        .collect();
+    for (key, slot) in siblings {
+        let mut guard = slot.lock().await;
+        if let Some(old) = guard.take() {
+            tracing::info!(media = %media_id, audio = key.1, mode = %key.2, "shutting down sibling producer");
+            old.shutdown().await;
+        }
+    }
+}
+
+async fn bump_target_head(registry: &ProducerRegistry, media_id: &str, audio_idx: u32, mode_tag: &str, idx: u32, total: u32) {
+    if let Some(slot) = registry.by_media.get(&(media_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone()) {
         let guard = slot.lock().await;
         if let Some(h) = guard.as_ref() {
             let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
@@ -377,7 +425,9 @@ fn spawn_ffmpeg(
     start_t: f64,
     run_dir: &Path,
 ) -> anyhow::Result<Child> {
-    // The flag set that took a long time to find. Key pieces:
+    // Common preamble + HLS muxer flags. Codec args (video copy vs
+    // libx264) come from `apply_video_args` based on plan mode. Key
+    // shared pieces:
     //
     //  * `-ss <start_t>` before `-i`: fast demuxer-index seek, lands at
     //    nearest cluster ≤ start_t, sub-millisecond.
@@ -386,10 +436,7 @@ fn spawn_ffmpeg(
     //  * `-hls_segment_options movflags=+frag_discont`: THE flag (from
     //    Jellyfin's `DynamicHlsController.cs`). Without it the
     //    HLS-fmp4 muxer normalises each fragment's tfdt to zero, which
-    //    breaks A/V sync on seek-restart because the trun
-    //    composition_offsets are still source-absolute. With it, tfdt
-    //    is the actual sample DTS (including the seek offset) and both
-    //    tracks land on the source-absolute timeline.
+    //    breaks A/V sync on seek-restart.
     //  * `-hls_segment_filename seg-%05d.m4s -start_number start_idx`:
     //    scratch filenames already encode plan indices; the watcher
     //    renames straight across.
@@ -403,9 +450,9 @@ fn spawn_ffmpeg(
         .arg("-i").arg(&ctx.source)
         .arg("-map").arg("0:v:0")
         .arg("-map").arg(format!("0:a:{}?", ctx.audio_idx))
-        .arg("-avoid_negative_ts").arg("disabled")
-        .arg("-c:v").arg("copy");
-    apply_audio_args(&mut cmd, ctx.audio.as_ref());
+        .arg("-avoid_negative_ts").arg("disabled");
+    apply_video_args(&mut cmd, &ctx.plan.mode);
+    apply_audio_args(&mut cmd, ctx.audio.as_ref(), &ctx.plan.mode);
     cmd.arg("-sn").arg("-dn")
         .arg("-f").arg("hls")
         .arg("-hls_time").arg("6")
@@ -430,13 +477,49 @@ fn spawn_ffmpeg(
         .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg: {e}"))
 }
 
-fn apply_audio_args(cmd: &mut Command, audio: Option<&AudioPlan>) {
+fn apply_video_args(cmd: &mut Command, mode: &Mode) {
+    match mode {
+        Mode::Remux => {
+            cmd.arg("-c:v").arg("copy");
+        }
+        Mode::Transcode { bitrate_kbps, max_height } => {
+            // `scale=-2:'min(H,ih)'` keeps source aspect, never
+            // upscales, and the `-2` rounds width to the nearest even
+            // multiple (libx264 + yuv420p require even dimensions).
+            let vf = format!("scale=-2:'min({max_height},ih)'");
+            let maxrate = bitrate_kbps.saturating_mul(15) / 10; // 1.5×
+            let bufsize = bitrate_kbps.saturating_mul(2);
+            // `force_key_frames "expr:gte(t,n_forced*6)"` makes ffmpeg
+            // insert IDRs exactly at our 6s segment boundaries so each
+            // produced segment is independently decodable — which is
+            // what `independent_segments` advertises in the playlist.
+            cmd.arg("-vf").arg(vf)
+                .arg("-c:v").arg("libx264")
+                .arg("-preset").arg("veryfast")
+                .arg("-profile:v").arg("high")
+                .arg("-level").arg("4.1")
+                .arg("-pix_fmt").arg("yuv420p")
+                .arg("-b:v").arg(format!("{bitrate_kbps}k"))
+                .arg("-maxrate").arg(format!("{maxrate}k"))
+                .arg("-bufsize").arg(format!("{bufsize}k"))
+                .arg("-force_key_frames").arg("expr:gte(t,n_forced*6)");
+        }
+    }
+}
+
+fn apply_audio_args(cmd: &mut Command, audio: Option<&AudioPlan>, mode: &Mode) {
     // No audio plan = no source stream at this index. ffmpeg's
     // `-map 0:a:N?` already silently drops the output, so we just don't
     // pass any `-c:a`/`-b:a` flags and let ffmpeg produce a video-only
     // output. (This also covers files with no audio at all.)
     let Some(audio) = audio else { return };
-    if audio.out_codec == "copy" {
+    // For Transcode we always re-encode audio to stereo AAC: the rest of
+    // the pipeline is already CPU-bound on libx264, and a uniform output
+    // codec sidesteps the "source AAC has weird channel layout that
+    // browsers won't decode" footgun on a path users only hit when
+    // remux already wasn't viable.
+    let force_aac = matches!(mode, Mode::Transcode { .. });
+    if !force_aac && audio.out_codec == "copy" {
         cmd.arg("-c:a").arg("copy");
     } else {
         cmd.arg("-c:a").arg("aac")

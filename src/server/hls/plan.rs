@@ -45,7 +45,12 @@ use tokio::process::Command;
 ///          parameter (cache dir keyed by audio index). The persisted
 ///          plan no longer carries an `AudioPlan` — `derive_audio_plan`
 ///          builds one on demand from the probe.
-pub const PLAN_VERSION: u32 = 11;
+///   v12:   `Mode::Transcode { bitrate_kbps, max_height }` added. Mode is
+///          a per-request param (cache dir keyed by `mode_tag`), so the
+///          persisted plan still always describes the remux variant —
+///          transcode plans use uniform 6s segments and are built on the
+///          fly without DB caching.
+pub const PLAN_VERSION: u32 = 12;
 
 /// Target segment length. ffmpeg only cuts at source keyframes under
 /// `-c:v copy`, so real segments will land near this value but vary with
@@ -74,12 +79,26 @@ pub struct StreamPlan {
     pub segments: Vec<Segment>,
 }
 
-/// Future: `Transcode { codec, height, bitrate_kbps }`. For now, only Remux
-/// (copy-mux) is implemented; other modes return 501 at request time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Two encode strategies share the same producer/playlist/cache machinery:
+///
+/// * `Remux` — `-c:v copy` into fMP4. Cheap, but only viable when the
+///   source video codec is one fMP4 + browser stack can decode (h264 today,
+///   plus best-effort hevc on systems with hardware decoders). Segments
+///   are cut at source keyframes, so timing is determined by an ffprobe
+///   pass over the source's video packets.
+/// * `Transcode` — `-c:v libx264` at `bitrate_kbps` with the source
+///   downscaled to at most `max_height`. Real CPU cost, but always plays.
+///   Segments are uniform 6s blocks (no source-keyframe constraint —
+///   ffmpeg is told to force keyframes at boundaries), so the plan can
+///   be built from duration alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Mode {
     Remux,
+    Transcode {
+        bitrate_kbps: u32,
+        max_height: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +149,64 @@ pub fn is_copy_remux_viable(info: &MediaTechInfo) -> Result<(), String> {
         return Err("duration too short to segment".into());
     }
     Ok(())
+}
+
+/// Map a target video bitrate to the maximum output height. The ladder is
+/// conservative — picking a height that the bitrate can sustain at a
+/// reasonable per-pixel rate avoids the "blocky 1080p at 1 Mbps" failure
+/// mode. Source resolution is the upper bound; we never upscale.
+pub fn height_for_bitrate(bitrate_kbps: u32) -> u32 {
+    match bitrate_kbps {
+        b if b >= 6000 => 1080,
+        b if b >= 3000 => 720,
+        b if b >= 1500 => 480,
+        _ => 360,
+    }
+}
+
+/// Build a transcode plan: uniform 6s segments derived from duration. No
+/// keyframe ffprobe pass — the producer's ffmpeg forces keyframes at
+/// segment boundaries via `-force_key_frames`.
+pub fn build_transcode_plan(
+    info: &MediaTechInfo,
+    bitrate_kbps: u32,
+) -> anyhow::Result<StreamPlan> {
+    let v = info.video.as_ref().ok_or_else(|| anyhow::anyhow!("no video stream"))?;
+    let duration = info
+        .duration_seconds
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid duration"))?;
+    if duration < 0.5 {
+        anyhow::bail!("duration too short to segment");
+    }
+    let max_height = height_for_bitrate(bitrate_kbps);
+    let segments = uniform_segments(duration, TARGET_SEGMENT_SECS);
+    Ok(StreamPlan {
+        version: PLAN_VERSION,
+        mode: Mode::Transcode {
+            bitrate_kbps,
+            max_height,
+        },
+        duration,
+        video_codec: v.codec.clone(),
+        segments,
+    })
+}
+
+fn uniform_segments(duration: f64, target_secs: f64) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut t = 0.0_f64;
+    let mut idx = 1u32;
+    while t + target_secs < duration {
+        out.push(Segment { i: idx, t, d: target_secs });
+        idx += 1;
+        t += target_secs;
+    }
+    let tail = (duration - t).max(0.0);
+    if tail > 0.0 {
+        out.push(Segment { i: idx, t, d: tail });
+    }
+    out
 }
 
 /// Build a fresh plan. Runs ffprobe over the source's video packets, folds
@@ -311,20 +388,13 @@ fn group_segments(keyframes: &[f64], duration: f64) -> Vec<Segment> {
     segments
 }
 
-/// Cached row for a media's plan + invalidation keys.
-pub struct PlanRow {
-    pub plan: StreamPlan,
-    pub source_mtime: i64,
-    pub source_size: i64,
-}
-
 /// Load a plan from the DB if one exists *and* matches the on-disk source's
 /// mtime+size. Returns `Ok(None)` for cache miss (caller should rebuild).
 pub async fn load_if_fresh(
     pool: &SqlitePool,
     media_id: &str,
     src: &Path,
-) -> anyhow::Result<Option<PlanRow>> {
+) -> anyhow::Result<Option<StreamPlan>> {
     let row: Option<(Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
         "SELECT stream_plan_json, source_mtime, source_size FROM media WHERE id = ?",
     )
@@ -350,11 +420,7 @@ pub async fn load_if_fresh(
     if cur_mtime != mtime || cur_size != size {
         return Ok(None);
     }
-    Ok(Some(PlanRow {
-        plan,
-        source_mtime: mtime,
-        source_size: size,
-    }))
+    Ok(Some(plan))
 }
 
 pub async fn store(

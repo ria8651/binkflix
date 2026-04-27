@@ -85,8 +85,14 @@ pub struct MediaTechInfo {
     pub video: Option<VideoTrackInfo>,
     pub audio: Vec<AudioTrackInfo>,
     /// What the browser can do with this file: play it as-is, remux into
-    /// fragmented MP4, or (not yet implemented) full transcode.
+    /// fragmented MP4, or full transcode.
     pub browser_compat: BrowserCompat,
+    /// Human-readable explanation for why the verdict isn't `Direct`. `None`
+    /// for direct files. Surfaced in the playback info panel so an operator
+    /// can see *why* the server picked Remux/Transcode without re-deriving
+    /// the rule.
+    #[serde(default)]
+    pub compat_reason: Option<String>,
 }
 
 /// How we expect to deliver this media to a modern browser.
@@ -174,11 +180,18 @@ pub struct HlsProducerState {
 // URL builders — relative paths work through dx proxy and same-origin alike.
 pub fn media_image_url(id: &str) -> String { format!("/api/media/{id}/image") }
 pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") }
-pub fn media_stream_url_with_mode(id: &str, mode: &str) -> String {
-    format!("/api/media/{id}/stream?mode={mode}")
-}
-pub fn media_hls_url_with_audio(id: &str, audio_idx: u32) -> String {
-    format!("/api/media/{id}/hls/index.m3u8?a={audio_idx}")
+/// HLS playlist URL with explicit mode + optional bitrate. `mode` is
+/// `"remux"` or `"transcode"`; bitrate (kbps) is honored for transcode
+/// only. Empty mode falls back to the server's compat verdict.
+pub fn media_hls_url(id: &str, audio_idx: u32, mode: &str, bitrate_kbps: Option<u32>) -> String {
+    let mut url = format!("/api/media/{id}/hls/index.m3u8?a={audio_idx}");
+    if !mode.is_empty() {
+        url.push_str(&format!("&mode={mode}"));
+    }
+    if let Some(b) = bitrate_kbps {
+        url.push_str(&format!("&bitrate={b}"));
+    }
+    url
 }
 pub fn media_subtitle_url(id: &str, track: &str) -> String {
     format!("/api/media/{id}/subtitle/{track}")

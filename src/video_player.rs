@@ -21,6 +21,26 @@ use crate::client_api::*;
 use crate::types::*;
 use dioxus::prelude::*;
 
+/// Per-session user override on top of the server's compat verdict.
+#[derive(Clone, Copy, PartialEq)]
+struct PlaybackOverride {
+    /// `None` = follow the auto verdict (Direct > Remux > Transcode).
+    mode: Option<BrowserCompat>,
+    /// Transcode bitrate in kbps. `None` = "Auto" (server picks from source).
+    bitrate_kbps: Option<u32>,
+}
+
+/// Bitrate menu presets. `None` = "Auto" — the server derives a bitrate
+/// from the source. Each numeric option carries the matching auto-derived
+/// height label for display.
+const BITRATE_PRESETS: &[(Option<u32>, &str)] = &[
+    (None, "Auto"),
+    (Some(8000), "8 Mbps · ~1080p"),
+    (Some(4000), "4 Mbps · ~720p"),
+    (Some(2000), "2 Mbps · ~480p"),
+    (Some(1000), "1 Mbps · ~360p"),
+];
+
 const ICON_PLAY: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>"#;
 const ICON_BACK: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>"#;
 const ICON_CAPTIONS: &str = r#"<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 7H9.5v-.5h-2v3h2V13H11v1c0 .55-.45 1-1 1H7c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1zm7 0h-1.5v-.5h-2v3h2V13H18v1c0 .55-.45 1-1 1h-3c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1z"/></svg>"#;
@@ -28,6 +48,7 @@ const ICON_FULLSCREEN: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20"
 const ICON_INFO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5M12 8h.01"/></svg>"#;
 const ICON_CHECK: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
 const ICON_AUDIO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 11v2"/></svg>"#;
+const ICON_SETTINGS: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>"#;
 
 #[component]
 pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
@@ -124,93 +145,54 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         }
     });
 
-    // `None` = use /stream (server picks).
-    // `Some("remux"|"direct")` = user explicitly opted in after the
-    //     transcode prompt; pin that mode on subsequent loads.
-    let mut forced_mode = use_signal(|| None::<&'static str>);
+    // User-override on top of the server's compat verdict. `mode = None`
+    // means "follow whatever the probe says"; explicit Some(...) pins one
+    // of Direct/Remux/Transcode. `bitrate_kbps = None` means "Auto" —
+    // the server derives a bitrate from the source. Per-session only.
+    let mut playback_override = use_signal(|| PlaybackOverride { mode: None, bitrate_kbps: None });
 
-    // Compute the src to hand the video element. Empty string means "don't
-    // load yet" — we're waiting on the tech probe to decide whether to
-    // show the transcode prompt. Rendering with an empty src is harmless
-    // because we render the <video> behind the prompt overlay (it won't
-    // be interacted with until the overlay is dismissed).
-    let id_for_src = id.clone();
-    let stream_src = use_memo(move || -> String {
-        let aidx = *effective_audio.read();
-        // Direct serve only carries the file's first audio track (the
-        // one the browser exposes by default). Picking a non-default
-        // track from the UI transparently switches the source onto the
-        // HLS pipeline so the server can `-map 0:a:N?` the right one.
-        // Picking back to track 0 returns to direct.
-        let direct_or_hls = |id: &str| -> String {
-            if aidx == 0 {
-                media_stream_url(id)
-            } else {
-                media_hls_url_with_audio(id, aidx)
-            }
-        };
-        if let Some(mode) = *forced_mode.read() {
-            // "Try remux" now goes through the HLS pipeline so the user
-            // gets real random-access seeking instead of the fMP4-over-
-            // pipe workaround. "Try direct" still hits byte-range serve
-            // so source containers that are already browser-friendly
-            // skip the ffmpeg round-trip entirely.
-            return match mode {
-                "remux" => media_hls_url_with_audio(&id_for_src, aidx),
-                "direct" => direct_or_hls(&id_for_src),
-                _ => media_stream_url_with_mode(&id_for_src, mode),
-            };
-        }
-        match &*tech.read_unchecked() {
-            // Wait for the probe before setting a src — otherwise we
-            // hit `/stream` optimistically, the server returns 501 for
-            // transcode-needed files, the <video> fires an error, and
-            // the "Can't play this video" overlay stacks underneath
-            // the transcode prompt that appears once tech does resolve.
-            None => String::new(),
-            // Probe failed: try direct and let the browser's own error
-            // surface if it can't handle it.
-            Some(Err(_)) => media_stream_url(&id_for_src),
-            Some(Ok(info)) => match info.browser_compat {
-                // Remux goes through the new HLS pipeline (real random
-                // access + keyframe-aligned fMP4 segments). Direct stays
-                // on the byte-range `/stream` path for the default
-                // audio track and switches to HLS when the user picks
-                // an alternate (since direct can't re-mux audio).
-                BrowserCompat::Direct => direct_or_hls(&id_for_src),
-                BrowserCompat::Remux => media_hls_url_with_audio(&id_for_src, aidx),
-                // Don't set a src — the overlay below prompts the user
-                // to pick a best-effort mode.
-                BrowserCompat::Transcode => String::new(),
-            },
-        }
-    });
-
-    // True when the probe says we need transcoding and the user hasn't
-    // yet picked remux/direct as a fallback.
-    let show_transcode_prompt = use_memo(move || -> bool {
-        if forced_mode.read().is_some() { return false; }
-        matches!(
-            &*tech.read_unchecked(),
-            Some(Ok(info)) if info.browser_compat == BrowserCompat::Transcode
-        )
-    });
-
-    // What's actually happening on the wire, accounting for user
-    // overrides on top of the server's verdict. Surfaced in the debug
-    // panel's Delivery section so the panel doesn't keep claiming
-    // "transcode required" after the user picked remux/direct.
-    let effective_mode = use_memo(move || -> BrowserCompat {
-        if let Some(mode) = *forced_mode.read() {
-            return match mode {
-                "direct" => BrowserCompat::Direct,
-                "remux" => BrowserCompat::Remux,
-                _ => BrowserCompat::Transcode,
-            };
-        }
+    // Auto-pick: pick the simplest mode the file supports. Direct >
+    // Remux > Transcode. Probe failure falls back to Direct so the
+    // browser's own error surface takes over rather than us silently
+    // 501ing.
+    let auto_mode = use_memo(move || -> BrowserCompat {
         match &*tech.read_unchecked() {
             Some(Ok(info)) => info.browser_compat,
             _ => BrowserCompat::Direct,
+        }
+    });
+
+    // What we'll actually deliver, accounting for user override.
+    let effective_mode = use_memo(move || -> BrowserCompat {
+        playback_override.read().mode.unwrap_or_else(|| *auto_mode.read())
+    });
+
+    // Compute the src to hand the video element. Empty string means "don't
+    // load yet" — we're still waiting on the tech probe.
+    let id_for_src = id.clone();
+    let stream_src = use_memo(move || -> String {
+        // Wait for the probe before setting a src — otherwise we'd hit
+        // `/stream` optimistically and risk a redirect/error race.
+        let probed = matches!(&*tech.read_unchecked(), Some(_));
+        if !probed {
+            return String::new();
+        }
+        let aidx = *effective_audio.read();
+        let mode = *effective_mode.read();
+        let bitrate = playback_override.read().bitrate_kbps;
+        match mode {
+            // Direct serve only carries the file's first audio track.
+            // Picking a non-default track transparently switches to HLS
+            // so the server can `-map 0:a:N?` the right one.
+            BrowserCompat::Direct => {
+                if aidx == 0 {
+                    media_stream_url(&id_for_src)
+                } else {
+                    media_hls_url(&id_for_src, aidx, "remux", None)
+                }
+            }
+            BrowserCompat::Remux => media_hls_url(&id_for_src, aidx, "remux", None),
+            BrowserCompat::Transcode => media_hls_url(&id_for_src, aidx, "transcode", bitrate),
         }
     });
 
@@ -236,36 +218,51 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     });
 
     // Same idea but for the HLS pipeline state (producer head, cached
-    // segments). Polled whenever the file is being remuxed — we use
-    // `producer.head` to drive the "Remuxing… seg N/total" label inside
-    // the loading overlay, so the user can tell whether ffmpeg is
-    // making progress while the player buffers. A `poll_alive` gate
-    // lets the component drop the loop on unmount.
+    // segments). Polled whenever the file is going through the HLS
+    // pipeline (Remux or Transcode) — we use `producer.head` to drive
+    // the "Remuxing…/Transcoding… seg N/total" label inside the loading
+    // overlay so the user can tell whether ffmpeg is making progress
+    // while the player buffers. A `poll_alive` gate lets the component
+    // drop the loop on unmount.
     let mut poll_alive = use_signal(|| true);
     use_drop(move || poll_alive.set(false));
     let id_for_hls_state = id.clone();
+    // Single long-lived polling task — depend only on whether we're in
+    // the HLS pipeline, *not* on audio/mode/bitrate, so changing any of
+    // those doesn't spawn a parallel loop. The loop reads the current
+    // values via `peek()` on each tick, so it always queries the right
+    // (audio, mode, bitrate) combination without re-firing the effect.
+    // (Earlier we captured these once at effect entry, which produced
+    // racing loops whenever the user touched the settings menu — the
+    // debug panel would alternate between stale snapshots.)
     use_effect(move || {
-        let in_remux = matches!(
-            &*tech.read_unchecked(),
-            Some(Ok(info)) if info.browser_compat == BrowserCompat::Remux
-        ) || matches!(*forced_mode.read(), Some("remux"));
-        if !in_remux {
+        let in_pipeline = matches!(
+            *effective_mode.read(),
+            BrowserCompat::Remux | BrowserCompat::Transcode
+        );
+        if !in_pipeline {
             return;
         }
-        // Captured for the web-only polling loop below; non-web build
-        // never enters the loop so the binding stays unused there.
         #[cfg_attr(not(feature = "web"), allow(unused_variables))]
         let id = id_for_hls_state.clone();
         spawn(async move {
             #[cfg(feature = "web")]
             loop {
                 if !*poll_alive.peek() { break; }
-                match get_hls_state(&id).await {
+                let aidx = *effective_audio.peek();
+                let mode_str = match *effective_mode.peek() {
+                    BrowserCompat::Transcode => "transcode",
+                    _ => "remux",
+                };
+                let bitrate = playback_override.peek().bitrate_kbps;
+                match get_hls_state(&id, aidx, mode_str, bitrate).await {
                     Ok(s) => hls_state.set(Some(s)),
                     Err(_) => { /* leave previous; next tick retries */ }
                 }
                 gloo_timers::future::TimeoutFuture::new(1000).await;
             }
+            #[cfg(not(feature = "web"))]
+            { let _ = id; }
         });
     });
 
@@ -548,35 +545,6 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     rsx! {}
                 }
             }
-            // Transcode prompt: source codec isn't natively playable and
-            // we don't have a real transcode path yet. Offer remux
-            // (cheap, video-copy into fMP4/WebM — may or may not decode)
-            // and direct (serve the raw file — browser plays if it can).
-            if *show_transcode_prompt.read() {
-                div { class: "player-transcode-prompt", role: "dialog",
-                    div { class: "player-transcode-icon", "⚠" }
-                    div { class: "player-transcode-title", "This file needs transcoding" }
-                    div { class: "player-transcode-body",
-                        "The source codec isn't one we can reliably play in a browser. "
-                        "Transcoding isn't implemented yet — you can try remuxing (fast, may fail to decode) or direct streaming (browser decides)."
-                    }
-                    div { class: "player-transcode-actions",
-                        button {
-                            class: "player-transcode-btn primary",
-                            r#type: "button",
-                            onclick: move |_| forced_mode.set(Some("remux")),
-                            "Try remux"
-                        }
-                        button {
-                            class: "player-transcode-btn",
-                            r#type: "button",
-                            onclick: move |_| forced_mode.set(Some("direct")),
-                            "Try direct"
-                        }
-                        Link { to: back_route.clone(), class: "player-transcode-btn", "Back" }
-                    }
-                }
-            }
             // Loading spinner overlay — shown while `.loading` is on the
             // wrap (initial load / buffering / stalled). The class is
             // toggled from player.js while the video is mounted, and
@@ -584,20 +552,25 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             // the user gets feedback while waiting on the tech probe).
             //
             // The label under the spinner narrates *why* we're waiting:
-            //   * empty src      → "Preparing playback…"
-            //   * remux + producer running → "Remuxing… seg N / total"
+            //   * empty src         → "Preparing playback…"
+            //   * remux + producer  → "Remuxing… seg N / total"
+            //   * transcode + producer → "Transcoding… seg N / total"
             // This makes a stalled pipeline visible from the UI alone
             // instead of needing the debug panel.
             {
                 let src_empty = stream_src.read().is_empty();
-                let in_remux = matches!(*effective_mode.read(), BrowserCompat::Remux);
+                let mode = *effective_mode.read();
                 let label: Option<String> = if src_empty {
                     Some("Preparing playback…".to_string())
-                } else if in_remux {
+                } else if matches!(mode, BrowserCompat::Remux | BrowserCompat::Transcode) {
+                    let verb = match mode {
+                        BrowserCompat::Transcode => "Transcoding",
+                        _ => "Remuxing",
+                    };
                     hls_state.read().as_ref().and_then(|s| {
                         let p = s.producer.as_ref()?;
                         Some(format!(
-                            "Remuxing… seg {} / {}",
+                            "{verb}… seg {} / {}",
                             p.head.max(p.start_idx), s.total_segments
                         ))
                     })
@@ -782,6 +755,91 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                         }
                     }
 
+                    // Video settings menu. Lets the user override the
+                    // server's auto-picked mode (Direct/Remux/Transcode)
+                    // and choose a transcode bitrate. The auto-picked
+                    // mode is checked by default; clicking it again
+                    // clears the override.
+                    {
+                        let is_open = *open_menu.read() == Some("settings");
+                        let current_auto = *auto_mode.read();
+                        let cur = *playback_override.read();
+                        let cur_mode = cur.mode.unwrap_or(current_auto);
+                        let cur_bitrate = cur.bitrate_kbps;
+                        rsx! {
+                            div { class: "player-menu-wrap", "data-popover": "settings",
+                                button {
+                                    class: "player-btn settings-btn",
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        open_menu.set(if is_open { None } else { Some("settings") });
+                                    },
+                                    title: "Video settings",
+                                    dangerous_inner_html: ICON_SETTINGS,
+                                }
+                                if is_open {
+                                    div { class: "player-menu",
+                                        div { class: "player-menu-section", "Mode" }
+                                        for (m, label) in [
+                                            (BrowserCompat::Direct, "Direct"),
+                                            (BrowserCompat::Remux, "Remux"),
+                                            (BrowserCompat::Transcode, "Transcode"),
+                                        ] {
+                                            {
+                                                let is_active = cur_mode == m;
+                                                let display_label = if m == current_auto {
+                                                    format!("{label} (auto)")
+                                                } else {
+                                                    label.to_string()
+                                                };
+                                                rsx! {
+                                                    button {
+                                                        key: "{label}",
+                                                        class: if is_active { "active" } else { "" },
+                                                        r#type: "button",
+                                                        onclick: move |_| {
+                                                            // Clicking the auto-recommended option clears
+                                                            // the override — keeps the override "sticky"
+                                                            // semantics minimal.
+                                                            let next = if m == current_auto { None } else { Some(m) };
+                                                            playback_override.with_mut(|o| o.mode = next);
+                                                        },
+                                                        span { "{display_label}" }
+                                                        if is_active {
+                                                            span { class: "check", dangerous_inner_html: ICON_CHECK }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if matches!(cur_mode, BrowserCompat::Transcode) {
+                                            div { class: "player-menu-section", "Quality" }
+                                            for (preset, label) in BITRATE_PRESETS.iter().copied() {
+                                                {
+                                                    let is_active = cur_bitrate == preset;
+                                                    rsx! {
+                                                        button {
+                                                            key: "{label}",
+                                                            class: if is_active { "active" } else { "" },
+                                                            r#type: "button",
+                                                            onclick: move |_| {
+                                                                playback_override.with_mut(|o| o.bitrate_kbps = preset);
+                                                            },
+                                                            span { "{label}" }
+                                                            if is_active {
+                                                                span { class: "check", dangerous_inner_html: ICON_CHECK }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Debug / tech-info toggle. The panel itself is
                     // rendered outside .player-chrome so it stays visible
                     // even while the chrome auto-hides during playback.
@@ -842,6 +900,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                                     stats: stats_snapshot,
                                     hls: hls_snapshot,
                                     effective_mode: *effective_mode.read(),
+                                    bitrate_override: playback_override.read().bitrate_kbps,
                                 }
                             }
                         }
@@ -869,6 +928,7 @@ fn DebugMenuBody(
     stats: Option<serde_json::Value>,
     hls: Option<HlsState>,
     effective_mode: BrowserCompat,
+    bitrate_override: Option<u32>,
 ) -> Element {
     // Prefer what the server actually told us over our inference: if we
     // saw `Accept-Ranges: bytes` in the response, it's a direct serve;
@@ -898,7 +958,7 @@ fn DebugMenuBody(
         .and_then(|s| s.get("current_time"))
         .and_then(|v| v.as_f64());
     rsx! {
-        if matches!(effective_mode, BrowserCompat::Remux) {
+        if matches!(effective_mode, BrowserCompat::Remux | BrowserCompat::Transcode) {
             div { class: "debug-section",
                 div { class: "debug-section-title", "HLS pipeline" }
                 match &hls {
@@ -939,6 +999,7 @@ fn DebugMenuBody(
                         info: info.clone(),
                         effective_mode: observed_mode.unwrap_or(effective_mode),
                         observed_container: observed_container.clone(),
+                        bitrate_override,
                     }
                 },
             }
@@ -989,11 +1050,32 @@ impl ObservedStream {
     }
 }
 
+/// Mirror the server's auto-bitrate logic so the debug panel can show
+/// the same value the server would pick when the user has Auto selected.
+/// Keep in sync with `resolve_bitrate` in `src/server/hls/mod.rs`.
+fn auto_bitrate_kbps(source_kbps: Option<u64>) -> u32 {
+    let auto = source_kbps
+        .and_then(|b| u32::try_from(b).ok())
+        .unwrap_or(4000);
+    auto.clamp(200, 6000)
+}
+
+/// Mirror of `height_for_bitrate` in `src/server/hls/plan.rs`.
+fn height_for_bitrate(bitrate_kbps: u32) -> u32 {
+    match bitrate_kbps {
+        b if b >= 6000 => 1080,
+        b if b >= 3000 => 720,
+        b if b >= 1500 => 480,
+        _ => 360,
+    }
+}
+
 #[component]
 fn DeliveryRows(
     info: MediaTechInfo,
     effective_mode: BrowserCompat,
     observed_container: Option<String>,
+    bitrate_override: Option<u32>,
 ) -> Element {
     // Describe what the browser is actually receiving on the wire, as a
     // complement to the Source section above. `effective_mode` reflects
@@ -1051,12 +1133,52 @@ fn DeliveryRows(
                 DebugRow { label: "Container", value: container_label }
                 DebugRow { label: "Video", value: format!("{source_video} (copy)") }
                 DebugRow { label: "Audio", value: audio_label }
+                if let Some(reason) = info.compat_reason.clone() {
+                    DebugRow { label: "Why", value: reason }
+                }
             }
         }
-        BrowserCompat::Transcode => rsx! {
-            DebugRow { label: "Mode", value: "transcode required".to_string() }
-            DebugRow { label: "Status", value: "not implemented".to_string() }
-        },
+        BrowserCompat::Transcode => {
+            let source_video = info
+                .video
+                .as_ref()
+                .map(|v| v.codec.clone())
+                .unwrap_or_else(|| "none".into());
+            let container_label = observed_container
+                .clone()
+                .unwrap_or_else(|| "fragmented MP4".into());
+            // Mirror the server's bitrate/height pick so the panel
+            // shows the same numbers the producer is using. When the
+            // user picks "Auto", `bitrate_override` is None and we
+            // derive from the source's probed bitrate (clamped).
+            let target_bitrate = bitrate_override.unwrap_or_else(|| auto_bitrate_kbps(info.bitrate_kbps));
+            let target_height = height_for_bitrate(target_bitrate);
+            // Source resolution is the upper bound — never upscale.
+            let effective_height = info
+                .video
+                .as_ref()
+                .and_then(|v| v.height)
+                .map(|h| h.min(target_height))
+                .unwrap_or(target_height);
+            let bitrate_label = if bitrate_override.is_some() {
+                format!("{target_bitrate} kbps")
+            } else {
+                format!("{target_bitrate} kbps (auto)")
+            };
+            rsx! {
+                DebugRow { label: "Mode", value: "transcode (libx264)".to_string() }
+                DebugRow { label: "Container", value: container_label }
+                DebugRow {
+                    label: "Video",
+                    value: format!("{source_video} → h264 · ≤{effective_height}p"),
+                }
+                DebugRow { label: "Bitrate", value: bitrate_label }
+                DebugRow { label: "Audio", value: "AAC · stereo · 192 kbps".to_string() }
+                if let Some(reason) = info.compat_reason.clone() {
+                    DebugRow { label: "Why", value: reason }
+                }
+            }
+        }
     }
 }
 

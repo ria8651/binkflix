@@ -62,8 +62,20 @@ pub async fn get_media_tech(id: &str) -> Result<MediaTechInfo, String> {
 // Only consumed from the `#[cfg(feature = "web")]` polling loop in
 // the debug panel; non-web builds compile but never call it.
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
-pub async fn get_hls_state(id: &str) -> Result<HlsState, String> {
-    fetch_json(&format!("/api/media/{id}/hls/state")).await
+pub async fn get_hls_state(
+    id: &str,
+    audio_idx: u32,
+    mode: &str,
+    bitrate_kbps: Option<u32>,
+) -> Result<HlsState, String> {
+    let mut url = format!("/api/media/{id}/hls/state?a={audio_idx}");
+    if !mode.is_empty() {
+        url.push_str(&format!("&mode={mode}"));
+    }
+    if let Some(b) = bitrate_kbps {
+        url.push_str(&format!("&bitrate={b}"));
+    }
+    fetch_json(&url).await
 }
 
 #[cfg(feature = "web")]

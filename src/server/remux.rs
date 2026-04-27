@@ -79,14 +79,19 @@ pub async fn media_stream(
     match mode {
         BrowserCompat::Direct => direct_stream(&path, req).await,
         BrowserCompat::Remux => remux_stream(&state, &id, &path).await,
-        // Refuse silently-remuxing a file classified as transcode — the
-        // remux pipeline is `-c:v copy`, which either fails the mux or
-        // produces a stream the browser can't decode. Surface 501 so the
-        // client can prompt the user to explicitly try `?mode=remux` or
-        // `?mode=direct` with informed consent.
-        BrowserCompat::Transcode => Err(Error::NotImplemented(
-            "transcoding isn't implemented; use ?mode=remux or ?mode=direct to attempt a best-effort play".into(),
-        )),
+        // Transcode is delivered via the HLS pipeline (`-c:v libx264`
+        // segmented into fMP4). The client picks that URL directly when
+        // the compat verdict is Transcode; this branch only fires for
+        // the `?mode=transcode` debug override against `/stream`, where
+        // we redirect to the equivalent HLS URL.
+        BrowserCompat::Transcode => {
+            let target = format!("/api/media/{id}/hls/index.m3u8?a=0&mode=transcode");
+            Ok((
+                StatusCode::TEMPORARY_REDIRECT,
+                [(header::LOCATION, target)],
+            )
+                .into_response())
+        }
     }
 }
 
