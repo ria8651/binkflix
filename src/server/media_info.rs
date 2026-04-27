@@ -39,7 +39,25 @@ pub async fn store(pool: &SqlitePool, media_id: &str, info: &MediaTechInfo) -> a
     Ok(())
 }
 
+/// Raw subtitle stream entry as reported by ffprobe. Filtering / target-format
+/// decisions happen in [`crate::server::subtitles`]; this struct just carries
+/// what's needed to make those decisions without re-probing.
+pub struct EmbeddedSubtitleStream {
+    pub index: u32,
+    pub codec: String,
+    pub tags: std::collections::BTreeMap<String, String>,
+    pub disposition: std::collections::BTreeMap<String, i64>,
+}
+
 pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
+    Ok(probe_full(video).await?.0)
+}
+
+/// Like [`probe`] but also returns subtitle stream metadata, so the scanner
+/// can avoid a second ffprobe just to enumerate subtitle tracks.
+pub async fn probe_full(
+    video: &Path,
+) -> anyhow::Result<(MediaTechInfo, Vec<EmbeddedSubtitleStream>)> {
     let output = Command::new("ffprobe")
         .args([
             "-v", "error",
@@ -62,6 +80,7 @@ pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
 
     let mut video_track: Option<VideoTrackInfo> = None;
     let mut audio_tracks: Vec<AudioTrackInfo> = Vec::new();
+    let mut subtitle_streams: Vec<EmbeddedSubtitleStream> = Vec::new();
 
     for s in &parsed.streams {
         match s.codec_type.as_str() {
@@ -95,6 +114,14 @@ pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
                     default: s.disposition.get("default").copied().unwrap_or(0) != 0,
                 });
             }
+            "subtitle" => {
+                subtitle_streams.push(EmbeddedSubtitleStream {
+                    index: s.index,
+                    codec: s.codec_name.clone(),
+                    tags: s.tags.clone(),
+                    disposition: s.disposition.clone(),
+                });
+            }
             _ => {}
         }
     }
@@ -102,7 +129,7 @@ pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
     let container = parsed.format.format_name.clone().filter(|s| !s.is_empty());
     let browser_compat = compute_compat(video_track.as_ref(), &audio_tracks, container.as_deref());
 
-    Ok(MediaTechInfo {
+    let info = MediaTechInfo {
         container,
         duration_seconds: parsed.format.duration.as_deref().and_then(|s| s.parse().ok()),
         bitrate_kbps: parse_bitrate_kbps(parsed.format.bit_rate.as_deref()),
@@ -110,7 +137,8 @@ pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
         video: video_track,
         audio: audio_tracks,
         browser_compat,
-    })
+    };
+    Ok((info, subtitle_streams))
 }
 
 /// Decide whether a file can be served as-is, remuxed cheaply, or needs
@@ -203,6 +231,8 @@ struct ProbeFormat {
 
 #[derive(Debug, Deserialize)]
 struct ProbeStream {
+    #[serde(default)]
+    index: u32,
     #[serde(default)]
     codec_type: String,
     #[serde(default)]

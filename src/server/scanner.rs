@@ -399,7 +399,17 @@ pub async fn scan_library_with_progress(
                 let progress = progress.clone();
                 async move {
                     let job_started = std::time::Instant::now();
-                    let sub_count = match subtitles::scan_for_media(&pool, &job.media_id, &job.video).await {
+                    // Single ffprobe per file: gives us tech info AND the
+                    // embedded subtitle stream list, so subtitles::scan_for_media
+                    // doesn't have to spawn its own ffprobe.
+                    let (tech_info, embedded_subs) = match super::media_info::probe_full(&job.video).await {
+                        Ok(pair) => (Some(pair.0), pair.1),
+                        Err(e) => {
+                            warn!(media_id = %job.media_id, %e, "ffprobe failed");
+                            (None, Vec::new())
+                        }
+                    };
+                    let sub_count = match subtitles::scan_for_media(&pool, &job.media_id, &job.video, &embedded_subs).await {
                         Ok(n) => n,
                         Err(e) => {
                             warn!(media_id = %job.media_id, %e, "subtitle scan failed");
@@ -409,15 +419,10 @@ pub async fn scan_library_with_progress(
                     if !job.has_sidecar_image {
                         thumbnails::scan_for_media(&pool, &job.media_id, &job.video).await;
                     }
-                    // Probe + cache container/codec/duration info so /tech
-                    // and the remux endpoint don't each re-run ffprobe.
-                    match super::media_info::probe(&job.video).await {
-                        Ok(info) => {
-                            if let Err(e) = super::media_info::store(&pool, &job.media_id, &info).await {
-                                warn!(media_id = %job.media_id, %e, "failed to cache tech info");
-                            }
+                    if let Some(info) = tech_info {
+                        if let Err(e) = super::media_info::store(&pool, &job.media_id, &info).await {
+                            warn!(media_id = %job.media_id, %e, "failed to cache tech info");
                         }
-                        Err(e) => warn!(media_id = %job.media_id, %e, "ffprobe failed"),
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
