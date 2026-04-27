@@ -41,7 +41,11 @@ use tokio::process::Command;
 ///          the player aligns by media time regardless of slight
 ///          EXTINF/actual-duration discrepancies at run boundaries.
 ///          Producer collapsed from ~1000 lines to ~500.
-pub const PLAN_VERSION: u32 = 10;
+///   v11:   Audio track moved out of the plan body and into a per-request
+///          parameter (cache dir keyed by audio index). The persisted
+///          plan no longer carries an `AudioPlan` — `derive_audio_plan`
+///          builds one on demand from the probe.
+pub const PLAN_VERSION: u32 = 11;
 
 /// Target segment length. ffmpeg only cuts at source keyframes under
 /// `-c:v copy`, so real segments will land near this value but vary with
@@ -55,13 +59,18 @@ const TARGET_SEGMENT_SECS: f64 = 6.0;
 const MAX_SEGMENT_WARN_SECS: f64 = 30.0;
 
 /// Top-level plan persisted as JSON in `media.stream_plan_json`.
+///
+/// Audio is intentionally absent: the per-request `audio_idx` decides
+/// which source stream to mux, and `derive_audio_plan` builds the
+/// matching `AudioPlan` on demand. That lets a single persisted plan
+/// serve every audio track on the file without growing per-track
+/// duplicates in the DB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamPlan {
     pub version: u32,
     pub mode: Mode,
     pub duration: f64,
     pub video_codec: String,
-    pub audio: AudioPlan,
     pub segments: Vec<Segment>,
 }
 
@@ -134,32 +143,36 @@ pub async fn build_remux_plan(src: &Path, info: &MediaTechInfo) -> anyhow::Resul
 
     let segments = probe_segments(src, duration).await?;
 
-    // Audio: copy AAC/MP3 (browsers play them natively in MP4), transcode
-    // anything else to stereo AAC. ac3/dts/eac3/truehd have ~zero browser
-    // support; re-encode is cheap relative to video.
-    let src_audio = info
-        .audio
-        .iter()
-        .find(|a| a.default)
-        .or_else(|| info.audio.first());
-    let src_codec = src_audio.map(|a| a.codec.clone());
-    let out_codec = match src_codec.as_deref() {
-        Some("aac") | Some("mp3") => "copy".to_string(),
-        _ => "aac".to_string(),
-    };
-
     Ok(StreamPlan {
         version: PLAN_VERSION,
         mode: Mode::Remux,
         duration,
         video_codec: v.codec.clone(),
-        audio: AudioPlan {
-            src_codec,
-            out_codec,
-            channels: 2,
-            bitrate_kbps: 192,
-        },
         segments,
+    })
+}
+
+/// Pick the Nth audio stream from the probe and decide whether ffmpeg
+/// should copy it through or transcode to AAC. Returns `None` when the
+/// source has no audio at all OR when `audio_idx` overruns the available
+/// streams — callers treat that as "no audio mapped" (ffmpeg's
+/// `-map 0:a:N?` then silently drops the audio map).
+///
+/// `aac`/`mp3` → copy (browsers decode them natively in MP4).
+/// Everything else (`ac3`/`dts`/`eac3`/`truehd`/…) → re-encode to
+/// stereo AAC at 192 kbps. Re-encode is cheap relative to video.
+pub fn derive_audio_plan(info: &MediaTechInfo, audio_idx: u32) -> Option<AudioPlan> {
+    let track = info.audio.get(audio_idx as usize)?;
+    let src_codec = Some(track.codec.clone());
+    let out_codec = match src_codec.as_deref() {
+        Some("aac") | Some("mp3") => "copy".to_string(),
+        _ => "aac".to_string(),
+    };
+    Some(AudioPlan {
+        src_codec,
+        out_codec,
+        channels: 2,
+        bitrate_kbps: 192,
     })
 }
 

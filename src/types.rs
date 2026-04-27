@@ -177,7 +177,9 @@ pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") 
 pub fn media_stream_url_with_mode(id: &str, mode: &str) -> String {
     format!("/api/media/{id}/stream?mode={mode}")
 }
-pub fn media_hls_url(id: &str) -> String { format!("/api/media/{id}/hls/index.m3u8") }
+pub fn media_hls_url_with_audio(id: &str, audio_idx: u32) -> String {
+    format!("/api/media/{id}/hls/index.m3u8?a={audio_idx}")
+}
 pub fn media_subtitle_url(id: &str, track: &str) -> String {
     format!("/api/media/{id}/subtitle/{track}")
 }

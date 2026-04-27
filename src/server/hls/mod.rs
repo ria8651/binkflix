@@ -27,13 +27,34 @@ pub use producer::{sweep_orphan_ffmpegs, ProducerRegistry};
 
 use super::error::{Error, Result};
 use super::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use crate::types::MediaTechInfo;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Query string carried on every HLS endpoint. `?a=N` selects which
+/// source audio stream to mux into the output. Defaults to 0
+/// (first stream — preserves the pre-multi-audio behavior).
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct AudioParam {
+    #[serde(default)]
+    pub a: Option<u32>,
+}
+
+impl AudioParam {
+    fn idx(&self) -> u32 {
+        self.a.unwrap_or(0)
+    }
+}
+
+/// Cap on the audio index a request can ask for. Sanity bound; real
+/// files have at most a handful of audio streams.
+const MAX_AUDIO_IDX: u32 = 64;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -51,10 +72,12 @@ pub fn router() -> Router<AppState> {
 async fn state(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(audio): Query<AudioParam>,
 ) -> Result<axum::Json<crate::types::HlsState>> {
-    let (plan, plan_dir, _src) = resolve_plan(&state, &id).await?;
+    let audio_idx = validate_audio_idx(audio.idx())?;
+    let (plan, plan_dir, _src, _info) = resolve_plan(&state, &id, audio_idx).await?;
     let cached_segments = scan_cached_segments(&plan_dir, plan.segments.len() as u32).await;
-    let producer = state.hls_producers.snapshot(&id).await;
+    let producer = state.hls_producers.snapshot(&id, audio_idx).await;
     Ok(axum::Json(crate::types::HlsState {
         duration: plan.duration,
         total_segments: plan.segments.len() as u32,
@@ -82,9 +105,25 @@ async fn scan_cached_segments(plan_dir: &std::path::Path, total: u32) -> Vec<u32
     found
 }
 
-/// Resolve the plan + on-disk plan dir for a media. Builds + persists the
-/// plan on cache miss; sweeps stale sibling dirs after a rebuild.
-async fn resolve_plan(state: &AppState, id: &str) -> Result<(Arc<plan::StreamPlan>, PathBuf, PathBuf)> {
+fn validate_audio_idx(idx: u32) -> Result<u32> {
+    if idx > MAX_AUDIO_IDX {
+        return Err(Error::BadRequest(format!(
+            "audio index {idx} out of range (max {MAX_AUDIO_IDX})"
+        )));
+    }
+    Ok(idx)
+}
+
+/// Resolve the plan + on-disk plan dir + tech info for a media. Builds +
+/// persists the plan on cache miss; sweeps stale sibling dirs after a
+/// rebuild. The plan itself is shared across audio tracks (the segment
+/// timeline doesn't depend on audio); `audio_idx` only affects the
+/// returned `plan_dir` so each track's segments cache separately.
+async fn resolve_plan(
+    state: &AppState,
+    id: &str,
+    audio_idx: u32,
+) -> Result<(Arc<plan::StreamPlan>, PathBuf, PathBuf, MediaTechInfo)> {
     if !id_is_safe(id) {
         return Err(Error::BadRequest("invalid media id".into()));
     }
@@ -95,23 +134,9 @@ async fn resolve_plan(state: &AppState, id: &str) -> Result<(Arc<plan::StreamPla
         .ok_or(Error::NotFound)?;
     let src = PathBuf::from(row.0);
 
-    if let Some(loaded) = plan::load_if_fresh(&state.pool, id, &src)
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
-    {
-        let plan_dir = cache::plan_dir(
-            id,
-            loaded.plan.version,
-            loaded.source_mtime,
-            loaded.source_size,
-        );
-        return Ok((Arc::new(loaded.plan), plan_dir, src));
-    }
-
-    // Cache miss → build a fresh plan. The probe (also cached on the media
-    // row as `tech_json`) provides codec + duration. If it's missing we
-    // probe inline and persist; viability is decided by `build_remux_plan`
-    // and surfaces as 501 if the source can't be copy-muxed.
+    // Probe is needed even on the plan cache hit so we can derive the
+    // per-request `AudioPlan` from the right source stream. Both probe
+    // and plan have their own caches on the media row, so this stays cheap.
     let info = match super::media_info::load(&state.pool, id)
         .await
         .ok()
@@ -127,6 +152,23 @@ async fn resolve_plan(state: &AppState, id: &str) -> Result<(Arc<plan::StreamPla
         }
     };
 
+    if let Some(loaded) = plan::load_if_fresh(&state.pool, id, &src)
+        .await
+        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
+    {
+        let plan_dir = cache::plan_dir(
+            id,
+            loaded.plan.version,
+            loaded.source_mtime,
+            loaded.source_size,
+            audio_idx,
+        );
+        return Ok((Arc::new(loaded.plan), plan_dir, src, info));
+    }
+
+    // Cache miss → build a fresh plan. Viability is decided by
+    // `build_remux_plan` and surfaces as 501 if the source can't be
+    // copy-muxed.
     let plan = plan::build_remux_plan(&src, &info)
         .await
         .map_err(|e| Error::NotImplemented(format!("hls plan: {e}")))?;
@@ -137,26 +179,29 @@ async fn resolve_plan(state: &AppState, id: &str) -> Result<(Arc<plan::StreamPla
         .await
         .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
 
-    let dir_name = cache::plan_dir_name(plan.version, mtime, size);
+    let dir_name = cache::plan_dir_name(plan.version, mtime, size, audio_idx);
     let plan_dir = cache::media_dir(id).join(&dir_name);
-    cache::sweep_stale_plan_dirs(id, &dir_name).await;
+    let keep_prefix = cache::plan_dir_prefix(plan.version, mtime, size);
+    cache::sweep_stale_plan_dirs(id, &keep_prefix).await;
 
-    Ok((Arc::new(plan), plan_dir, src))
+    Ok((Arc::new(plan), plan_dir, src, info))
 }
 
 async fn serve(
     State(state): State<AppState>,
     Path((id, file)): Path<(String, String)>,
+    Query(audio): Query<AudioParam>,
 ) -> Result<Response> {
     if !is_allowed_name(&file) {
         return Err(Error::BadRequest(format!("invalid hls file: {file}")));
     }
 
-    let (plan, plan_dir, src) = resolve_plan(&state, &id).await?;
+    let audio_idx = validate_audio_idx(audio.idx())?;
+    let (plan, plan_dir, src, info) = resolve_plan(&state, &id, audio_idx).await?;
     let path = plan_dir.join(&file);
 
     if file == "index.m3u8" {
-        let body = playlist::render_m3u8(&plan);
+        let body = playlist::render_m3u8(&plan, audio_idx);
         return Ok(text_response(body, "application/vnd.apple.mpegurl", false));
     }
 
@@ -165,6 +210,8 @@ async fn serve(
         source: src,
         plan: plan.clone(),
         plan_dir: plan_dir.clone(),
+        audio_idx,
+        audio: plan::derive_audio_plan(&info, audio_idx),
     };
 
     if file == "init.mp4" {

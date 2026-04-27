@@ -103,9 +103,15 @@ const PREROLL_SEGMENTS: u32 = 1;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SEGMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Registry key: `(media_id, audio_idx)`. Different audio tracks for the
+/// same media run as independent producers because each writes a
+/// different segment cache dir; killing one to start another would
+/// destroy any other client's playback on the same file.
+type ProducerKey = (String, u32);
+
 #[derive(Default)]
 pub struct ProducerRegistry {
-    by_media: DashMap<String, Arc<Mutex<Option<ProducerHandle>>>>,
+    by_media: DashMap<ProducerKey, Arc<Mutex<Option<ProducerHandle>>>>,
 }
 
 impl ProducerRegistry {
@@ -113,15 +119,15 @@ impl ProducerRegistry {
         Arc::new(Self::default())
     }
 
-    fn slot(&self, media_id: &str) -> Arc<Mutex<Option<ProducerHandle>>> {
+    fn slot(&self, media_id: &str, audio_idx: u32) -> Arc<Mutex<Option<ProducerHandle>>> {
         self.by_media
-            .entry(media_id.to_string())
+            .entry((media_id.to_string(), audio_idx))
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
     }
 
-    pub async fn snapshot(&self, media_id: &str) -> Option<crate::types::HlsProducerState> {
-        let slot = self.by_media.get(media_id).map(|e| e.clone())?;
+    pub async fn snapshot(&self, media_id: &str, audio_idx: u32) -> Option<crate::types::HlsProducerState> {
+        let slot = self.by_media.get(&(media_id.to_string(), audio_idx)).map(|e| e.clone())?;
         let guard = slot.lock().await;
         let h = guard.as_ref()?;
         let start_idx = h.start_idx;
@@ -193,6 +199,11 @@ pub struct ProducerCtx {
     pub source: PathBuf,
     pub plan: Arc<StreamPlan>,
     pub plan_dir: PathBuf,
+    pub audio_idx: u32,
+    /// `None` when the requested audio index doesn't exist on the source.
+    /// ffmpeg gets `-map 0:a:N?` either way; the optional flag just means
+    /// "no audio in the output" if the stream is missing.
+    pub audio: Option<AudioPlan>,
 }
 
 pub async fn ensure_segment(
@@ -210,13 +221,13 @@ pub async fn ensure_segment(
     // producer keeps its read-ahead window aligned with where the
     // client actually is.
     if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
-        bump_target_head(registry, &ctx.media_id, idx, total).await;
+        bump_target_head(registry, &ctx.media_id, ctx.audio_idx, idx, total).await;
         return Ok(seg_path);
     }
 
     // Slot mutex serialises start/restart so concurrent seek-back-to-back
-    // can't fire two ffmpegs on the same media.
-    let slot = registry.slot(&ctx.media_id);
+    // can't fire two ffmpegs on the same (media, audio_idx).
+    let slot = registry.slot(&ctx.media_id, ctx.audio_idx);
     {
         let mut guard = slot.lock().await;
         let needs_restart = match guard.as_ref() {
@@ -249,8 +260,8 @@ pub async fn ensure_segment(
     Ok(seg_path)
 }
 
-async fn bump_target_head(registry: &ProducerRegistry, media_id: &str, idx: u32, total: u32) {
-    if let Some(slot) = registry.by_media.get(media_id).map(|e| e.clone()) {
+async fn bump_target_head(registry: &ProducerRegistry, media_id: &str, audio_idx: u32, idx: u32, total: u32) {
+    if let Some(slot) = registry.by_media.get(&(media_id.to_string(), audio_idx)).map(|e| e.clone()) {
         let guard = slot.lock().await;
         if let Some(h) = guard.as_ref() {
             let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
@@ -391,10 +402,10 @@ fn spawn_ffmpeg(
         .arg("-copyts")
         .arg("-i").arg(&ctx.source)
         .arg("-map").arg("0:v:0")
-        .arg("-map").arg("0:a:0?")
+        .arg("-map").arg(format!("0:a:{}?", ctx.audio_idx))
         .arg("-avoid_negative_ts").arg("disabled")
         .arg("-c:v").arg("copy");
-    apply_audio_args(&mut cmd, &ctx.plan.audio);
+    apply_audio_args(&mut cmd, ctx.audio.as_ref());
     cmd.arg("-sn").arg("-dn")
         .arg("-f").arg("hls")
         .arg("-hls_time").arg("6")
@@ -419,7 +430,12 @@ fn spawn_ffmpeg(
         .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg: {e}"))
 }
 
-fn apply_audio_args(cmd: &mut Command, audio: &AudioPlan) {
+fn apply_audio_args(cmd: &mut Command, audio: Option<&AudioPlan>) {
+    // No audio plan = no source stream at this index. ffmpeg's
+    // `-map 0:a:N?` already silently drops the output, so we just don't
+    // pass any `-c:a`/`-b:a` flags and let ffmpeg produce a video-only
+    // output. (This also covers files with no audio at all.)
+    let Some(audio) = audio else { return };
     if audio.out_codec == "copy" {
         cmd.arg("-c:a").arg("copy");
     } else {

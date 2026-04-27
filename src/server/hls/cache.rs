@@ -37,27 +37,47 @@ pub fn media_dir(id: &str) -> PathBuf {
 }
 
 /// Subdirectory within `media_dir` whose name encodes the plan's invalidation
-/// keys. Changes if the source file changes (mtime/size) or the plan algorithm
-/// is bumped (`PLAN_VERSION`).
-pub fn plan_dir_name(plan_version: u32, source_mtime: i64, source_size: i64) -> String {
-    format!("v{plan_version}-m{source_mtime}-s{source_size}")
+/// keys. Changes if the source file changes (mtime/size), the plan algorithm
+/// is bumped (`PLAN_VERSION`), or the user picks a different audio track.
+/// Audio index is part of the key because each track's segments contain a
+/// different muxed audio stream — the video timeline is identical, but the
+/// fragment bytes differ, so they need separate cache entries.
+pub fn plan_dir_name(
+    plan_version: u32,
+    source_mtime: i64,
+    source_size: i64,
+    audio_idx: u32,
+) -> String {
+    format!("v{plan_version}-m{source_mtime}-s{source_size}-a{audio_idx}")
 }
 
-pub fn plan_dir(id: &str, plan_version: u32, source_mtime: i64, source_size: i64) -> PathBuf {
-    media_dir(id).join(plan_dir_name(plan_version, source_mtime, source_size))
+pub fn plan_dir(
+    id: &str,
+    plan_version: u32,
+    source_mtime: i64,
+    source_size: i64,
+    audio_idx: u32,
+) -> PathBuf {
+    media_dir(id).join(plan_dir_name(plan_version, source_mtime, source_size, audio_idx))
 }
 
-/// Remove every subdirectory of `media_dir(id)` except the one named `keep`.
-/// Best-effort — IO errors are logged and swallowed because a stale dir is
-/// harmless beyond wasted disk.
-pub async fn sweep_stale_plan_dirs(id: &str, keep: &str) {
+/// Remove every subdirectory of `media_dir(id)` whose name doesn't share
+/// the given `keep_prefix`. Per-audio-index variants of the *current*
+/// (version,mtime,size) are kept so switching tracks doesn't repeatedly
+/// blow away each other's caches; only genuinely stale dirs (old plan
+/// version, outdated source mtime/size) are removed. Best-effort — IO
+/// errors are logged and swallowed because a stale dir is harmless
+/// beyond wasted disk.
+pub async fn sweep_stale_plan_dirs(id: &str, keep_prefix: &str) {
     let dir = media_dir(id);
     let mut rd = match tokio::fs::read_dir(&dir).await {
         Ok(rd) => rd,
         Err(_) => return,
     };
     while let Ok(Some(entry)) = rd.next_entry().await {
-        if entry.file_name().to_str() == Some(keep) {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else { continue };
+        if name_str.starts_with(keep_prefix) {
             continue;
         }
         let p = entry.path();
@@ -65,6 +85,12 @@ pub async fn sweep_stale_plan_dirs(id: &str, keep: &str) {
             tracing::warn!(path = %p.display(), error = %e, "failed to remove stale hls dir");
         }
     }
+}
+
+/// Prefix used by `sweep_stale_plan_dirs` to keep all per-audio-index
+/// variants of the current (version, mtime, size) tuple.
+pub fn plan_dir_prefix(plan_version: u32, source_mtime: i64, source_size: i64) -> String {
+    format!("v{plan_version}-m{source_mtime}-s{source_size}-")
 }
 
 /// Filenames the HTTP layer is allowed to serve out of a plan directory.

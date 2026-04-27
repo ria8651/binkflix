@@ -62,9 +62,16 @@ fn Shell() -> Element {
     // Close any open popover when the user clicks outside one. The old
     // `.menu-backdrop` div only worked in the Shell's stacking context;
     // on the video-player route the fullpage layer sits above it, so
-    // clicks there never reached the backdrop. A document-level
-    // pointerdown listener doesn't care about z-index at all — if the
-    // click target isn't inside a registered dropdown wrapper, we close.
+    // clicks there never reached the backdrop. A document-level click
+    // listener doesn't care about z-index at all — if the click target
+    // isn't inside a registered dropdown wrapper, we close.
+    //
+    // We listen on `click` in bubble phase rather than `pointerdown` in
+    // capture phase so that link/button click handlers fire *first*. With
+    // `pointerdown`, the close-and-clear-query side effect would re-render
+    // the Home grid and unmount any filtered show card before the click
+    // event ever reached its target — clicking a search result would
+    // close the search but never navigate.
     //
     // The listener is installed by JS (easier to reach document events
     // from there) and dispatches a custom window event back to Rust;
@@ -80,11 +87,11 @@ fn Shell() -> Element {
             let mut eval = document::eval(
                 r#"
                 if (!window.__binkflixOutsideClickInstalled) {
-                    document.addEventListener('pointerdown', (e) => {
+                    document.addEventListener('click', (e) => {
                         if (!e.target.closest('[data-popover]')) {
                             window.dispatchEvent(new CustomEvent('binkflix-close-popover'));
                         }
-                    }, true);
+                    });
                     window.__binkflixOutsideClickInstalled = true;
                 }
                 // Resolve this eval on the next outside-click so the Rust

@@ -27,6 +27,7 @@ const ICON_CAPTIONS: &str = r#"<svg viewBox="0 0 24 24" width="22" height="22" f
 const ICON_FULLSCREEN: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9V4h5M21 9V4h-5M3 15v5h5M21 15v5h-5"/></svg>"#;
 const ICON_INFO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5M12 8h.01"/></svg>"#;
 const ICON_CHECK: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
+const ICON_AUDIO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 11v2"/></svg>"#;
 
 #[component]
 pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
@@ -69,6 +70,12 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             language: track.language.clone(),
         })
     });
+
+    // Audio-track picker. `None` = haven't touched (default = first
+    // stream). `Some(N)` = explicit N. The dropdown only renders when
+    // the source has ≥2 audio tracks.
+    let mut audio_pick = use_signal(|| None::<u32>);
+    let effective_audio = use_memo(move || -> u32 { audio_pick.read().unwrap_or(0) });
 
     let mut loading = use_signal(|| false);
     let mut sub_error = use_signal(|| None::<String>);
@@ -129,6 +136,19 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // be interacted with until the overlay is dismissed).
     let id_for_src = id.clone();
     let stream_src = use_memo(move || -> String {
+        let aidx = *effective_audio.read();
+        // Direct serve only carries the file's first audio track (the
+        // one the browser exposes by default). Picking a non-default
+        // track from the UI transparently switches the source onto the
+        // HLS pipeline so the server can `-map 0:a:N?` the right one.
+        // Picking back to track 0 returns to direct.
+        let direct_or_hls = |id: &str| -> String {
+            if aidx == 0 {
+                media_stream_url(id)
+            } else {
+                media_hls_url_with_audio(id, aidx)
+            }
+        };
         if let Some(mode) = *forced_mode.read() {
             // "Try remux" now goes through the HLS pipeline so the user
             // gets real random-access seeking instead of the fMP4-over-
@@ -136,7 +156,8 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             // so source containers that are already browser-friendly
             // skip the ffmpeg round-trip entirely.
             return match mode {
-                "remux" => media_hls_url(&id_for_src),
+                "remux" => media_hls_url_with_audio(&id_for_src, aidx),
+                "direct" => direct_or_hls(&id_for_src),
                 _ => media_stream_url_with_mode(&id_for_src, mode),
             };
         }
@@ -153,12 +174,11 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             Some(Ok(info)) => match info.browser_compat {
                 // Remux goes through the new HLS pipeline (real random
                 // access + keyframe-aligned fMP4 segments). Direct stays
-                // on the byte-range `/stream` path for now — HLS with
-                // `-c:v copy` can't repackage VP9/AV1 into fMP4, and most
-                // Direct-compat files are plain MP4 that ServeFile handles
-                // natively.
-                BrowserCompat::Direct => media_stream_url(&id_for_src),
-                BrowserCompat::Remux => media_hls_url(&id_for_src),
+                // on the byte-range `/stream` path for the default
+                // audio track and switches to HLS when the user picks
+                // an alternate (since direct can't re-mux audio).
+                BrowserCompat::Direct => direct_or_hls(&id_for_src),
+                BrowserCompat::Remux => media_hls_url_with_audio(&id_for_src, aidx),
                 // Don't set a src — the overlay below prompts the user
                 // to pick a best-effort mode.
                 BrowserCompat::Transcode => String::new(),
@@ -259,6 +279,14 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     use_effect(move || {
         let src = stream_src.read().clone();
         if src.is_empty() { return; }
+        // Capture the live currentTime *before* swapping the source so
+        // a mid-playback src change (audio-track switch, transcode-prompt
+        // mode flip) resumes where the user was. Returns 0 on the very
+        // first attach since the element hasn't loaded anything yet —
+        // we fall through to the saved-progress lookup in that case.
+        let capture_js = format!(
+            "dioxus.send(window.binkflixPlayer?.getPlaybackState('{video_dom_id}')?.currentTime ?? 0);"
+        );
         // Attach the source first (native or hls.js, decided by the JS
         // side based on canPlayType), then wire up the custom controls.
         // `attach` is idempotent and re-attaches cleanly when `src`
@@ -268,15 +296,36 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         );
         let id_for_resume = id_for_resume.clone();
         spawn(async move {
+            #[cfg_attr(not(feature = "web"), allow(unused_variables))]
+            let live_pos: f64 = {
+                #[cfg(feature = "web")]
+                {
+                    let mut eval = document::eval(&capture_js);
+                    eval.recv::<f64>().await.unwrap_or(0.0)
+                }
+                #[cfg(not(feature = "web"))]
+                { let _ = capture_js; 0.0 }
+            };
             let _ = document::eval(&js).await;
             #[cfg(feature = "web")]
-            if let Ok(Some(p)) = get_progress(&id_for_resume).await {
-                if !p.completed && p.position_secs > 5.0 {
+            {
+                // Mid-playback switch wins over the saved-progress
+                // resume because it's strictly fresher. Threshold
+                // matches the saved-progress one (>5s) so a very early
+                // switch still falls through to the resume flow.
+                if live_pos > 5.0 {
                     let js = format!(
-                        "window.binkflixPlayer?.seekTo('{video_dom_id}', {});",
-                        p.position_secs
+                        "window.binkflixPlayer?.seekTo('{video_dom_id}', {live_pos});"
                     );
                     let _ = document::eval(&js).await;
+                } else if let Ok(Some(p)) = get_progress(&id_for_resume).await {
+                    if !p.completed && p.position_secs > 5.0 {
+                        let js = format!(
+                            "window.binkflixPlayer?.seekTo('{video_dom_id}', {});",
+                            p.position_secs
+                        );
+                        let _ = document::eval(&js).await;
+                    }
                 }
             }
             #[cfg(not(feature = "web"))]
@@ -677,6 +726,60 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                             }
                         }
                         _ => rsx! {}
+                    }
+
+                    // Audio-track menu. Only renders when the source
+                    // probe resolves *and* there are at least two audio
+                    // streams; single-track files don't need a picker.
+                    {
+                        let tech_snapshot = tech.read_unchecked().clone();
+                        match tech_snapshot {
+                            Some(Ok(info)) if info.audio.len() >= 2 => {
+                                let tracks = info.audio.clone();
+                                let is_open = *open_menu.read() == Some("audio");
+                                let cur_audio = *effective_audio.read();
+                                rsx! {
+                                    div { class: "player-menu-wrap", "data-popover": "audio",
+                                        button {
+                                            class: "player-btn audio-btn",
+                                            r#type: "button",
+                                            onclick: move |_| {
+                                                open_menu.set(if is_open { None } else { Some("audio") });
+                                            },
+                                            title: "Audio track",
+                                            dangerous_inner_html: ICON_AUDIO,
+                                        }
+                                        if is_open {
+                                            div { class: "player-menu",
+                                                for (i, t) in tracks.iter().enumerate() {
+                                                    {
+                                                        let idx = i as u32;
+                                                        let label = audio_option_label(t, idx);
+                                                        let is_active = cur_audio == idx;
+                                                        rsx! {
+                                                            button {
+                                                                key: "{idx}",
+                                                                class: if is_active { "active" } else { "" },
+                                                                r#type: "button",
+                                                                onclick: move |_| {
+                                                                    audio_pick.set(Some(idx));
+                                                                    open_menu.set(None);
+                                                                },
+                                                                span { "{label}" }
+                                                                if is_active {
+                                                                    span { class: "check", dangerous_inner_html: ICON_CHECK }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => rsx! {}
+                        }
                     }
 
                     // Debug / tech-info toggle. The panel itself is
@@ -1288,4 +1391,28 @@ fn subtitle_option_label(t: &SubtitleTrack) -> String {
     if t.forced { s.push_str(" · forced"); }
     if t.default { s.push_str(" · default"); }
     s
+}
+
+/// "English · 5.1 · ac3" / "Japanese · stereo · aac". Falls back to
+/// "Track N" when the source has no language or title metadata.
+fn audio_option_label(t: &AudioTrackInfo, idx: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(lang) = t.language.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(lang.to_string());
+    } else if let Some(title) = t.title.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(title.to_string());
+    }
+    if let Some(layout) = t.channel_layout.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(layout.to_string());
+    } else if let Some(c) = t.channels {
+        parts.push(format!("{c}ch"));
+    }
+    if !t.codec.is_empty() {
+        parts.push(t.codec.clone());
+    }
+    if parts.is_empty() {
+        format!("Track {}", idx + 1)
+    } else {
+        parts.join(" · ")
+    }
 }
