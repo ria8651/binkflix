@@ -59,6 +59,13 @@ pub async fn get_media_tech(id: &str) -> Result<MediaTechInfo, String> {
     fetch_json(&format!("/api/media/{id}/tech")).await
 }
 
+// Only consumed from the `#[cfg(feature = "web")]` polling loop in
+// the debug panel; non-web builds compile but never call it.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub async fn get_hls_state(id: &str) -> Result<HlsState, String> {
+    fetch_json(&format!("/api/media/{id}/hls/state")).await
+}
+
 #[cfg(feature = "web")]
 async fn post_empty<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
     let resp = gloo_net::http::Request::post(url)

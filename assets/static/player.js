@@ -54,11 +54,18 @@ function clearNativeTracks(video) {
 }
 
 function detach(videoId) {
-    // Synchronous visible cleanup first — rip the overlay canvases off the
-    // DOM and nuke any native tracks so the user sees subs disappear
-    // instantly. The async work (renderer.destroy() behind the per-video
-    // lock) still runs, but can't keep the old subs visible while pending
-    // attaches finish ahead of us in the queue.
+    // Synchronous teardown of the *current* renderer + DOM. Done outside
+    // the per-video lock so "user clicks Off" takes effect immediately:
+    // the JASSUB worker is terminated before our next paint, the canvas
+    // is removed, and native tracks are cleared. (Going through `run`
+    // alone meant the worker kept painting until the queue drained
+    // behind any in-flight setAss, leaving the last cue frozen
+    // on screen.)
+    const entry = state.get(videoId);
+    if (entry?.renderer) {
+        try { entry.renderer.destroy(); } catch (_) { /* may throw if already torn */ }
+    }
+    state.delete(videoId);
     const video = getVideo(videoId);
     if (video) {
         const parent = video.parentElement;
@@ -69,6 +76,9 @@ function detach(videoId) {
         }
         clearNativeTracks(video);
     }
+    // Queued tail handles the rare race where a setAss is mid-flight
+    // and installs a new renderer after our sync sweep — detachInner
+    // catches that case when it eventually runs.
     return run(videoId, () => detachInner(videoId));
 }
 
@@ -387,6 +397,7 @@ function initControls(videoId) {
     // currentTime advances) as an always-on clear so we recover even if
     // the browser never emits the matching ready event.
     const HAVE_FUTURE_DATA = 3;
+    const HAVE_CURRENT_DATA = 2;
     const onLoadStart = () => { setError(null); setLoading(true); };
     const onWaiting = () => { if (video.readyState < HAVE_FUTURE_DATA) setLoading(true); };
     const onCanPlay = () => setLoading(false);
@@ -394,6 +405,13 @@ function initControls(videoId) {
     const onLoadedData = () => setLoading(false);
     const onStalled = () => { if (video.readyState < HAVE_FUTURE_DATA) setLoading(true); };
     const onError = () => setError(describeError());
+    // After a seek-while-paused, the typical event order is
+    // `seeking → waiting → seeked → canplay`, but Chrome sometimes
+    // skips `canplay` if data was already buffered. Without a `seeked`
+    // clear the spinner gets stuck even though playback is ready.
+    const onSeeked = () => {
+        if (video.readyState >= HAVE_CURRENT_DATA) setLoading(false);
+    };
     const onTimeClearLoading = () => {
         if (!video.paused && video.readyState >= HAVE_FUTURE_DATA) setLoading(false);
     };
@@ -412,6 +430,7 @@ function initControls(videoId) {
     video.addEventListener("playing", onPlaying);
     video.addEventListener("loadeddata", onLoadedData);
     video.addEventListener("stalled", onStalled);
+    video.addEventListener("seeked", onSeeked);
     video.addEventListener("error", onError);
     // If we're initialising after the video already started loading, the
     // readyState lets us pick the right starting state without waiting for
@@ -579,6 +598,7 @@ function initControls(videoId) {
         video.removeEventListener("playing", onPlaying);
         video.removeEventListener("loadeddata", onLoadedData);
         video.removeEventListener("stalled", onStalled);
+        video.removeEventListener("seeked", onSeeked);
         video.removeEventListener("error", onError);
         playBtn?.removeEventListener("click", onPlayBtn);
         playBtn?.removeEventListener("click", stopBubble);
@@ -644,12 +664,19 @@ function getDebugStats(videoId) {
     const video = getVideo(videoId);
     if (!video) return null;
     let buffered = 0;
+    // Also collect every buffered range so the debug panel can draw a
+    // YouTube-style "what's actually loaded in this client" bar that
+    // covers gaps from seeks. Duration of all ranges is tiny — handful
+    // of entries even after aggressive seeking.
+    let bufferedRanges = [];
     try {
         const b = video.buffered;
         for (let i = 0; i < b.length; i++) {
-            if (b.start(i) <= video.currentTime && video.currentTime <= b.end(i)) {
-                buffered = b.end(i) - video.currentTime;
-                break;
+            const start = b.start(i);
+            const end = b.end(i);
+            bufferedRanges.push([start, end]);
+            if (start <= video.currentTime && video.currentTime <= end) {
+                buffered = end - video.currentTime;
             }
         }
     } catch (_) { /* ignore */ }
@@ -670,6 +697,7 @@ function getDebugStats(videoId) {
         readyState: readyStates[video.readyState] || String(video.readyState),
         networkState: video.networkState,
         buffered_ahead_seconds: Number(buffered.toFixed(1)),
+        buffered_ranges: bufferedRanges,
         current_time: Number(video.currentTime.toFixed(1)),
         duration: isFinite(video.duration) ? Number(video.duration.toFixed(1)) : null,
         playback_rate: video.playbackRate,
@@ -703,6 +731,47 @@ function loadHlsJs() {
 // videoId -> { hls: Hls | null, url: string }
 const attached = new Map();
 
+// Show the wrap's `.player-error` overlay with `message`. Used for failure
+// modes the native `<video>` `error` event doesn't catch — notably hls.js
+// playlist/segment fetches (which return through hls.js's internal error
+// channel, not the media element's). The error overlay markup is rendered
+// once by the Dioxus component; we just toggle the class and fill text.
+function surfaceError(video, message) {
+    const wrap = video?.closest?.(".video-wrap");
+    if (!wrap) return;
+    const msgEl = wrap.querySelector(".player-error-msg");
+    if (msgEl) msgEl.textContent = message;
+    wrap.classList.add("errored");
+    wrap.classList.remove("loading");
+}
+
+// Dismiss the error overlay. Called by the × button in the Dioxus
+// component. Not every error we surface is unrecoverable — for HTTP
+// 5xx hits, partial buffer corruption, or "browser couldn't decode this
+// segment", dismissing and letting the user seek elsewhere often
+// recovers without a full reload.
+function dismissError(videoId) {
+    const video = getVideo(videoId);
+    const wrap = video?.closest?.(".video-wrap");
+    if (!wrap) return;
+    wrap.classList.remove("errored");
+    const msgEl = wrap.querySelector(".player-error-msg");
+    if (msgEl) msgEl.textContent = "";
+}
+
+// Try to extract a useful error message from a non-2xx Response. Servers
+// return a short plain-text body for 4xx/5xx; if the body is empty (or
+// reading fails) fall back to a generic per-status message.
+async function describeHttpError(resp) {
+    let body = "";
+    try { body = (await resp.text()).trim(); } catch (_) { /* ignore */ }
+    if (body) return `${resp.status}: ${body}`;
+    if (resp.status === 501) return "Server can't stream this file (transcoding not implemented).";
+    if (resp.status === 404) return "File not found on the server.";
+    if (resp.status >= 500) return `Server error (${resp.status}).`;
+    return `Request failed (${resp.status}).`;
+}
+
 function attach(videoId, url) {
     // Serialize attach/detach through the same per-video queue the
     // subtitle code uses so a second `attach` arriving mid-`loadHlsJs`
@@ -719,9 +788,28 @@ async function attachInner(videoId, url) {
     if (existing && existing.url === url) return; // already attached to this url
     detachSource(videoId);
 
+    const isHls = /\.m3u8($|[?#])/.test(url);
+
+    // Pre-flight the URL so server-side errors (e.g. /hls 501 when the
+    // source isn't viable for copy-remux) reach the overlay. hls.js
+    // funnels playlist HTTP errors through its own ERROR event, not the
+    // <video> element's, so without this the user sees nothing on a 501.
+    // For non-HLS URLs the `<video>` element does surface load errors,
+    // but we still pre-flight to give a richer message than "code 4".
+    try {
+        const probe = await fetch(url, { method: "GET" });
+        if (!probe.ok) {
+            surfaceError(video, await describeHttpError(probe));
+            return;
+        }
+    } catch (e) {
+        surfaceError(video, `Network error: ${e?.message || e}`);
+        return;
+    }
+
     // Native HLS (Safari / iOS). Just set the src and let the browser
     // handle playlist parsing + segment fetching.
-    if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    if (isHls && video.canPlayType("application/vnd.apple.mpegurl")) {
         video.src = url;
         attached.set(videoId, { hls: null, url });
         return;
@@ -729,8 +817,7 @@ async function attachInner(videoId, url) {
 
     // Non-HLS URL (e.g. `?mode=direct` fallback from the transcode prompt,
     // which still hits the old `/stream` endpoint): set src directly.
-    // `#`-frag URLs count as HLS too — don't regress into `video.src`.
-    if (!/\.m3u8($|[?#])/.test(url)) {
+    if (!isHls) {
         video.src = url;
         attached.set(videoId, { hls: null, url });
         return;
@@ -738,17 +825,36 @@ async function attachInner(videoId, url) {
 
     const Hls = await loadHlsJs();
     if (!Hls?.isSupported?.()) {
-        // No HLS support at all — surface a recognisable error so the
-        // wrap's error overlay appears instead of silent failure.
-        video.dispatchEvent(new Event("error"));
+        surfaceError(video, "This browser doesn't support HLS playback.");
         return;
     }
     const hls = new Hls({
-        // Playlist is event-type until ffmpeg finishes, so hls.js will
-        // keep refreshing it. Keep the refresh interval snappy so seeks
-        // into newly-generated territory become available quickly.
+        // Real VOD playlist now (full ENDLIST from byte zero), so hls.js
+        // doesn't need to refresh — but keep backBufferLength reasonable
+        // so a long watch doesn't accumulate unbounded memory.
         lowLatencyMode: false,
         backBufferLength: 90,
+    });
+    // hls.js errors: non-fatal go to console (library handles them),
+    // fatal surface to the overlay. We previously auto-retried MEDIA
+    // errors via `recoverMediaError()`, but it didn't actually fix
+    // bufferAppendError in practice — it just delayed the surfaced
+    // error by a few segments. Better to fail loudly so the
+    // underlying bug (typically: a malformed segment from the
+    // server) gets fixed instead of papered over.
+    hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (!data?.fatal) return;
+        const detail = data.details || data.type || "playback error";
+        let msg;
+        const status = data.response?.code;
+        if (status) {
+            msg = `HLS ${detail} (HTTP ${status})`;
+        } else if (data.error?.message) {
+            msg = `HLS ${detail}: ${data.error.message}`;
+        } else {
+            msg = `HLS ${detail}`;
+        }
+        surfaceError(video, msg);
     });
     hls.loadSource(url);
     hls.attachMedia(video);
@@ -785,6 +891,7 @@ const realApi = {
     getDebugStats,
     attach,
     detach: fullDetach,
+    dismissError,
 };
 
 const pending = (window.binkflixPlayer && window.binkflixPlayer.__queue) || [];

@@ -764,8 +764,13 @@ h2.section {
     color: rgb(255 255 255 / 0.78);
     max-width: 32rem;
 }
-.player-error-back {
+.player-error-actions {
+    display: flex;
+    gap: var(--space-3);
+    justify-content: center;
     margin-top: var(--space-4);
+}
+.player-error-btn {
     padding: var(--space-2) var(--space-4);
     background: rgb(255 255 255 / 0.14);
     color: #fff;
@@ -773,8 +778,11 @@ h2.section {
     border-radius: var(--radius-dialog);
     font-size: var(--text-sm);
     cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
 }
-.player-error-back:hover { background: rgb(255 255 255 / 0.22); }
+.player-error-btn:hover { background: rgb(255 255 255 / 0.22); }
 
 /* Transcode-needed prompt. Sits on top of the (unloaded) video element
  * and blocks interaction until the user picks a fallback mode. */
@@ -913,6 +921,83 @@ h2.section {
     text-align: right;
     word-break: break-word;
 }
+
+/* ── HLS pipeline timeline ─────────────────────────────────────
+ *
+ * YouTube-style stacked bar showing where the server's ffmpeg has
+ * reached, what's cached on disk, and what the client has buffered.
+ * Layers are absolute-positioned so they overlap cleanly. Pixel-thin
+ * vertical lines mark the producer head and current playback position.
+ */
+.hls-timeline {
+    position: relative;
+    height: 18px;
+    margin: var(--space-3) var(--space-6) var(--space-2);
+    background: rgb(255 255 255 / 0.08);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.hls-tl-window {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgb(234 179 8 / 0.18); /* amber, low alpha */
+}
+.hls-tl-cached {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgb(34 197 94 / 0.55); /* green */
+}
+.hls-tl-buffered {
+    position: absolute;
+    top: 50%;
+    bottom: 0;
+    background: rgb(59 130 246 / 0.65); /* blue, lower half so cached stays visible */
+}
+.hls-tl-head {
+    position: absolute;
+    top: -2px;
+    bottom: -2px;
+    width: 2px;
+    margin-left: -1px;
+    background: rgb(234 179 8); /* amber */
+    box-shadow: 0 0 4px rgb(234 179 8 / 0.7);
+}
+.hls-tl-head.paused {
+    background: rgb(239 68 68); /* red — paused looks "stopped" not "running" */
+    box-shadow: 0 0 4px rgb(239 68 68 / 0.7);
+}
+.hls-tl-cursor {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 2px;
+    margin-left: -1px;
+    background: rgb(255 255 255);
+    box-shadow: 0 0 4px rgb(0 0 0 / 0.6);
+}
+.hls-tl-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-5);
+    padding: 0 var(--space-6) var(--space-3);
+    font-size: 11px;
+    color: rgb(255 255 255 / 0.55);
+}
+.hls-tl-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 4px;
+    vertical-align: -1px;
+}
+.hls-tl-swatch.cached   { background: rgb(34 197 94 / 0.55); }
+.hls-tl-swatch.buffered { background: rgb(59 130 246 / 0.65); }
+.hls-tl-swatch.window   { background: rgb(234 179 8 / 0.18); }
+.hls-tl-swatch.head     { background: rgb(234 179 8); }
+.hls-tl-swatch.cursor   { background: rgb(255 255 255); }
 
 /* ── Seasons / episodes ────────────────────────────────────── */
 

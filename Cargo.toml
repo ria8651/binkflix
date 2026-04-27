@@ -39,6 +39,10 @@ uuid = { version = "1", features = ["v4", "serde"], optional = true }
 dashmap = { version = "6", optional = true }
 dotenvy = { version = "0.15", optional = true }
 bytes = { version = "1", optional = true }
+# Used in `pre_exec` for ffmpeg children: setpgid + (Linux) PR_SET_PDEATHSIG
+# so children die when the binkflix process does. Pulled in transitively
+# anyway via tokio; declaring it directly keeps the unsafe block honest.
+libc = { version = "0.2", optional = true }
 
 # bastion auth
 jsonwebtoken = { version = "9", optional = true }
@@ -60,7 +64,7 @@ server = [
     "dep:sqlx", "dep:quick-xml", "dep:walkdir",
     "dep:tracing", "dep:tracing-subscriber",
     "dep:chrono", "dep:uuid", "dep:dashmap", "dep:dotenvy",
-    "dep:bytes",
+    "dep:bytes", "dep:libc",
     "dep:jsonwebtoken", "dep:reqwest", "dep:axum-extra",
 ]
 

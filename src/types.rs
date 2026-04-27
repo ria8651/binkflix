@@ -137,6 +137,33 @@ pub struct SubtitleTrack {
     pub forced: bool,
 }
 
+/// Debug-panel snapshot of the HLS pipeline for one media. Exposed by
+/// `/api/media/{id}/hls/state` and rendered as a YouTube-style timeline
+/// bar so an operator can see at a glance where ffmpeg is running, what
+/// segments are cached on disk, and what the client has buffered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HlsState {
+    pub duration: f64,
+    pub total_segments: u32,
+    /// Each segment's duration in source-time order. Index in this array
+    /// + 1 is the segment number used in URLs.
+    pub segment_durations: Vec<f64>,
+    /// Sorted segment indices currently on disk under the plan dir.
+    pub cached_segments: Vec<u32>,
+    pub producer: Option<HlsProducerState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HlsProducerState {
+    pub start_idx: u32,
+    pub head: u32,
+    pub high_water: u32,
+    pub paused: bool,
+    pub idle_for_secs: f64,
+    pub buffer_ahead: u32,
+    pub lookahead_window: u32,
+}
+
 // URL builders — relative paths work through dx proxy and same-origin alike.
 pub fn media_image_url(id: &str) -> String { format!("/api/media/{id}/image") }
 pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") }

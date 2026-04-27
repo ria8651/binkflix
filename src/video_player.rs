@@ -73,10 +73,17 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     let mut loading = use_signal(|| false);
     let mut sub_error = use_signal(|| None::<String>);
     let mut last_applied = use_signal(|| None::<Option<SubCommand>>);
-    let mut menu_open = use_signal(|| false);
+    // Use the Shell's shared OpenMenu context (rather than a local
+    // signal) so the global pointerdown handler — which closes any
+    // popover on outside-click — also closes the subtitle picker.
+    // The wrapping div carries `data-popover="subtitles"` to mark
+    // its descendants as "inside".
+    let mut open_menu = use_context::<crate::app::OpenMenu>().0;
     let mut debug_open = use_signal(|| false);
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut debug_stats = use_signal(|| None::<serde_json::Value>);
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut hls_state = use_signal(|| None::<HlsState>);
 
     // Tech probe drives two things: (1) the info panel, and (2) the
     // transcode-prompt flow below. For Direct/Remux verdicts the server
@@ -202,6 +209,39 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                 ));
                 if let Ok(v) = eval.recv::<serde_json::Value>().await {
                     debug_stats.set(Some(v));
+                }
+                gloo_timers::future::TimeoutFuture::new(1000).await;
+            }
+        });
+    });
+
+    // Same idea but for the HLS pipeline state (producer head, cached
+    // segments). Only relevant when the file is actually being remuxed,
+    // and only worth fetching while the panel is open. Endpoint is
+    // 1-2 KB for typical movies — fine to poll once a second.
+    let id_for_hls_state = id.clone();
+    use_effect(move || {
+        if !*debug_open.read() {
+            return;
+        }
+        if !matches!(
+            &*tech.read_unchecked(),
+            Some(Ok(info)) if info.browser_compat == BrowserCompat::Remux
+        ) && !matches!(*forced_mode.read(), Some("remux"))
+        {
+            return;
+        }
+        // Captured for the web-only polling loop below; non-web build
+        // never enters the loop so the binding stays unused there.
+        #[cfg_attr(not(feature = "web"), allow(unused_variables))]
+        let id = id_for_hls_state.clone();
+        spawn(async move {
+            #[cfg(feature = "web")]
+            loop {
+                if !*debug_open.peek() { break; }
+                match get_hls_state(&id).await {
+                    Ok(s) => hls_state.set(Some(s)),
+                    Err(_) => { /* leave previous; next tick retries */ }
                 }
                 gloo_timers::future::TimeoutFuture::new(1000).await;
             }
@@ -435,12 +475,30 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             }
             // Codec / playback error overlay — shown while `.errored` is
             // on the wrap. player.js fills the inner `.player-error-msg`.
+            // Two buttons in the body: Back for genuinely unrecoverable
+            // cases, Dismiss for blips the user wants to ignore (HTTP
+            // 5xx, transient buffer error). Both styled identically and
+            // sit side-by-side so neither is a cryptic corner glyph.
             div { class: "player-error", role: "alert",
                 div { class: "player-error-icon", "⚠" }
                 div { class: "player-error-body",
                     div { class: "player-error-title", "Can't play this video" }
                     div { class: "player-error-msg" }
-                    Link { to: back_route.clone(), class: "player-error-back", "← Back" }
+                    div { class: "player-error-actions",
+                        Link { to: back_route.clone(), class: "player-error-btn", "← Back" }
+                        button {
+                            class: "player-error-btn",
+                            r#type: "button",
+                            aria_label: "Dismiss",
+                            onclick: move |_| {
+                                let js = format!(
+                                    "window.binkflixPlayer?.dismissError('{video_dom_id}');"
+                                );
+                                spawn(async move { let _ = document::eval(&js).await; });
+                            },
+                            "Dismiss"
+                        }
+                    }
                 }
             }
             div { class: "player-chrome",
@@ -469,14 +527,16 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     match &*tracks.read_unchecked() {
                         Some(Ok(list)) if !list.is_empty() => {
                             let list = list.clone();
-                            let is_open = *menu_open.read();
+                            let is_open = *open_menu.read() == Some("subtitles");
                             rsx! {
-                                div { class: "player-menu-wrap",
+                                div { class: "player-menu-wrap", "data-popover": "subtitles",
                                     button {
                                         class: "player-btn subs-btn",
                                         r#type: "button",
                                         disabled: is_loading,
-                                        onclick: move |_| { let cur = *menu_open.peek(); menu_open.set(!cur); },
+                                        onclick: move |_| {
+                                            open_menu.set(if is_open { None } else { Some("subtitles") });
+                                        },
                                         title: "Subtitles",
                                         if is_loading {
                                             span { class: "spinner" }
@@ -491,7 +551,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                                                 r#type: "button",
                                                 onclick: move |_| {
                                                     user_pick.set(Some(None));
-                                                    menu_open.set(false);
+                                                    open_menu.set(None);
                                                 },
                                                 span { "Off" }
                                                 if current.is_empty() {
@@ -510,7 +570,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                                                             r#type: "button",
                                                             onclick: move |_| {
                                                                 user_pick.set(Some(Some(tid.clone())));
-                                                                menu_open.set(false);
+                                                                open_menu.set(None);
                                                             },
                                                             span { "{label}" }
                                                             if is_active {
@@ -568,6 +628,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                 {
                     let tech_snapshot = tech.read_unchecked().clone();
                     let stats_snapshot = debug_stats.read().clone();
+                    let hls_snapshot = hls_state.read().clone();
                     rsx! {
                         div { class: "debug-panel", role: "dialog", aria_label: "Playback info",
                             div { class: "debug-panel-head",
@@ -585,6 +646,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                                 DebugMenuBody {
                                     tech: tech_snapshot,
                                     stats: stats_snapshot,
+                                    hls: hls_snapshot,
                                     effective_mode: *effective_mode.read(),
                                 }
                             }
@@ -611,6 +673,7 @@ struct SubCommand {
 fn DebugMenuBody(
     tech: Option<Result<MediaTechInfo, String>>,
     stats: Option<serde_json::Value>,
+    hls: Option<HlsState>,
     effective_mode: BrowserCompat,
 ) -> Element {
     // Prefer what the server actually told us over our inference: if we
@@ -621,7 +684,42 @@ fn DebugMenuBody(
     let observed: Option<ObservedStream> = stats.as_ref().and_then(ObservedStream::from_stats);
     let observed_mode = observed.as_ref().map(|o| o.mode);
     let observed_container = observed.as_ref().and_then(|o| o.container());
+    let buffered_ranges: Vec<(f64, f64)> = stats
+        .as_ref()
+        .and_then(|s| s.get("buffered_ranges"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let pair = r.as_array()?;
+                    let s = pair.first()?.as_f64()?;
+                    let e = pair.get(1)?.as_f64()?;
+                    Some((s, e))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let current_time = stats
+        .as_ref()
+        .and_then(|s| s.get("current_time"))
+        .and_then(|v| v.as_f64());
     rsx! {
+        if matches!(effective_mode, BrowserCompat::Remux) {
+            div { class: "debug-section",
+                div { class: "debug-section-title", "HLS pipeline" }
+                match &hls {
+                    Some(state) => rsx! {
+                        HlsTimeline {
+                            state: state.clone(),
+                            buffered_ranges: buffered_ranges.clone(),
+                            current_time,
+                        }
+                        HlsPipelineRows { state: state.clone() }
+                    },
+                    None => rsx! { div { class: "debug-row muted", "Gathering…" } },
+                }
+            }
+        }
         div { class: "debug-section",
             div { class: "debug-section-title", "Playback" }
             match &stats {
@@ -875,6 +973,175 @@ fn TechInfoRows(info: MediaTechInfo) -> Element {
                     rsx! { DebugRow { key: "{i}", label: label, value: parts.join(" · ") } }
                 }
             }
+        }
+    }
+}
+
+/// Stacked timeline showing what the HLS pipeline is doing right now:
+/// * server-cached segments (green run)
+/// * client-buffered range[s] from `<video>.buffered` (blue overlay)
+/// * producer's "active window" — start_idx through head + lookahead (yellow band)
+/// * producer head — vertical orange line (where ffmpeg has reached)
+/// * current playback position — vertical red line
+///
+/// Inline-styled (not utility classes) because the absolute positions are
+/// computed from runtime data; cleaner to do this in Rust than to plumb a
+/// CSS variable per-segment. Stylesheet covers the static chrome.
+#[component]
+fn HlsTimeline(
+    state: HlsState,
+    buffered_ranges: Vec<(f64, f64)>,
+    current_time: Option<f64>,
+) -> Element {
+    let dur = state.duration.max(0.001);
+
+    // Map a segment index to (left%, width%) on the bar. Falls back to a
+    // proportional slice if the segment_durations array doesn't cover this
+    // index — defensive against version drift.
+    let seg_rect = move |idx: u32| -> (f64, f64) {
+        let n = state.segment_durations.len();
+        if n == 0 || idx == 0 || (idx as usize) > n {
+            return (0.0, 0.0);
+        }
+        let prefix: f64 = state.segment_durations[..(idx as usize - 1)].iter().sum();
+        let d = state.segment_durations[idx as usize - 1];
+        (prefix / dur * 100.0, d / dur * 100.0)
+    };
+
+    // Collapse contiguous cached indices into runs so the DOM only has a
+    // handful of rectangles (a 1200-segment file with sequential cache =
+    // one rectangle, not 1200). Keeps render cheap regardless of plan size.
+    let mut cached_runs: Vec<(u32, u32)> = Vec::new();
+    for &i in &state.cached_segments {
+        match cached_runs.last_mut() {
+            Some((_, last_end)) if *last_end + 1 == i => *last_end = i,
+            _ => cached_runs.push((i, i)),
+        }
+    }
+
+    let producer = state.producer.clone();
+    let head_pct = producer.as_ref().and_then(|p| {
+        if p.head == 0 {
+            None
+        } else {
+            let (l, w) = seg_rect(p.head);
+            Some(l + w)
+        }
+    });
+    let window_rect = producer.as_ref().and_then(|p| {
+        let end = p.head.saturating_add(p.lookahead_window);
+        if p.start_idx == 0 || end == 0 {
+            return None;
+        }
+        let (l1, _) = seg_rect(p.start_idx.max(1));
+        let (l2, w2) = seg_rect(end.min(state.total_segments));
+        Some((l1, (l2 + w2 - l1).max(0.0)))
+    });
+
+    let cur_pct = current_time.map(|t| (t / dur * 100.0).clamp(0.0, 100.0));
+
+    rsx! {
+        div { class: "hls-timeline",
+            // Producer's read-ahead window (start..head+lookahead). Drawn
+            // first so cached/buffered/head paint over it.
+            if let Some((l, w)) = window_rect {
+                div {
+                    class: "hls-tl-window",
+                    style: "left: {l}%; width: {w}%;",
+                }
+            }
+            // Server-side cache (segments on disk).
+            for (a, b) in cached_runs.iter().copied() {
+                {
+                    let (l1, _) = seg_rect(a);
+                    let (l2, w2) = seg_rect(b);
+                    let w = (l2 + w2 - l1).max(0.0);
+                    rsx! {
+                        div {
+                            key: "{a}-{b}",
+                            class: "hls-tl-cached",
+                            style: "left: {l1}%; width: {w}%;",
+                        }
+                    }
+                }
+            }
+            // Client-side buffered ranges (what the <video> can play right now).
+            for (i, (s, e)) in buffered_ranges.iter().copied().enumerate() {
+                {
+                    let l = (s / dur * 100.0).clamp(0.0, 100.0);
+                    let w = ((e - s) / dur * 100.0).max(0.0);
+                    rsx! {
+                        div {
+                            key: "{i}",
+                            class: "hls-tl-buffered",
+                            style: "left: {l}%; width: {w}%;",
+                        }
+                    }
+                }
+            }
+            // Producer head — vertical line at the boundary of the last
+            // segment ffmpeg finished writing.
+            if let Some(p) = head_pct {
+                div {
+                    class: if producer.as_ref().map(|p| p.paused).unwrap_or(false) {
+                        "hls-tl-head paused"
+                    } else {
+                        "hls-tl-head"
+                    },
+                    style: "left: {p}%;",
+                }
+            }
+            // Current playback position.
+            if let Some(p) = cur_pct {
+                div { class: "hls-tl-cursor", style: "left: {p}%;" }
+            }
+        }
+        // Legend so colors aren't a guessing game.
+        div { class: "hls-tl-legend",
+            span { class: "hls-tl-swatch cached" } "cached"
+            span { class: "hls-tl-swatch buffered" } "buffered"
+            span { class: "hls-tl-swatch window" } "window"
+            span { class: "hls-tl-swatch head" } "head"
+            span { class: "hls-tl-swatch cursor" } "now"
+        }
+    }
+}
+
+#[component]
+fn HlsPipelineRows(state: HlsState) -> Element {
+    let total = state.total_segments;
+    let cached_count = state.cached_segments.len() as u32;
+    let cached_pct = if total > 0 {
+        (cached_count as f64 / total as f64 * 100.0).round() as u32
+    } else {
+        0
+    };
+    let producer_label = match &state.producer {
+        None => "idle".to_string(),
+        Some(p) => {
+            let status = if p.paused { "paused" } else { "running" };
+            format!("{status} · seg {} / {total}", p.head)
+        }
+    };
+    let window_label = match &state.producer {
+        None => "—".to_string(),
+        Some(p) => format!(
+            "start {} → head {} (hw {}, lookahead {})",
+            p.start_idx, p.head, p.high_water, p.lookahead_window
+        ),
+    };
+    let idle_label = state
+        .producer
+        .as_ref()
+        .map(|p| format!("{:.1}s since last request", p.idle_for_secs))
+        .unwrap_or_else(|| "—".into());
+    rsx! {
+        DebugRow { label: "Producer", value: producer_label }
+        DebugRow { label: "Window", value: window_label }
+        DebugRow { label: "Idle", value: idle_label }
+        DebugRow {
+            label: "Cache",
+            value: format!("{cached_count} / {total} segs ({cached_pct}%)"),
         }
     }
 }

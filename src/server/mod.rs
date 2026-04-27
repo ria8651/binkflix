@@ -36,7 +36,7 @@ pub struct AppState {
     pub scan_progress: scanner::ProgressHandle,
     pub scan_lock: Arc<Mutex<()>>,
     pub libraries: Arc<Vec<(i64, PathBuf)>>,
-    pub hls_cache: Arc<hls::HlsCache>,
+    pub hls_producers: Arc<hls::ProducerRegistry>,
     /// `None` disables bastion auth entirely — set `BASTION_ORIGIN` to enable.
     pub auth: Option<auth::AuthState>,
 }
@@ -162,6 +162,14 @@ async fn run_async() -> anyhow::Result<()> {
 
     let pool = db::connect(&db_path).await?;
 
+    // If a previous run was killed abruptly (preview_stop, OOM, kill -9
+    // on the parent), any ffmpeg children we'd spawned can survive as
+    // orphans — possibly still SIGSTOP'd from backpressure, holding
+    // file descriptors open and burning a process slot. Sweep them
+    // before we start fresh so they don't compete with the new
+    // producers for the same plan dirs.
+    hls::sweep_orphan_ffmpegs().await;
+
     // Register each path as its own row in `libraries` and kick off scans in
     // the background so startup isn't blocked on large trees.
     let mut scan_jobs: Vec<(i64, PathBuf)> = Vec::with_capacity(library_paths.len());
@@ -211,7 +219,7 @@ async fn run_async() -> anyhow::Result<()> {
         scan_progress,
         scan_lock,
         libraries,
-        hls_cache: hls::HlsCache::new(),
+        hls_producers: hls::ProducerRegistry::new(),
         auth: auth_state.clone(),
     };
 
