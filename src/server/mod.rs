@@ -44,15 +44,35 @@ pub struct AppState {
 }
 
 /// Permissive CSP that explicitly allows the resources this app uses.
-/// The critical bit is `media-src 'self' blob:` — hls.js attaches MSE
+///
+/// `media-src 'self' blob:` is load-bearing — hls.js attaches MSE
 /// by setting `video.src = URL.createObjectURL(mediaSource)`, which is
 /// a `blob:` URL. Without `blob:` listed, Firefox blocks the attach
 /// (visible as `Content at .../play may not load data from blob:...`)
 /// and playback never starts even though segments arrive. Multiple
 /// CSP headers combine restrictively, so a strict downstream proxy
 /// will need this same relaxation.
+///
+/// `script-src 'unsafe-inline'`: Dioxus 0.7 fullstack injects two inline
+/// `<script>` blocks into the served HTML (the wasm-bindgen bootloader
+/// and the hydration kickoff). They have no nonce/hash hook, so the
+/// pragmatic options are `'unsafe-inline'` or patching Dioxus. Modern
+/// browsers ignore `'unsafe-inline'` when a hash/nonce is present, so
+/// adding hashes later would tighten this without another CSP edit.
+///
+/// `script-src 'unsafe-eval'`: Dioxus' `document::eval()` (used in the
+/// theme switcher, search focus, and outside-click bridge) compiles
+/// each JS snippet through `new Function(...)`, which CSP treats as
+/// eval. `'wasm-unsafe-eval'` only covers wasm compilation, not the
+/// Function constructor. Without this, those `eval()` calls throw
+/// silently and cascade into a `DOMException` from the wasm-bindgen
+/// glue once it tries to use the half-initialised callback.
+///
+/// Fonts (Open Sans, Chivo) are vendored under `assets/static/fonts/` and
+/// referenced from `style.css` with absolute `/static/fonts/...` URLs, so no
+/// Google Fonts origins appear here.
 const CSP_POLICY: &str = "default-src 'self'; \
-    script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; \
+    script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; \
     style-src 'self' 'unsafe-inline'; \
     img-src 'self' data: blob: https:; \
     media-src 'self' blob:; \
