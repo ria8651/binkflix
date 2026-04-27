@@ -157,34 +157,3 @@ pub fn detect_nfo_kind(path: &Path) -> Option<NfoKind> {
     }
 }
 
-/// Parse `SxxEyy` (or sxxeyy) from a filename, returning (season, episode).
-pub fn parse_sxxeyy(name: &str) -> Option<(i64, i64)> {
-    let lower = name.to_ascii_lowercase();
-    let b = lower.as_bytes();
-    let mut i = 0;
-    while i + 3 < b.len() {
-        if b[i] == b's' && b[i + 1].is_ascii_digit() {
-            let s_start = i + 1;
-            let mut s_end = s_start;
-            while s_end < b.len() && b[s_end].is_ascii_digit() {
-                s_end += 1;
-            }
-            if s_end < b.len() && b[s_end] == b'e' && s_end + 1 < b.len() && b[s_end + 1].is_ascii_digit()
-            {
-                let e_start = s_end + 1;
-                let mut e_end = e_start;
-                while e_end < b.len() && b[e_end].is_ascii_digit() {
-                    e_end += 1;
-                }
-                if let (Ok(s), Ok(e)) = (
-                    lower[s_start..s_end].parse::<i64>(),
-                    lower[e_start..e_end].parse::<i64>(),
-                ) {
-                    return Some((s, e));
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}

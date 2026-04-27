@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth;
 pub mod db;
 pub mod error;
+pub mod filename;
 pub mod hls;
 pub mod media_info;
 pub mod nfo;

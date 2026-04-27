@@ -1,3 +1,4 @@
+use super::filename;
 use super::nfo::{self, EpisodeNfo, MovieNfo};
 use super::{subtitles, thumbnails};
 use crate::types::ScanProgress;
@@ -164,7 +165,7 @@ fn classify(video: &Path, library_root: &Path) -> Classification {
     }
 
     if let Some(stem) = video.file_stem().and_then(|s| s.to_str()) {
-        if nfo::parse_sxxeyy(stem).is_some() {
+        if filename::parse_episode(stem).is_some() {
             if let Some(parent) = video.parent() {
                 if parent != library_root {
                     return Classification::Episode(parent.to_path_buf());
@@ -576,12 +577,14 @@ async fn upsert_show(
 
     let nfo = nfo::parse_tvshow_nfo(&nfo_path).unwrap_or_default();
     let title = nfo.title.clone().unwrap_or_else(|| {
-        show_dir
+        let folder = show_dir
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("Untitled Show")
-            .to_string()
+            .unwrap_or("Untitled Show");
+        let cleaned = filename::clean_title(folder);
+        if cleaned.is_empty() { folder.to_string() } else { cleaned }
     });
+    let sort_title = filename::sort_title(&title);
     let poster = find_show_poster(show_dir).map(|p| p.to_string_lossy().into_owned());
     let fanart = find_show_fanart(show_dir).map(|p| p.to_string_lossy().into_owned());
     let tvdb_id = nfo
@@ -593,12 +596,13 @@ async fn upsert_show(
     sqlx::query(
         r#"
         INSERT INTO shows (
-            id, library_id, path, title, original_title, year, plot,
+            id, library_id, path, title, sort_title, original_title, year, plot,
             imdb_id, tmdb_id, tvdb_id, poster_path, fanart_path
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
+            sort_title = excluded.sort_title,
             original_title = excluded.original_title,
             year = excluded.year,
             plot = excluded.plot,
@@ -614,6 +618,7 @@ async fn upsert_show(
     .bind(library_id)
     .bind(&path_str)
     .bind(&title)
+    .bind(&sort_title)
     .bind(&nfo.original_title)
     .bind(nfo.year_or_premiered())
     .bind(&nfo.plot)
@@ -729,19 +734,23 @@ async fn upsert_episode(
 
     let (season, episode) = match (nfo.season, nfo.episode) {
         (Some(s), Some(e)) => (s, e),
-        _ => nfo::parse_sxxeyy(base).unwrap_or_else(|| {
+        _ => filename::parse_episode(base).unwrap_or_else(|| {
             let inferred = infer_season_episode(video, show_dir);
             debug!(
                 file = base,
                 season = inferred.0,
                 episode = inferred.1,
-                "no SxxEyy/nfo — inferred from folder + filename"
+                "no episode tag/nfo — inferred from folder + filename"
             );
             inferred
         }),
     };
 
-    let title = nfo.title.clone().unwrap_or_else(|| base.to_string());
+    let title = nfo
+        .title
+        .clone()
+        .unwrap_or_else(|| filename::clean_episode_title(base, episode));
+    let sort_title = filename::sort_title(&title);
     let thumb = find_episode_thumb(video).map(|p| p.to_string_lossy().into_owned());
 
     let id = existing
@@ -752,13 +761,14 @@ async fn upsert_episode(
         r#"
         INSERT INTO media (
             id, library_id, kind, path, file_size,
-            title, plot, runtime_minutes, image_path,
+            title, sort_title, plot, runtime_minutes, image_path,
             show_id, season_number, episode_number
         )
-        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'episode',
             title           = excluded.title,
+            sort_title      = excluded.sort_title,
             plot            = excluded.plot,
             runtime_minutes = excluded.runtime_minutes,
             image_path      = excluded.image_path,
@@ -780,6 +790,7 @@ async fn upsert_episode(
     .bind(&path_str)
     .bind(file_size)
     .bind(&title)
+    .bind(&sort_title)
     .bind(&nfo.plot)
     .bind(nfo.runtime)
     .bind(&thumb)
@@ -838,7 +849,12 @@ async fn upsert_movie(
         .and_then(|p| nfo::parse_movie_nfo(p).ok())
         .unwrap_or_default();
 
-    let title = nfo.title.clone().unwrap_or_else(|| base.to_string());
+    let parsed = filename::parse_movie(base);
+    let title = nfo.title.clone().unwrap_or_else(|| {
+        if parsed.title.is_empty() { base.to_string() } else { parsed.title.clone() }
+    });
+    let year = nfo.year.or(parsed.year);
+    let sort_title = filename::sort_title(&title);
     let image = find_movie_image(video).map(|p| p.to_string_lossy().into_owned());
     let fanart = find_movie_fanart(video).map(|p| p.to_string_lossy().into_owned());
 
@@ -850,13 +866,14 @@ async fn upsert_movie(
         r#"
         INSERT INTO media (
             id, library_id, kind, path, file_size,
-            title, original_title, year, plot, runtime_minutes,
+            title, sort_title, original_title, year, plot, runtime_minutes,
             imdb_id, tmdb_id, image_path, fanart_path
         )
-        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'movie',
             title           = excluded.title,
+            sort_title      = excluded.sort_title,
             original_title  = excluded.original_title,
             year            = excluded.year,
             plot            = excluded.plot,
@@ -878,8 +895,9 @@ async fn upsert_movie(
     .bind(&path_str)
     .bind(file_size)
     .bind(&title)
+    .bind(&sort_title)
     .bind(&nfo.original_title)
-    .bind(nfo.year)
+    .bind(year)
     .bind(&nfo.plot)
     .bind(nfo.runtime)
     .bind(nfo.imdb_id())

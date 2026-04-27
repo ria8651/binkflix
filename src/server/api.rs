@@ -134,7 +134,7 @@ pub struct LibraryResponse {
 
 async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>> {
     let movies = sqlx::query_as::<_, MovieSummary>(
-        "SELECT id, title, year FROM media WHERE kind = 'movie' ORDER BY title",
+        "SELECT id, title, year FROM media WHERE kind = 'movie' ORDER BY sort_title",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -143,7 +143,7 @@ async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>>
         "SELECT s.id, s.title, s.year,
                 (SELECT COUNT(*) FROM media m WHERE m.show_id = s.id) AS episode_count
          FROM shows s
-         ORDER BY s.title",
+         ORDER BY s.sort_title",
     )
     .fetch_all(&state.pool)
     .await?;
