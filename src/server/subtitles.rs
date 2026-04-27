@@ -10,8 +10,8 @@
 //!     extracted with `ffmpeg` (PGS/DVD bitmap subs are skipped; they need
 //!     OCR).
 
+use crate::server::media_info::EmbeddedSubtitleStream;
 use crate::types::SubtitleTrack;
-use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -83,10 +83,14 @@ pub async fn get_from_db(
 ///
 /// Called from the scanner when a video is first indexed or when its
 /// mtime/size change. Idempotent — wipes+re-inserts under a single tx.
+///
+/// `embedded` is the subtitle stream list from a prior `media_info::probe_full`
+/// call, so we don't re-spawn ffprobe just to enumerate text tracks.
 pub async fn scan_for_media(
     pool: &SqlitePool,
     media_id: &str,
     video: &Path,
+    embedded: &[EmbeddedSubtitleStream],
 ) -> anyhow::Result<usize> {
     let mut tracks = Vec::new();
 
@@ -106,30 +110,25 @@ pub async fn scan_for_media(
         }
     }
 
-    // Embedded: one ffprobe, then one ffmpeg per text track.
-    match probe_embedded(video).await {
-        Ok(embedded) => {
-            for e in embedded {
-                match extract_embedded(video, e.stream_index, &e.codec, e.target_format).await {
-                    Ok(content) => tracks.push(Extracted {
-                        track_id: format!("embed-{}", e.stream_index),
-                        format: e.target_format,
-                        language: e.language,
-                        label: e.label,
-                        default: e.default,
-                        forced: e.forced,
-                        content,
-                    }),
-                    Err(err) => tracing::warn!(
-                        video = %video.display(),
-                        stream = e.stream_index,
-                        %err,
-                        "embedded subtitle extract failed"
-                    ),
-                }
-            }
+    // Embedded: one ffmpeg per text track. (Stream list pre-probed by caller.)
+    for e in classify_embedded(embedded) {
+        match extract_embedded(video, e.stream_index, &e.codec, e.target_format).await {
+            Ok(content) => tracks.push(Extracted {
+                track_id: format!("embed-{}", e.stream_index),
+                format: e.target_format,
+                language: e.language,
+                label: e.label,
+                default: e.default,
+                forced: e.forced,
+                content,
+            }),
+            Err(err) => tracing::warn!(
+                video = %video.display(),
+                stream = e.stream_index,
+                %err,
+                "embedded subtitle extract failed"
+            ),
         }
-        Err(e) => tracing::debug!(%e, "ffprobe unavailable; skipping embedded subs"),
     }
 
     let count = tracks.len();
@@ -227,26 +226,7 @@ async fn extract_sidecar(path: &Path) -> anyhow::Result<SidecarData> {
     })
 }
 
-// ---- ffprobe / ffmpeg for embedded streams ----
-
-#[derive(Debug, Deserialize)]
-struct ProbeOutput {
-    #[serde(default)]
-    streams: Vec<ProbeStream>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProbeStream {
-    index: u32,
-    #[serde(default)]
-    codec_type: String,
-    #[serde(default)]
-    codec_name: String,
-    #[serde(default)]
-    tags: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    disposition: std::collections::BTreeMap<String, i64>,
-}
+// ---- ffmpeg for embedded streams ----
 
 struct EmbeddedMeta {
     stream_index: u32,
@@ -258,32 +238,15 @@ struct EmbeddedMeta {
     forced: bool,
 }
 
-async fn probe_embedded(video: &Path) -> anyhow::Result<Vec<EmbeddedMeta>> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-print_format", "json",
-            "-show_streams",
-            "-select_streams", "s",
-        ])
-        .arg(video)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)?;
+/// Pick text-codec subtitles out of the pre-probed stream list and decide
+/// each track's target format / display label.
+fn classify_embedded(streams: &[EmbeddedSubtitleStream]) -> Vec<EmbeddedMeta> {
     let mut out = Vec::new();
-    for s in parsed.streams {
-        if s.codec_type != "subtitle" || !is_text_codec(&s.codec_name) {
+    for s in streams {
+        if !is_text_codec(&s.codec) {
             continue;
         }
-        let target_format: &'static str = match s.codec_name.as_str() {
+        let target_format: &'static str = match s.codec.as_str() {
             "ass" | "ssa" => "ass",
             _ => "vtt",
         };
@@ -298,7 +261,7 @@ async fn probe_embedded(video: &Path) -> anyhow::Result<Vec<EmbeddedMeta>> {
         };
         out.push(EmbeddedMeta {
             stream_index: s.index,
-            codec: s.codec_name,
+            codec: s.codec.clone(),
             target_format,
             language: lang,
             label,
@@ -306,7 +269,7 @@ async fn probe_embedded(video: &Path) -> anyhow::Result<Vec<EmbeddedMeta>> {
             forced: s.disposition.get("forced").copied().unwrap_or(0) != 0,
         });
     }
-    Ok(out)
+    out
 }
 
 async fn extract_embedded(
