@@ -4,7 +4,7 @@ use super::AppState;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use sqlx::FromRow;
@@ -28,8 +28,14 @@ pub fn router() -> Router<AppState> {
         .route("/api/shows/{id}/fanart", get(show_fanart))
         .route("/api/shows/{id}/seasons/{n}/poster", get(season_poster))
         .route("/api/rooms", get(list_rooms).post(create_room))
-        .route("/api/scan", axum::routing::post(start_scan))
+        .route("/api/scan", post(start_scan))
         .route("/api/scan/status", get(scan_status))
+        .route(
+            "/api/media/{id}/progress",
+            get(super::watch::get_progress).post(super::watch::report_progress),
+        )
+        .route("/api/continue-watching", get(super::watch::continue_watching))
+        .route("/api/media/{id}/watched", post(super::watch::mark_watched).delete(super::watch::mark_unwatched))
 }
 
 async fn scan_status(State(state): State<AppState>) -> Json<crate::types::ScanProgress> {

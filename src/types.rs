@@ -255,6 +255,35 @@ pub enum Broadcast {
     Drift { client_id: String, position_ms: i64, playing: bool, server_ts: i64 },
 }
 
+// ---- Watch progress / continue watching ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WatchProgress {
+    pub media_id: String,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub completed: bool,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(dead_code)]
+pub struct ProgressReport {
+    pub position_secs: f64,
+    pub duration_secs: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContinueItem {
+    pub media_id: String,
+    pub kind: String,
+    pub title: String,
+    /// `Some` for episodes — use the show poster, not the episode thumb.
+    pub show_id: Option<String>,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+}
+
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
 pub fn season_poster_url(show_id: &str, season: i64) -> String {
     format!("/api/shows/{show_id}/seasons/{season}/poster")

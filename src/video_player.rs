@@ -254,6 +254,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // initControls must fire *after* the video mounts, not on component
     // mount when the element doesn't exist yet. `initControls` is
     // idempotent, so re-running on subsequent src changes is safe.
+    let id_for_resume = id.clone();
     use_effect(move || {
         let src = stream_src.read().clone();
         if src.is_empty() { return; }
@@ -264,21 +265,72 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         let js = format!(
             "(async () => {{ await window.binkflixPlayer?.attach('{video_dom_id}', '{src}'); window.binkflixPlayer?.initControls('{video_dom_id}'); }})();"
         );
+        let id_for_resume = id_for_resume.clone();
         spawn(async move {
             let _ = document::eval(&js).await;
+            #[cfg(feature = "web")]
+            if let Ok(Some(p)) = get_progress(&id_for_resume).await {
+                if !p.completed && p.position_secs > 5.0 {
+                    let js = format!(
+                        "window.binkflixPlayer?.seekTo('{video_dom_id}', {});",
+                        p.position_secs
+                    );
+                    let _ = document::eval(&js).await;
+                }
+            }
+            #[cfg(not(feature = "web"))]
+            { let _ = id_for_resume; }
+        });
+    });
+
+    // Heartbeat: every 10s while the player is mounted, POST current
+    // position back so the home page's Continue Watching row stays fresh
+    // and the next session can resume. Suppressed while paused (no
+    // forward progress) and while duration is unknown (still loading).
+    let id_for_heartbeat = id.clone();
+    use_effect(move || {
+        if stream_src.read().is_empty() {
+            return;
+        }
+        let id = id_for_heartbeat.clone();
+        spawn(async move {
+            #[cfg(feature = "web")]
+            {
+                let mut last_pos: f64 = -1.0;
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(10_000).await;
+                    let mut eval = document::eval(&format!(
+                        "dioxus.send(window.binkflixPlayer?.getPlaybackState('{video_dom_id}') || null);"
+                    ));
+                    let Ok(v) = eval.recv::<serde_json::Value>().await else { break };
+                    let Some(state) = v.as_object() else { continue };
+                    let pos = state.get("currentTime").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let dur = state.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let paused = state.get("paused").and_then(|x| x.as_bool()).unwrap_or(true);
+                    if dur <= 0.0 { continue; }
+                    if paused && (pos - last_pos).abs() < 0.25 { continue; }
+                    let _ = report_progress(&id, pos, dur).await;
+                    last_pos = pos;
+                }
+            }
+            #[cfg(not(feature = "web"))]
+            { let _ = id; }
         });
     });
 
     // Pause + detach the stream when the component unmounts. Without this
     // the browser keeps the range request alive (and audio playing)
     // through a soft route change, which is jarring when navigating back
-    // to the library from the player.
+    // to the library from the player. Also flush one last progress
+    // report so the resume position stays accurate to the second.
+    let id_for_drop = id.clone();
     use_drop(move || {
         // `detach` tears down any hls.js instance attached to this video
         // element in addition to clearing src/pausing — without it the
         // hls.js xhr loop keeps running after a soft nav.
+        let media_id = id_for_drop.clone();
         let js = format!(
-            "window.binkflixPlayer?.detach('{video_dom_id}');"
+            "window.binkflixPlayer?.flushProgress('{video_dom_id}', '{media_id}'); window.binkflixPlayer?.detach('{video_dom_id}');"
         );
         spawn(async move { let _ = document::eval(&js).await; });
     });

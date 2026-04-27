@@ -13,6 +13,7 @@ pub mod scanner;
 pub mod subtitles;
 pub mod syncplay;
 pub mod thumbnails;
+pub mod watch;
 
 use crate::app::App;
 use crate::types::ScanProgress;

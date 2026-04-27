@@ -300,6 +300,69 @@ h2.section {
     padding: 0 var(--space-6) var(--space-7);
 }
 
+/* Continue Watching uses landscape episode stills, so the row needs wider
+   columns than the portrait-poster grids. */
+.grid-wide {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.card-wide .poster {
+    aspect-ratio: 16 / 9;
+}
+/* Continue Watching cards have no `.year` line, so the title needs its
+   own bottom padding to match the breathing room on poster cards. */
+.card-wide .title {
+    padding-bottom: var(--space-7);
+}
+
+.card {
+    position: relative;
+}
+.card .poster-wrap {
+    position: relative;
+}
+
+/* "Mark as watched" overlay button. Hidden until the user hovers (or
+   focuses for keyboard nav) to keep the row visually clean. */
+.mark-watched {
+    position: absolute;
+    top: var(--space-4, 8px);
+    right: var(--space-4, 8px);
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: rgb(0 0 0 / 0.7);
+    border: 1px solid rgb(255 255 255 / 0.3);
+    color: white;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease, transform 0.15s ease;
+    z-index: 2;
+}
+.card:hover .mark-watched,
+.mark-watched:focus-visible {
+    opacity: 1;
+}
+.mark-watched:hover {
+    background: rgb(0 0 0 / 0.92);
+    transform: scale(1.05);
+}
+.card .progress {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 3px;
+    background: rgb(0 0 0 / 0.55);
+}
+.card .progress-bar {
+    height: 100%;
+    background: var(--accent, #e50914);
+}
+
 /* ── Detail page ───────────────────────────────────────────── */
 
 .detail {
@@ -1000,6 +1063,61 @@ h2.section {
 .hls-tl-swatch.cursor   { background: rgb(255 255 255); }
 
 /* ── Seasons / episodes ────────────────────────────────────── */
+
+/* Picker row — one mini season poster per season. The active one
+   gets a colored ring; the rest fade slightly so it pops. */
+.season-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-7);
+    margin-top: var(--space-10);
+    margin-bottom: var(--space-8);
+}
+.season-pick {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    color: var(--text-muted);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    font: inherit;
+    width: 110px;
+    transition: color 0.15s, transform 0.15s;
+}
+.season-pick-poster {
+    width: 110px;
+    aspect-ratio: 2 / 3;
+    background: var(--bg-surface-hover) center/cover no-repeat;
+    border-radius: var(--radius-tile);
+    border: 2px solid transparent;
+    box-shadow: var(--shadow-tile);
+    opacity: 0.55;
+    transition: opacity 0.15s, border-color 0.15s, transform 0.15s;
+}
+.season-pick:hover {
+    color: var(--text-primary);
+}
+.season-pick:hover .season-pick-poster {
+    opacity: 0.9;
+    transform: translateY(-2px);
+}
+.season-pick.active {
+    color: var(--text-primary);
+}
+.season-pick.active .season-pick-poster {
+    opacity: 1;
+    border-color: var(--accent, #e50914);
+    transform: translateY(-2px);
+}
+.season-pick-label {
+    font-size: var(--text-sm);
+    font-weight: var(--weight-semibold);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
 
 .season { margin-top: var(--space-10); }
 .season-head {

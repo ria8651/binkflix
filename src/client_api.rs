@@ -109,3 +109,54 @@ pub async fn get_scan_status() -> Result<ScanProgress, String> {
 pub async fn start_scan() -> Result<ScanProgress, String> {
     post_empty("/api/scan").await
 }
+
+pub async fn get_continue_watching() -> Result<Vec<ContinueItem>, String> {
+    fetch_json("/api/continue-watching").await
+}
+
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub async fn get_progress(id: &str) -> Result<Option<WatchProgress>, String> {
+    fetch_json(&format!("/api/media/{id}/progress")).await
+}
+
+#[cfg(feature = "web")]
+pub async fn report_progress(id: &str, position_secs: f64, duration_secs: f64) -> Result<(), String> {
+    let url = format!("/api/media/{id}/progress");
+    let body = ProgressReport { position_secs, duration_secs };
+    let resp = gloo_net::http::Request::post(&url)
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| format!("network error hitting {url}: {e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("{url} returned HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+#[allow(dead_code)]
+pub async fn report_progress(_id: &str, _position_secs: f64, _duration_secs: f64) -> Result<(), String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}
+
+#[cfg(feature = "web")]
+pub async fn mark_watched(id: &str) -> Result<(), String> {
+    let url = format!("/api/media/{id}/watched");
+    let resp = gloo_net::http::Request::post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("network error hitting {url}: {e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("{url} returned HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+#[allow(dead_code)]
+pub async fn mark_watched(_id: &str) -> Result<(), String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}

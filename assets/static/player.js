@@ -883,12 +883,57 @@ function fullDetach(videoId) {
     detachSource(videoId);
 }
 
+// Resume support: jump the video to `position` seconds. Waits for metadata
+// so currentTime can actually take a value > 0.
+function seekTo(videoId, position) {
+    const video = getVideo(videoId);
+    if (!video || !Number.isFinite(position) || position <= 0) return;
+    const apply = () => {
+        try { video.currentTime = position; } catch (_) { /* ignore */ }
+    };
+    if (video.readyState >= 1 /* HAVE_METADATA */) {
+        apply();
+    } else {
+        video.addEventListener("loadedmetadata", apply, { once: true });
+    }
+}
+
+// Lightweight subset of getDebugStats used by the progress heartbeat.
+function getPlaybackState(videoId) {
+    const video = getVideo(videoId);
+    if (!video) return null;
+    return {
+        currentTime: video.currentTime || 0,
+        duration: Number.isFinite(video.duration) ? video.duration : 0,
+        paused: !!video.paused,
+        ended: !!video.ended,
+    };
+}
+
+// Final progress report on tab close / soft nav. sendBeacon is the only
+// network call that's reliably allowed to fire from `pagehide` / `unload`.
+function flushProgress(videoId, mediaId) {
+    const s = getPlaybackState(videoId);
+    if (!s || s.duration <= 0) return;
+    const body = JSON.stringify({
+        position_secs: s.currentTime,
+        duration_secs: s.duration,
+    });
+    try {
+        const blob = new Blob([body], { type: "application/json" });
+        navigator.sendBeacon(`/api/media/${encodeURIComponent(mediaId)}/progress`, blob);
+    } catch (_) { /* ignore */ }
+}
+
 const realApi = {
     setAss,
     setVtt,
     clear: detach,
     initControls,
     getDebugStats,
+    getPlaybackState,
+    seekTo,
+    flushProgress,
     attach,
     detach: fullDetach,
     dismissError,
