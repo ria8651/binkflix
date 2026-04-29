@@ -132,6 +132,7 @@ fn Shell() -> Element {
             crate::syncplay_client::RoomNavigator {}
             Outlet::<Route> {}
         }
+        crate::syncplay_client::RoomToasts {}
     }
 }
 

@@ -200,23 +200,36 @@ pub fn media_subtitle_url(id: &str, track: &str) -> String {
 // ---- Syncplay (watch-party) ----
 
 /// Server's authoritative snapshot of what a room is currently watching.
-/// Sent to new joiners in `Welcome.current` and updated on every Play/Pause/Seek/SetMedia.
+/// `version` is bumped on every mutation; clients use it to ignore stale or
+/// already-applied broadcasts (no string compare on media_id, no clock games).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoomState {
     pub media_id: String,
     pub position_ms: i64,
     pub playing: bool,
     pub updated_at: i64,
+    pub version: u64,
+}
+
+/// One participant in a room. `client_id` distinguishes multiple tabs by the
+/// same user; `username` is the display name (Bastion `login`, or "dev" when
+/// auth is off).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Member {
+    pub client_id: String,
+    pub user_sub: String,
+    pub username: String,
 }
 
 /// Dropdown list item. `current_media_*` is None when the room exists but nobody
-/// has started anything yet.
+/// has started anything yet. `members` carries usernames for the rooms list UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoomListItem {
     pub id: String,
     pub viewers: usize,
     pub current_media_id: Option<String>,
     pub current_media_title: Option<String>,
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -263,18 +276,36 @@ pub enum ClientMsg {
 }
 
 /// Messages the server fans out to all clients in a room.
+///
+/// `version` on Play/Pause/Seek/SetMedia/Resync mirrors `RoomState.version` after
+/// the mutation — clients use it to gate idempotent application. `from` carries
+/// the full `Member` so UIs can render "Alice paused" without a side lookup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum Broadcast {
-    Welcome { client_id: String, server_ts: i64, current: Option<RoomState> },
-    Peer { client_id: String, joined: bool, viewers: usize },
-    Play { position_ms: i64, server_ts: i64, from: String },
-    Pause { position_ms: i64, server_ts: i64, from: String },
-    Seek { position_ms: i64, server_ts: i64, from: String },
-    SetMedia { media_id: String, server_ts: i64, from: String },
+    Welcome {
+        you: Member,
+        server_ts: i64,
+        current: Option<RoomState>,
+        members: Vec<Member>,
+    },
+    /// Roster snapshot. Sent on every join/leave so clients always have a
+    /// current member list (replaces the old per-event Peer message).
+    Members {
+        members: Vec<Member>,
+        joined: Option<Member>,
+        left: Option<Member>,
+    },
+    Play { position_ms: i64, server_ts: i64, from: Member, version: u64 },
+    Pause { position_ms: i64, server_ts: i64, from: Member, version: u64 },
+    Seek { position_ms: i64, server_ts: i64, from: Member, version: u64 },
+    SetMedia { media_id: String, server_ts: i64, from: Member, version: u64 },
+    /// Periodic snapshot for drift correction. `live_position_ms` is the
+    /// server's projection at `server_ts` (state.position_ms + elapsed if
+    /// playing). Clients reconcile only if their local position is far off.
+    Resync { state: RoomState, live_position_ms: i64, server_ts: i64 },
     Pong { client_ts: i64, server_ts: i64 },
-    Drift { client_id: String, position_ms: i64, playing: bool, server_ts: i64 },
 }
 
 // ---- Watch progress / continue watching ----
