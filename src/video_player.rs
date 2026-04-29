@@ -49,6 +49,8 @@ const ICON_INFO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill=
 const ICON_CHECK: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
 const ICON_AUDIO: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 10v4M7 7v10M11 4v16M15 8v8M19 11v2"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>"#;
+const ICON_PREV: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M6 6h2v12H6zM20 6v12L9 12z"/></svg>"#;
+const ICON_NEXT: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M16 6h2v12h-2zM4 6v12l11-6z"/></svg>"#;
 
 #[component]
 pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
@@ -137,12 +139,38 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         async move {
             match media {
                 Some(Ok(m)) if m.kind == "episode" => match m.show_id.as_deref() {
-                    Some(sid) => get_show(sid).await.ok().map(|s| s.show.title),
+                    Some(sid) => get_show(sid).await.ok(),
                     None => None,
                 },
                 _ => None,
             }
         }
+    });
+
+    // Prev/next episode IDs derived from the show's full episode list.
+    // Empty for movies / one-off media or when the show fetch hasn't
+    // resolved yet. Server returns seasons/episodes already ordered by
+    // (season_number, episode_number), so a flat iteration is enough.
+    let neighbors = use_memo(move || -> (Option<String>, Option<String>) {
+        let media_snapshot = media_resource.read_unchecked().clone();
+        let show_snapshot = show_resource.read_unchecked().clone().flatten();
+        let (Some(Ok(m)), Some(detail)) = (media_snapshot, show_snapshot) else {
+            return (None, None);
+        };
+        if m.kind != "episode" {
+            return (None, None);
+        }
+        let flat: Vec<&EpisodeSummary> = detail
+            .seasons
+            .iter()
+            .flat_map(|s| s.episodes.iter())
+            .collect();
+        let Some(i) = flat.iter().position(|e| e.id == m.id) else {
+            return (None, None);
+        };
+        let prev = if i > 0 { Some(flat[i - 1].id.clone()) } else { None };
+        let next = flat.get(i + 1).map(|e| e.id.clone());
+        (prev, next)
     });
 
     // User-override on top of the server's compat verdict. `mode = None`
@@ -263,6 +291,34 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             }
             #[cfg(not(feature = "web"))]
             { let _ = id; }
+        });
+    });
+
+    // End-of-video flag, polled from the JS side so the "Up next" overlay
+    // can render without an autoplay path. Reuses `poll_alive` so the
+    // loop dies on unmount.
+    #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+    let mut is_ended = use_signal(|| false);
+    use_effect(move || {
+        if stream_src.read().is_empty() {
+            return;
+        }
+        spawn(async move {
+            #[cfg(feature = "web")]
+            loop {
+                if !*poll_alive.peek() { break; }
+                let mut eval = document::eval(&format!(
+                    "dioxus.send(window.binkflixPlayer?.getPlaybackState('{video_dom_id}')?.ended ?? false);"
+                ));
+                let ended = match eval.recv::<serde_json::Value>().await {
+                    Ok(v) => v.as_bool().unwrap_or(false),
+                    Err(_) => false,
+                };
+                if *is_ended.peek() != ended {
+                    is_ended.set(ended);
+                }
+                gloo_timers::future::TimeoutFuture::new(750).await;
+            }
         });
     });
 
@@ -495,7 +551,11 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                 }
                 {
                     let media_snapshot = media_resource.read_unchecked().clone();
-                    let show_snapshot = show_resource.read_unchecked().clone().flatten();
+                    let show_title = show_resource
+                        .read_unchecked()
+                        .clone()
+                        .flatten()
+                        .map(|d| d.show.title);
                     match media_snapshot {
                         Some(Ok(m)) => {
                             let (primary, secondary) = if m.kind == "episode" {
@@ -503,7 +563,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                                     (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02} · {}", m.title)),
                                     _ => Some(m.title.clone()),
                                 };
-                                let primary = show_snapshot.unwrap_or_else(|| m.title.clone());
+                                let primary = show_title.unwrap_or_else(|| m.title.clone());
                                 (primary, ep_label)
                             } else {
                                 (m.title.clone(), m.year.map(|y| y.to_string()))
@@ -614,6 +674,33 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     }
                 }
             }
+            // End-of-video "Up next" overlay. Renders only when the video
+            // has actually ended *and* a next episode exists. No autoplay:
+            // user must click to advance. Hidden for movies and the last
+            // episode of a series.
+            {
+                let next_for_end = neighbors.read().1.clone();
+                let show_overlay = *is_ended.read() && next_for_end.is_some();
+                if show_overlay {
+                    rsx! {
+                        div { class: "player-end-overlay", role: "dialog", "aria-label": "Up next",
+                            div { class: "player-end-card",
+                                if let Some(nid) = next_for_end {
+                                    button {
+                                        class: "btn",
+                                        r#type: "button",
+                                        onclick: move |_| navigate_to_episode(&nid),
+                                        span { dangerous_inner_html: ICON_NEXT }
+                                        span { "Play next episode" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    rsx! {}
+                }
+            }
             div { class: "player-chrome",
                 input {
                     class: "player-scrub",
@@ -624,10 +711,33 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     value: "0",
                 }
                 div { class: "player-row",
-                    button {
-                        class: "player-btn play-btn",
-                        r#type: "button",
-                        dangerous_inner_html: ICON_PLAY,
+                    {
+                        let (prev_id, next_id) = neighbors.read().clone();
+                        rsx! {
+                            if let Some(pid) = prev_id {
+                                button {
+                                    class: "player-btn prev-ep-btn",
+                                    r#type: "button",
+                                    title: "Previous episode",
+                                    onclick: move |_| navigate_to_episode(&pid),
+                                    dangerous_inner_html: ICON_PREV,
+                                }
+                            }
+                            button {
+                                class: "player-btn play-btn",
+                                r#type: "button",
+                                dangerous_inner_html: ICON_PLAY,
+                            }
+                            if let Some(nid) = next_id {
+                                button {
+                                    class: "player-btn next-ep-btn",
+                                    r#type: "button",
+                                    title: "Next episode",
+                                    onclick: move |_| navigate_to_episode(&nid),
+                                    dangerous_inner_html: ICON_NEXT,
+                                }
+                            }
+                        }
                     }
                     span { class: "player-time",
                         span { class: "time-cur", "0:00" }
@@ -909,6 +1019,20 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             }
         }
     }
+}
+
+/// Navigate to a different episode by triggering a real page load. The
+/// soft-nav path (router `Link` to `Route::MediaPlay`) only updates the
+/// URL without unmounting `VideoPlayer`, so its captured `id`-derived
+/// resources (`stream_src`, subtitles, tech probe) stay locked to the
+/// first episode. A full reload guarantees a clean component tree for
+/// the new id; the cost is minor since loading the next episode involves
+/// a fresh stream + probe round-trip anyway.
+fn navigate_to_episode(id: &str) {
+    let js = format!("window.location.assign('/media/{id}/play');");
+    spawn(async move {
+        let _ = document::eval(&js).await;
+    });
 }
 
 #[derive(Clone, Copy, PartialEq)]

@@ -317,19 +317,26 @@ fn handle_broadcast(ctx: RoomContext, b: Broadcast, seq: &mut u64) {
 
 // ---------- components (both targets) ----------
 
-/// Watches `pending_nav` and drives the router. Must be mounted inside the
-/// Router subtree so `use_navigator()` works.
+/// Watches `pending_nav` and drives navigation. Uses a hard page load
+/// rather than the router's soft-nav: `VideoPlayer` captures its `id`
+/// at mount and derives `stream_src` / subtitles / tech probe from that
+/// captured value, so a soft `nav.push` updates the URL but leaves the
+/// player wired to the previous episode. A full load remounts the
+/// component tree against the new id, which is what we actually want
+/// when a remote room mate switches what's playing.
 #[component]
 pub fn RoomNavigator() -> Element {
     let ctx = use_room_context();
-    let nav = use_navigator();
 
     use_effect(move || {
         let target = ctx.pending_nav.read().clone();
         if let Some(media_id) = target {
             ctx.set_pending_nav(None);
             ctx.set_last_applied(Some(media_id.clone()));
-            nav.push(crate::app::Route::MediaPlay { id: media_id });
+            let js = format!("window.location.assign('/media/{media_id}/play');");
+            spawn(async move {
+                let _ = document::eval(&js).await;
+            });
         }
     });
 
