@@ -185,7 +185,7 @@ impl ProducerHandle {
         // backpressure — a stopped process can still receive SIGKILL,
         // but resuming it first lets the kernel clean up cleanly.
         if let Some(pid) = self.child.id() {
-            let _ = signal_resume(pid).await;
+            let _ = signal_resume(pid);
         }
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
@@ -259,7 +259,7 @@ pub async fn ensure_segment(
             *h.last_request_at.write().await = Instant::now();
             if h.paused.load(Ordering::Acquire) {
                 if let Some(pid) = h.child.id() {
-                    let _ = signal_resume(pid).await;
+                    let _ = signal_resume(pid);
                     h.paused.store(false, Ordering::Release);
                 }
             }
@@ -706,16 +706,24 @@ fn spawn_reaper(
             let is_paused = paused.load(Ordering::Acquire);
             if !is_paused && h >= target {
                 if let Some(pid) = current_pid(&slot, &head).await {
-                    if signal_pause(pid).await.is_ok() {
-                        paused.store(true, Ordering::Release);
-                        tracing::debug!(media = %media_id, head = h, target, "paused producer");
+                    match signal_pause(pid) {
+                        Ok(()) => {
+                            paused.store(true, Ordering::Release);
+                            tracing::debug!(media = %media_id, head = h, target, "paused producer");
+                        }
+                        Err(e) => tracing::warn!(media = %media_id, pid, error = %e,
+                            "failed to SIGSTOP producer; backpressure not engaging"),
                     }
                 }
             } else if is_paused && target > h {
                 if let Some(pid) = current_pid(&slot, &head).await {
-                    if signal_resume(pid).await.is_ok() {
-                        paused.store(false, Ordering::Release);
-                        tracing::debug!(media = %media_id, head = h, target, "resumed producer");
+                    match signal_resume(pid) {
+                        Ok(()) => {
+                            paused.store(false, Ordering::Release);
+                            tracing::debug!(media = %media_id, head = h, target, "resumed producer");
+                        }
+                        Err(e) => tracing::warn!(media = %media_id, pid, error = %e,
+                            "failed to SIGCONT producer"),
                     }
                 }
             }
@@ -798,38 +806,36 @@ async fn atomic_link_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-async fn signal_pause(pid: u32) -> std::io::Result<()> {
-    run_kill(pid, "-STOP").await
+fn signal_pause(pid: u32) -> std::io::Result<()> {
+    send_signal(pid, libc::SIGSTOP)
 }
 
 #[cfg(unix)]
-async fn signal_resume(pid: u32) -> std::io::Result<()> {
-    run_kill(pid, "-CONT").await
+fn signal_resume(pid: u32) -> std::io::Result<()> {
+    send_signal(pid, libc::SIGCONT)
 }
 
+// Direct syscall instead of shelling out to /bin/kill: minimal container
+// images (distroless, scratch + ffmpeg static, alpine without procps) often
+// lack the `kill` binary even when signals work fine, and a silent
+// Command::new("kill") failure leaves backpressure disabled with no obvious
+// cause.
 #[cfg(unix)]
-async fn run_kill(pid: u32, sig: &str) -> std::io::Result<()> {
-    let status = tokio::process::Command::new("kill")
-        .arg(sig)
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .status()
-        .await?;
-    if !status.success() {
-        return Err(std::io::Error::other(format!("kill {sig} {pid} failed")));
-    }
-    Ok(())
+fn send_signal(pid: u32, sig: i32) -> std::io::Result<()> {
+    // SAFETY: libc::kill is async-signal-safe and just takes pid_t + signum.
+    // pid was obtained from Child::id() while the child was live; if the
+    // child has since exited the kernel returns ESRCH, surfaced as io::Error.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 #[cfg(not(unix))]
-async fn signal_pause(_pid: u32) -> std::io::Result<()> {
+fn signal_pause(_pid: u32) -> std::io::Result<()> {
     Err(std::io::Error::other("pause not supported on this platform"))
 }
 
 #[cfg(not(unix))]
-async fn signal_resume(_pid: u32) -> std::io::Result<()> {
+fn signal_resume(_pid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -859,8 +865,11 @@ pub async fn sweep_orphan_ffmpegs() {
     let mut killed = 0;
     for line in stdout.lines() {
         let Ok(pid) = line.trim().parse::<u32>() else { continue };
-        let _ = run_kill(pid, "-CONT").await;
-        if run_kill(pid, "-KILL").await.is_ok() {
+        // SIGCONT first in case the orphan inherited a SIGSTOP from us;
+        // a stopped process can technically receive SIGKILL but resuming
+        // it first lets the kernel clean up cleanly.
+        let _ = send_signal(pid, libc::SIGCONT);
+        if send_signal(pid, libc::SIGKILL).is_ok() {
             killed += 1;
         }
     }
