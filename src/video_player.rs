@@ -329,6 +329,8 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // mount when the element doesn't exist yet. `initControls` is
     // idempotent, so re-running on subsequent src changes is safe.
     let id_for_resume = id.clone();
+    #[cfg_attr(not(feature = "web"), allow(unused_variables))]
+    let room_ctx = crate::syncplay_client::use_room_context();
     use_effect(move || {
         let src = stream_src.read().clone();
         if src.is_empty() { return; }
@@ -371,6 +373,18 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                         "window.binkflixPlayer?.seekTo('{video_dom_id}', {live_pos});"
                     );
                     let _ = document::eval(&js).await;
+                } else if room_ctx
+                    .current
+                    .peek()
+                    .as_ref()
+                    .map(|s| s.media_id == id_for_resume && room_ctx.room_id.peek().is_some())
+                    .unwrap_or(false)
+                {
+                    // We're in a watch party currently watching this media —
+                    // the room's broadcast position is authoritative. Skip
+                    // the saved-progress restore so we don't snap back to
+                    // where this user was *last time alone*; the syncplay
+                    // bridge's "initial catch-up" lands us at the live spot.
                 } else if let Ok(Some(p)) = get_progress(&id_for_resume).await {
                     if !p.completed && p.position_secs > 5.0 {
                         let js = format!(

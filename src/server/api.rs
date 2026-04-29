@@ -75,7 +75,7 @@ async fn list_rooms(
 ) -> Result<Json<Vec<crate::types::RoomListItem>>> {
     let rooms = state.hub.list_rooms();
     let mut out = Vec::with_capacity(rooms.len());
-    for (meta, room_state, viewers) in rooms {
+    for (meta, room_state, viewers, members) in rooms {
         let (current_media_id, current_media_title) = match room_state {
             Some(s) => {
                 let title: Option<(String,)> = sqlx::query_as(
@@ -93,6 +93,7 @@ async fn list_rooms(
             viewers,
             current_media_id,
             current_media_title,
+            members,
         });
     }
     Ok(Json(out))
