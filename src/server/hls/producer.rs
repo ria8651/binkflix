@@ -76,7 +76,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -367,14 +367,50 @@ async fn launch_producer(
         target_idx, ff_start_idx, start_t,
         "launching producer ffmpeg"
     );
-    let mut child = spawn_ffmpeg(&ctx, ff_start_idx, start_t, &run_dir)?;
+    let (mut child, argv) = spawn_ffmpeg(&ctx, ff_start_idx, start_t, &run_dir)?;
+
+    // Persist the exact ffmpeg invocation per plan so a future failure
+    // can be diagnosed without scraping container logs — "ask the user
+    // to send me <plan_dir>/ffmpeg.cmd and ffmpeg.log".
+    let cmd_path = ctx.plan_dir.join("ffmpeg.cmd");
+    if let Err(e) = tokio::fs::write(&cmd_path, format_argv(&argv)).await {
+        tracing::warn!(error = %e, path = %cmd_path.display(), "failed to write ffmpeg.cmd");
+    }
 
     if let Some(stderr) = child.stderr.take() {
         let id = ctx.media_id.clone();
+        let log_path = ctx.plan_dir.join("ffmpeg.log");
         tokio::spawn(async move {
+            // Truncate per run — last run wins. The watcher already
+            // delivers the previous run's segments to canonical before
+            // a new producer launches, so the only consumer of
+            // ffmpeg.log is the *current* run's diagnostics.
+            let mut log = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .await
+            {
+                Ok(f) => Some(BufWriter::new(f)),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %log_path.display(), "failed to open ffmpeg.log");
+                    None
+                }
+            };
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(target: "binkflix::hls::ffmpeg", media = %id, "{line}");
+                if let Some(w) = log.as_mut() {
+                    if w.write_all(line.as_bytes()).await.is_err()
+                        || w.write_all(b"\n").await.is_err()
+                    {
+                        log = None;
+                    }
+                }
+            }
+            if let Some(mut w) = log {
+                let _ = w.flush().await;
             }
         });
     }
@@ -424,7 +460,7 @@ fn spawn_ffmpeg(
     start_idx: u32,
     start_t: f64,
     run_dir: &Path,
-) -> anyhow::Result<Child> {
+) -> anyhow::Result<(Child, Vec<String>)> {
     // Common preamble + HLS muxer flags. Codec args (video copy vs
     // libx264) come from `apply_video_args` based on plan mode. Key
     // shared pieces:
@@ -445,6 +481,14 @@ fn spawn_ffmpeg(
         .arg("-hide_banner")
         .arg("-loglevel").arg("warning")
         .arg("-nostdin")
+        // Generous probe defaults: matroska sources with many streams
+        // (multi-audio, fonts, attachments) can need >5MB to resolve all
+        // codec parameters. ffmpeg's default warning ("Consider
+        // increasing analyzeduration / probesize") shows up routinely;
+        // bump both so the input demuxer has stable codec params before
+        // the output muxer starts writing init.mp4.
+        .arg("-analyzeduration").arg("10M")
+        .arg("-probesize").arg("50M")
         .arg("-ss").arg(format!("{start_t:.6}"))
         .arg("-copyts")
         .arg("-i").arg(&ctx.source)
@@ -473,8 +517,51 @@ fn spawn_ffmpeg(
     #[cfg(unix)]
     setup_pdeath_unix(&mut cmd);
 
-    cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg: {e}"))
+    let argv = collect_argv(&cmd);
+    let child = cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg: {e}"))?;
+    Ok((child, argv))
+}
+
+/// Snapshot the program + args of a built `Command` as plain strings
+/// (lossy on non-UTF-8) so we can persist them next to the run for
+/// post-mortem inspection.
+fn collect_argv(cmd: &Command) -> Vec<String> {
+    let std_cmd = cmd.as_std();
+    let mut argv = Vec::with_capacity(1 + std_cmd.get_args().len());
+    argv.push(std_cmd.get_program().to_string_lossy().into_owned());
+    for a in std_cmd.get_args() {
+        argv.push(a.to_string_lossy().into_owned());
+    }
+    argv
+}
+
+/// Render argv as a single shell-friendly line. Args containing spaces
+/// or shell metacharacters get single-quoted; embedded single quotes
+/// become `'\''`. Output is meant for human-readable diagnosis (paste
+/// into a terminal), not for re-execution by another tool.
+fn format_argv(argv: &[String]) -> String {
+    let mut out = String::new();
+    for (i, a) in argv.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if a.is_empty() || a.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\'' | '"' | '\\' | '$' | '`' | '*' | '?' | '[' | ']' | '(' | ')' | '<' | '>' | '|' | '&' | ';' | '#' | '!')) {
+            out.push('\'');
+            for ch in a.chars() {
+                if ch == '\'' {
+                    out.push_str("'\\''");
+                } else {
+                    out.push(ch);
+                }
+            }
+            out.push('\'');
+        } else {
+            out.push_str(a);
+        }
+    }
+    out.push('\n');
+    out
 }
 
 fn apply_video_args(cmd: &mut Command, mode: &Mode) {
@@ -486,7 +573,13 @@ fn apply_video_args(cmd: &mut Command, mode: &Mode) {
             // `scale=-2:'min(H,ih)'` keeps source aspect, never
             // upscales, and the `-2` rounds width to the nearest even
             // multiple (libx264 + yuv420p require even dimensions).
-            let vf = format!("scale=-2:'min({max_height},ih)'");
+            // The trailing `format=yuv420p` runs the 10-bit→8-bit
+            // conversion *inside* the filter graph rather than relying
+            // on `-pix_fmt`'s implicit auto-insertion. On 10-bit HEVC
+            // (yuv420p10le) sources this gives libx264 a deterministic
+            // 8-bit input and avoids HDR metadata leaking into the SPS
+            // emitted into init.mp4.
+            let vf = format!("scale=-2:'min({max_height},ih)':flags=lanczos,format=yuv420p");
             let maxrate = bitrate_kbps.saturating_mul(15) / 10; // 1.5×
             let bufsize = bitrate_kbps.saturating_mul(2);
             // `force_key_frames "expr:gte(t,n_forced*6)"` makes ffmpeg
@@ -880,3 +973,27 @@ pub async fn sweep_orphan_ffmpegs() {
 
 #[cfg(not(unix))]
 pub async fn sweep_orphan_ffmpegs() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_argv_quotes_paths_with_spaces() {
+        let argv = vec![
+            "ffmpeg".to_string(),
+            "-i".to_string(),
+            "/srv/My Movies/it's a film.mkv".to_string(),
+            "-c:v".to_string(),
+            "libx264".to_string(),
+        ];
+        let out = format_argv(&argv);
+        // Path with spaces and a single quote gets single-quoted with
+        // the embedded `'` rendered as `'\''`.
+        assert!(out.contains("'/srv/My Movies/it'\\''s a film.mkv'"));
+        // Plain args stay unquoted.
+        assert!(out.starts_with("ffmpeg -i "));
+        assert!(out.contains(" -c:v libx264"));
+        assert!(out.ends_with('\n'));
+    }
+}
