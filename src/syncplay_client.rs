@@ -143,15 +143,19 @@ impl RoomContext {
 
     /// Push a toast into the events feed, trimming to the last 16. Counter is
     /// kept on `events.len()` plus a high-water mark we hide on the entry.
-    #[cfg(feature = "web")]
     pub fn push_event(&self, text: String) {
-        let mut this = *self;
-        let mut q = this.events.write();
-        let next_id = q.back().map(|e| e.id + 1).unwrap_or(1);
-        q.push_back(RoomEvent { id: next_id, text });
-        while q.len() > 16 {
-            q.pop_front();
+        #[cfg(feature = "web")]
+        {
+            let mut this = *self;
+            let mut q = this.events.write();
+            let next_id = q.back().map(|e| e.id + 1).unwrap_or(1);
+            q.push_back(RoomEvent { id: next_id, text });
+            while q.len() > 16 {
+                q.pop_front();
+            }
         }
+        #[cfg(not(feature = "web"))]
+        let _ = text;
     }
 }
 
@@ -506,25 +510,18 @@ fn fmt_position(ms: i64) -> String {
 
 // ---------- components (both targets) ----------
 
-/// Watches `pending_nav` and drives navigation. Uses a hard page load
-/// rather than the router's soft-nav: `VideoPlayer` captures its `id`
-/// at mount and derives `stream_src` / subtitles / tech probe from that
-/// captured value, so a soft `nav.push` updates the URL but leaves the
-/// player wired to the previous episode. A full load remounts the
-/// component tree against the new id, which is what we actually want
-/// when a remote room mate switches what's playing.
+/// Watches `pending_nav` and drives the router. Must be mounted inside the
+/// Router subtree so `use_navigator()` works.
 #[component]
 pub fn RoomNavigator() -> Element {
     let ctx = use_room_context();
+    let nav = use_navigator();
 
     use_effect(move || {
         let target = ctx.pending_nav.read().clone();
         if let Some(media_id) = target {
             ctx.set_pending_nav(None);
-            let js = format!("window.location.assign('/media/{media_id}/play');");
-            spawn(async move {
-                let _ = document::eval(&js).await;
-            });
+            nav.push(crate::app::Route::MediaPlay { id: media_id });
         }
     });
 
@@ -734,28 +731,63 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
         let handle_slot: Rc<RefCell<Option<ListenerHandle>>> =
             use_hook(|| Rc::new(RefCell::new(None)));
 
-        // Announce what this tab is playing. Subscribes to `room_id` (so
-        // joining mid-playback fires) and to the current room state's media
-        // id (so we don't re-announce media we were navigated to).
-        {
-            let media_id = media_id.clone();
-            use_effect(move || {
-                let in_room = ctx.room_id.read().is_some();
-                if !in_room {
-                    return;
+        // Announce what this tab is playing. The bridge is keyed on
+        // `media_id` from `MediaPlay`, so a different episode triggers a
+        // remount with `media_id` already updated to the new episode —
+        // this effect re-runs from a clean slate. Gating:
+        //   * `room_id`     — only fires when actually in a room
+        //   * `me`          — Welcome has landed (so `current` reflects
+        //                     the room's authoritative state, not our
+        //                     pre-Welcome empty default)
+        //   * `pending_nav` — RoomNavigator is mid-flight pulling us to
+        //                     the room's media; wait for that to settle
+        //                     so we don't override the room with our
+        //                     still-old media in the gap.
+        //   * `current.media_id == mine` — already in sync, nothing to do
+        // What's left:
+        //   - Empty room, we're first-in → announce.
+        //   - User soft-nav'd to a new episode while in-room → announce
+        //     (peers will follow via the same SetMedia broadcast).
+        let media_id_for_announce = media_id.clone();
+        let video_dom_id_for_announce = video_dom_id.clone();
+        use_effect(move || {
+            let in_room = ctx.room_id.read().is_some();
+            if !in_room {
+                return;
+            }
+            let welcomed = ctx.me.read().is_some();
+            if !welcomed {
+                return;
+            }
+            if ctx.pending_nav.read().is_some() {
+                return;
+            }
+            let already_set = ctx
+                .current
+                .read()
+                .as_ref()
+                .map(|s| s.media_id == media_id_for_announce)
+                .unwrap_or(false);
+            if already_set {
+                return;
+            }
+            ctx.send(ClientMsg::SetMedia { media_id: media_id_for_announce.clone() });
+            // SetMedia leaves the server's position at 0 by design (a fresh
+            // room starts at the beginning). For the case where the user
+            // creates a room while *already mid-playback*, the autoplay
+            // "play" DOM event fired before the bridge's listeners were
+            // attached, so we never reported the position. Push it now so
+            // late joiners' Welcome carries the real position projected
+            // forward, instead of warping them back to 0.
+            if let Some(v) = lookup_video(&video_dom_id_for_announce) {
+                let pos_ms = (v.current_time() * 1000.0) as i64;
+                if !v.paused() && pos_ms > 0 {
+                    ctx.send(ClientMsg::Play { position_ms: pos_ms });
+                } else if v.paused() && pos_ms > 0 {
+                    ctx.send(ClientMsg::Pause { position_ms: pos_ms });
                 }
-                let already_set = ctx
-                    .current
-                    .read()
-                    .as_ref()
-                    .map(|s| s.media_id == media_id)
-                    .unwrap_or(false);
-                if already_set {
-                    return;
-                }
-                ctx.send(ClientMsg::SetMedia { media_id: media_id.clone() });
-            });
-        }
+            }
+        });
 
         // Attach DOM event listeners. The <video> element is conditionally
         // rendered (VideoPlayer waits for tech probe + HLS attach), so a

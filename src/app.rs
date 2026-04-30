@@ -855,12 +855,37 @@ fn MediaPlay(id: String) -> Element {
         _ => Route::MediaDetail { id: id.clone() },
     };
 
+    // The `for` + keyed wrapper `div` exists to force a full unmount +
+    // remount of `VideoPlayer` and `SyncplayBridge` whenever `id` changes
+    // (prev/next-episode soft-nav, or remote SetMedia from a watch party).
+    // Dioxus 0.7's `key:` is only honoured inside a list context — on a
+    // lone child it's silently ignored — so we have to render the wrapper
+    // through a one-element iterator to put it in a list. With remount
+    // semantics, every id-derived piece of state inside the player
+    // (subtitle URLs, tech probe, stream src, `<video>` element, listener
+    // handles, last_applied caches) is automatically fresh per episode,
+    // and we don't have to add per-effect "did the id change?" gating.
+    // `display: contents` on the wrapper keeps it from affecting layout.
     rsx! {
         div { class: "player-fullpage",
-            VideoPlayer { id: id.clone(), back_route: back_route.clone() }
-            crate::syncplay_client::SyncplayBridge {
-                video_dom_id: "binkflix-video".to_string(),
-                media_id: id.clone(),
+            for episode_id in [id.clone()] {
+                {
+                    let back = back_route.clone();
+                    rsx! {
+                        div {
+                            key: "{episode_id}",
+                            class: "player-keyed",
+                            VideoPlayer {
+                                id: episode_id.clone(),
+                                back_route: back,
+                            }
+                            crate::syncplay_client::SyncplayBridge {
+                                video_dom_id: "binkflix-video".to_string(),
+                                media_id: episode_id.clone(),
+                            }
+                        }
+                    }
+                }
             }
         }
     }

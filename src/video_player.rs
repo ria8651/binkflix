@@ -54,6 +54,11 @@ const ICON_NEXT: &str = r#"<svg viewBox="0 0 24 24" width="20" height="20" fill=
 
 #[component]
 pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
+    // The component is keyed on `id` from `MediaPlay`, so a different
+    // episode triggers a full unmount + remount with fresh state. Inside
+    // the component we therefore treat `id` as a constant for the
+    // lifetime of this mount and just clone it where async closures need
+    // it; no signal-tracking or "did the id change?" gating is required.
     let id_for_subs = id.clone();
     let tracks = use_resource(move || {
         let id = id_for_subs.clone();
@@ -82,10 +87,10 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
 
     let apply_id = id.clone();
     let sub_command = use_memo(move || -> Option<SubCommand> {
-        let id = effective_id.read().clone()?;
+        let track_id = effective_id.read().clone()?;
         let tracks_read = tracks.read();
         let Some(Ok(list)) = &*tracks_read else { return None };
-        let track = list.iter().find(|t| t.id == id)?;
+        let track = list.iter().find(|t| t.id == track_id)?;
         Some(SubCommand {
             format: if track.format == "ass" { SubFormat::Ass } else { SubFormat::Vtt },
             url: media_subtitle_url(&apply_id, &track.id),
@@ -101,7 +106,6 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     let effective_audio = use_memo(move || -> u32 { audio_pick.read().unwrap_or(0) });
 
     let mut loading = use_signal(|| false);
-    let mut sub_error = use_signal(|| None::<String>);
     let mut last_applied = use_signal(|| None::<Option<SubCommand>>);
     // Use the Shell's shared OpenMenu context (rather than a local
     // signal) so the global pointerdown handler — which closes any
@@ -254,15 +258,15 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // drop the loop on unmount.
     let mut poll_alive = use_signal(|| true);
     use_drop(move || poll_alive.set(false));
+    // Polling task — depends on whether we're in the HLS pipeline, plus a
+    // generation counter so re-runs (e.g. probe-pending → probe-resolved
+    // toggles `effective_mode`) cancel the old spawned loop instead of
+    // running it in parallel with the new one. The loop reads audio /
+    // mode / bitrate / id via `peek()` each tick, so settings changes
+    // don't even need to re-fire the effect — and the active loop always
+    // queries with the current values.
     let id_for_hls_state = id.clone();
-    // Single long-lived polling task — depend only on whether we're in
-    // the HLS pipeline, *not* on audio/mode/bitrate, so changing any of
-    // those doesn't spawn a parallel loop. The loop reads the current
-    // values via `peek()` on each tick, so it always queries the right
-    // (audio, mode, bitrate) combination without re-firing the effect.
-    // (Earlier we captured these once at effect entry, which produced
-    // racing loops whenever the user touched the settings menu — the
-    // debug panel would alternate between stale snapshots.)
+    let mut hls_poll_gen = use_signal(|| 0u64);
     use_effect(move || {
         let in_pipeline = matches!(
             *effective_mode.read(),
@@ -271,12 +275,15 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         if !in_pipeline {
             return;
         }
+        let my_gen = *hls_poll_gen.peek() + 1;
+        hls_poll_gen.set(my_gen);
         #[cfg_attr(not(feature = "web"), allow(unused_variables))]
         let id = id_for_hls_state.clone();
         spawn(async move {
             #[cfg(feature = "web")]
             loop {
                 if !*poll_alive.peek() { break; }
+                if *hls_poll_gen.peek() != my_gen { break; }
                 let aidx = *effective_audio.peek();
                 let mode_str = match *effective_mode.peek() {
                     BrowserCompat::Transcode => "transcode",
@@ -299,14 +306,18 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // loop dies on unmount.
     #[cfg_attr(not(feature = "web"), allow(unused_mut))]
     let mut is_ended = use_signal(|| false);
+    let mut ended_poll_gen = use_signal(|| 0u64);
     use_effect(move || {
         if stream_src.read().is_empty() {
             return;
         }
+        let my_gen = *ended_poll_gen.peek() + 1;
+        ended_poll_gen.set(my_gen);
         spawn(async move {
             #[cfg(feature = "web")]
             loop {
                 if !*poll_alive.peek() { break; }
+                if *ended_poll_gen.peek() != my_gen { break; }
                 let mut eval = document::eval(&format!(
                     "dioxus.send(window.binkflixPlayer?.getPlaybackState('{video_dom_id}')?.ended ?? false);"
                 ));
@@ -339,6 +350,9 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         // mode flip) resumes where the user was. Returns 0 on the very
         // first attach since the element hasn't loaded anything yet —
         // we fall through to the saved-progress lookup in that case.
+        // (Episode changes don't go through this code path: the parent
+        // re-keys `VideoPlayer` on `id`, so a new episode = new mount =
+        // fresh `<video>` with currentTime 0.)
         let capture_js = format!(
             "dioxus.send(window.binkflixPlayer?.getPlaybackState('{video_dom_id}')?.currentTime ?? 0);"
         );
@@ -405,10 +419,13 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // and the next session can resume. Suppressed while paused (no
     // forward progress) and while duration is unknown (still loading).
     let id_for_heartbeat = id.clone();
+    let mut heartbeat_gen = use_signal(|| 0u64);
     use_effect(move || {
         if stream_src.read().is_empty() {
             return;
         }
+        let my_gen = *heartbeat_gen.peek() + 1;
+        heartbeat_gen.set(my_gen);
         let id = id_for_heartbeat.clone();
         spawn(async move {
             #[cfg(feature = "web")]
@@ -416,6 +433,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                 let mut last_pos: f64 = -1.0;
                 loop {
                     gloo_timers::future::TimeoutFuture::new(10_000).await;
+                    if *heartbeat_gen.peek() != my_gen { break; }
                     let mut eval = document::eval(&format!(
                         "dioxus.send(window.binkflixPlayer?.getPlaybackState('{video_dom_id}') || null);"
                     ));
@@ -512,7 +530,6 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         let show_spinner = cmd.is_some();
         if show_spinner {
             loading.set(true);
-            sub_error.set(None);
         }
         spawn(async move {
             let mut eval = document::eval(&js);
@@ -529,12 +546,12 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("unknown")
                             .to_string();
-                        sub_error.set(Some(msg));
+                        room_ctx.push_event(format!("⚠ subtitle: {msg}"));
                     }
                 }
                 Err(e) => {
                     if show_spinner {
-                        sub_error.set(Some(format!("eval failed: {e}")));
+                        room_ctx.push_event(format!("⚠ subtitle: eval failed: {e}"));
                     }
                 }
             }
@@ -700,10 +717,9 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                         div { class: "player-end-overlay", role: "dialog", "aria-label": "Up next",
                             div { class: "player-end-card",
                                 if let Some(nid) = next_for_end {
-                                    button {
+                                    Link {
+                                        to: crate::app::Route::MediaPlay { id: nid },
                                         class: "btn",
-                                        r#type: "button",
-                                        onclick: move |_| navigate_to_episode(&nid),
                                         span { dangerous_inner_html: ICON_NEXT }
                                         span { "Play next episode" }
                                     }
@@ -729,12 +745,11 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                         let (prev_id, next_id) = neighbors.read().clone();
                         rsx! {
                             if let Some(pid) = prev_id {
-                                button {
+                                Link {
+                                    to: crate::app::Route::MediaPlay { id: pid },
                                     class: "player-btn prev-ep-btn",
-                                    r#type: "button",
                                     title: "Previous episode",
-                                    onclick: move |_| navigate_to_episode(&pid),
-                                    dangerous_inner_html: ICON_PREV,
+                                    span { dangerous_inner_html: ICON_PREV }
                                 }
                             }
                             button {
@@ -743,12 +758,11 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                                 dangerous_inner_html: ICON_PLAY,
                             }
                             if let Some(nid) = next_id {
-                                button {
+                                Link {
+                                    to: crate::app::Route::MediaPlay { id: nid },
                                     class: "player-btn next-ep-btn",
-                                    r#type: "button",
                                     title: "Next episode",
-                                    onclick: move |_| navigate_to_episode(&nid),
-                                    dangerous_inner_html: ICON_NEXT,
+                                    span { dangerous_inner_html: ICON_NEXT }
                                 }
                             }
                         }
@@ -993,9 +1007,6 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                         dangerous_inner_html: ICON_FULLSCREEN,
                     }
                 }
-                if let Some(msg) = sub_error.read().clone() {
-                    div { class: "sub-error", title: "{msg}", "⚠ {msg}" }
-                }
             }
             // Floating debug panel. Lives outside .player-chrome so the
             // chrome's auto-hide opacity doesn't affect it — "always on"
@@ -1033,20 +1044,6 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             }
         }
     }
-}
-
-/// Navigate to a different episode by triggering a real page load. The
-/// soft-nav path (router `Link` to `Route::MediaPlay`) only updates the
-/// URL without unmounting `VideoPlayer`, so its captured `id`-derived
-/// resources (`stream_src`, subtitles, tech probe) stay locked to the
-/// first episode. A full reload guarantees a clean component tree for
-/// the new id; the cost is minor since loading the next episode involves
-/// a fresh stream + probe round-trip anyway.
-fn navigate_to_episode(id: &str) {
-    let js = format!("window.location.assign('/media/{id}/play');");
-    spawn(async move {
-        let _ = document::eval(&js).await;
-    });
 }
 
 #[derive(Clone, Copy, PartialEq)]
