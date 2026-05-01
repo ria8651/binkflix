@@ -566,6 +566,22 @@ function initControls(videoId) {
             case "f":
             case "F":
                 e.preventDefault(); onFsBtn(); bumpActive(); break;
+            case ",":
+            case ".": {
+                e.preventDefault();
+                const probed = parseFloat(video.dataset.fps);
+                const fps = (isFinite(probed) && probed > 0) ? probed : 24;
+                if (!isFinite(probed) || probed <= 0) {
+                    console.warn("[binkflix] frame-step: fps not yet probed, using 24 fps fallback", { dataFps: video.dataset.fps });
+                }
+                const dir = (e.key === ".") ? 1 : -1;
+                if (!video.paused) video.pause();
+                const t = video.currentTime + dir * (1 / fps);
+                const max = isFinite(video.duration) ? video.duration : Infinity;
+                video.currentTime = Math.max(0, Math.min(max, t));
+                bumpActive();
+                break;
+            }
         }
     };
     document.addEventListener("keydown", onKey);

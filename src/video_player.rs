@@ -624,12 +624,23 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
             // immediately on Chrome/Firefox.
             {
                 let src = stream_src.read().clone();
+                // Pull FPS from the tech probe so player.js's frame-step
+                // (`,` / `.`) keys know how big a frame is. Subscribe via
+                // `read()` so the attribute updates when the probe lands
+                // after the element is already mounted.
+                let fps_attr = tech.read().as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|info| info.video.as_ref())
+                    .and_then(|v| v.fps)
+                    .map(|f| format!("{f}"))
+                    .unwrap_or_default();
                 if !src.is_empty() {
                     rsx! {
                         video {
                             id: "{video_dom_id}",
                             autoplay: true,
                             preload: "metadata",
+                            "data-fps": "{fps_attr}",
                         }
                     }
                 } else {
