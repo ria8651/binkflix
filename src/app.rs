@@ -512,6 +512,23 @@ fn Home() -> Element {
                             }
                         }
                     }
+                    {
+                        let recent: Vec<RecentItem> = if q.is_empty() {
+                            lib.recently_added.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        (!recent.is_empty()).then(|| rsx! {
+                            section {
+                                h2 { class: "section", "Recently Added" }
+                                div { class: "grid grid-wide",
+                                    for item in recent {
+                                        RecentCard { key: "{item.media_id}", item }
+                                    }
+                                }
+                            }
+                        })
+                    }
                     if !shows.is_empty() {
                         section {
                             h2 { class: "section", "Shows" }
@@ -587,6 +604,43 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
                 "aria-label": "Mark as watched",
                 onclick: on_mark,
                 dangerous_inner_html: ICON_CHECK_BADGE,
+            }
+        }
+    }
+}
+
+#[component]
+fn RecentCard(item: RecentItem) -> Element {
+    // Episodes: 16:9 still + "Show — S1E2" subtitle. Movies: portrait poster.
+    let is_episode = item.show_id.is_some();
+    let route = Route::MediaPlay { id: item.media_id.clone() };
+    let card_class = if is_episode { "card card-wide" } else { "card" };
+    let subtitle = if is_episode {
+        let s = item.season_number.unwrap_or(0);
+        let e = item.episode_number.unwrap_or(0);
+        let prefix = item.show_title.clone().unwrap_or_default();
+        if prefix.is_empty() {
+            format!("S{s}E{e}")
+        } else {
+            format!("{prefix} · S{s}E{e}")
+        }
+    } else {
+        String::new()
+    };
+    rsx! {
+        article { class: "{card_class}",
+            Link { to: route, class: "card-link",
+                img {
+                    class: "poster",
+                    src: "{media_image_url(&item.media_id)}",
+                    loading: "lazy",
+                    decoding: "async",
+                    alt: "{item.title}",
+                }
+                h3 { class: "title", "{item.title}" }
+                if !subtitle.is_empty() {
+                    p { class: "year", "{subtitle}" }
+                }
             }
         }
     }

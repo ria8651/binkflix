@@ -17,10 +17,25 @@ pub struct ShowSummary {
     pub episode_count: i64,
 }
 
+/// One newly-added playable item — an episode or a movie. Episodes carry
+/// `show_id` + `show_title` so the home page card can show "Show — S1E2".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecentItem {
+    pub media_id: String,
+    /// "movie" | "episode"
+    pub kind: String,
+    pub title: String,
+    pub show_id: Option<String>,
+    pub show_title: Option<String>,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Library {
     pub movies: Vec<MovieSummary>,
     pub shows: Vec<ShowSummary>,
+    pub recently_added: Vec<RecentItem>,
 }
 
 /// A playable video — movie or episode. Episode-only fields are None for movies.

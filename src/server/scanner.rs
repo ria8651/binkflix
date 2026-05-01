@@ -50,6 +50,21 @@ fn mtime_secs(p: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+/// File mtime as a SQLite-compatible UTC timestamp ("YYYY-MM-DD HH:MM:SS"),
+/// falling back to "now" when the path can't be stat'd. Used as `added_at`
+/// at INSERT time so the "Recently Added" row reflects when files actually
+/// landed on disk, not when the scanner first noticed them.
+fn file_added_at(path: &Path) -> String {
+    let system_time = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok();
+    let dt: chrono::DateTime<chrono::Utc> = match system_time {
+        Some(t) => t.into(),
+        None => chrono::Utc::now(),
+    };
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 /// True if any file's mtime is newer than `last_scan`. Unparseable timestamps
 /// force a re-index (safer than skipping something stale).
 fn any_newer_than(files: &[&Path], last_scan: &str) -> bool {
@@ -219,6 +234,53 @@ struct AssetJob {
     has_sidecar_image: bool,
 }
 
+/// Populate `added_at` on rows that pre-date the column (NULL). Uses the
+/// file/folder mtime — the closest proxy we have for "when the user copied
+/// this in" — and falls back to `scanned_at` when the path is gone. No-op
+/// once every row has been backfilled.
+async fn backfill_added_at(pool: &SqlitePool) -> anyhow::Result<()> {
+    let shows: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id, path, scanned_at FROM shows WHERE added_at IS NULL")
+            .fetch_all(pool)
+            .await?;
+    for (id, path, scanned_at) in shows {
+        let added = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+            })
+            .unwrap_or(scanned_at);
+        sqlx::query("UPDATE shows SET added_at = ? WHERE id = ?")
+            .bind(added)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+
+    let media: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id, path, scanned_at FROM media WHERE added_at IS NULL")
+            .fetch_all(pool)
+            .await?;
+    for (id, path, scanned_at) in media {
+        let added = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Utc> = t.into();
+                dt.format("%Y-%m-%d %H:%M:%S").to_string()
+            })
+            .unwrap_or(scanned_at);
+        sqlx::query("UPDATE media SET added_at = ? WHERE id = ?")
+            .bind(added)
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 pub async fn scan_library_with_progress(
     pool: &SqlitePool,
     library_id: i64,
@@ -227,6 +289,7 @@ pub async fn scan_library_with_progress(
 ) -> anyhow::Result<ScanStats> {
     let started = std::time::Instant::now();
     info!(path = %root.display(), "scanning library");
+    backfill_added_at(pool).await?;
     let root_display = root.display().to_string();
     if let Some(p) = &progress {
         set_progress(p, |s| {
@@ -593,13 +656,14 @@ async fn upsert_show(
         .find(|u| u.kind.eq_ignore_ascii_case("tvdb"))
         .map(|u| u.value.clone());
 
+    let added_at = file_added_at(show_dir);
     sqlx::query(
         r#"
         INSERT INTO shows (
             id, library_id, path, title, sort_title, original_title, year, plot,
-            imdb_id, tmdb_id, tvdb_id, poster_path, fanart_path
+            imdb_id, tmdb_id, tvdb_id, poster_path, fanart_path, added_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
             sort_title = excluded.sort_title,
@@ -627,6 +691,7 @@ async fn upsert_show(
     .bind(&tvdb_id)
     .bind(&poster)
     .bind(&fanart)
+    .bind(&added_at)
     .execute(pool)
     .await?;
 
@@ -757,14 +822,15 @@ async fn upsert_episode(
         .map(|(id, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    let added_at = file_added_at(video);
     sqlx::query(
         r#"
         INSERT INTO media (
             id, library_id, kind, path, file_size,
             title, sort_title, plot, runtime_minutes, image_path,
-            show_id, season_number, episode_number
+            show_id, season_number, episode_number, added_at
         )
-        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'episode',
             title           = excluded.title,
@@ -797,6 +863,7 @@ async fn upsert_episode(
     .bind(show_id)
     .bind(season)
     .bind(episode)
+    .bind(&added_at)
     .execute(pool)
     .await?;
 
@@ -862,14 +929,15 @@ async fn upsert_movie(
         .map(|(id, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    let added_at = file_added_at(video);
     sqlx::query(
         r#"
         INSERT INTO media (
             id, library_id, kind, path, file_size,
             title, sort_title, original_title, year, plot, runtime_minutes,
-            imdb_id, tmdb_id, image_path, fanart_path
+            imdb_id, tmdb_id, image_path, fanart_path, added_at
         )
-        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'movie',
             title           = excluded.title,
@@ -904,6 +972,7 @@ async fn upsert_movie(
     .bind(nfo.tmdb_id())
     .bind(&image)
     .bind(&fanart)
+    .bind(&added_at)
     .execute(pool)
     .await?;
 

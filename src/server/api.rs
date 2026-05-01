@@ -127,11 +127,25 @@ pub struct ShowSummary {
     pub episode_count: i64,
 }
 
+#[derive(Debug, Serialize, FromRow)]
+pub struct RecentItem {
+    pub media_id: String,
+    pub kind: String,
+    pub title: String,
+    pub show_id: Option<String>,
+    pub show_title: Option<String>,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LibraryResponse {
     pub movies: Vec<MovieSummary>,
     pub shows: Vec<ShowSummary>,
+    pub recently_added: Vec<RecentItem>,
 }
+
+const RECENTLY_ADDED_LIMIT: i64 = 20;
 
 async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>> {
     let movies = sqlx::query_as::<_, MovieSummary>(
@@ -149,7 +163,39 @@ async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>>
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(Json(LibraryResponse { movies, shows }))
+    // Episode-level "Recently Added" — newly-added playable files sorted by
+    // file mtime captured at scan time. Episodes collapse per show (only the
+    // freshest one per series); movies stay one-per-row. ROW_NUMBER partitions
+    // episodes by `show_id` and movies by their own id (so they all rank 1).
+    let recently_added = sqlx::query_as::<_, RecentItem>(
+        "WITH ranked AS (
+             SELECT m.id, m.kind, m.title, m.show_id,
+                    m.season_number, m.episode_number,
+                    COALESCE(m.added_at, m.scanned_at) AS effective_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY CASE WHEN m.kind = 'episode' THEN m.show_id ELSE m.id END
+                        ORDER BY COALESCE(m.added_at, m.scanned_at) DESC, m.id DESC
+                    ) AS rn
+             FROM media m
+         )
+         SELECT r.id  AS media_id,
+                r.kind,
+                r.title,
+                r.show_id,
+                s.title AS show_title,
+                r.season_number,
+                r.episode_number
+         FROM ranked r
+         LEFT JOIN shows s ON s.id = r.show_id
+         WHERE r.rn = 1
+         ORDER BY r.effective_at DESC
+         LIMIT ?",
+    )
+    .bind(RECENTLY_ADDED_LIMIT)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(LibraryResponse { movies, shows, recently_added }))
 }
 
 // ---- Media (movie or episode) ----
