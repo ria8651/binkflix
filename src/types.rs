@@ -79,6 +79,12 @@ pub struct EpisodeSummary {
     pub title: String,
     pub plot: Option<String>,
     pub runtime_minutes: Option<i64>,
+    #[serde(default)]
+    pub position_secs: f64,
+    #[serde(default)]
+    pub duration_secs: f64,
+    #[serde(default)]
+    pub completed: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

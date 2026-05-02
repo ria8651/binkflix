@@ -385,6 +385,7 @@ h2.section {
     z-index: 2;
 }
 .card:hover .mark-watched,
+.episode:hover .mark-watched,
 .mark-watched:focus-visible {
     opacity: 1;
 }
@@ -392,7 +393,8 @@ h2.section {
     background: rgb(0 0 0 / 0.92);
     transform: scale(1.05);
 }
-.card .progress {
+.card .progress,
+.episode .progress {
     position: absolute;
     left: 0;
     right: 0;
@@ -400,7 +402,8 @@ h2.section {
     height: 3px;
     background: rgb(0 0 0 / 0.55);
 }
-.card .progress-bar {
+.card .progress-bar,
+.episode .progress-bar {
     height: 100%;
     background: var(--accent, #e50914);
 }
@@ -1202,6 +1205,11 @@ h2.section {
 .episode-link:hover {
     background: var(--bg-surface-hover);
     border-color: var(--border-raised);
+}
+.ep-thumb-wrap {
+    position: relative;
+    border-radius: var(--radius-row);
+    overflow: hidden;
 }
 .ep-thumb {
     width: 100%;
