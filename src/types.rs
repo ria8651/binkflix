@@ -29,6 +29,9 @@ pub struct RecentItem {
     pub show_title: Option<String>,
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
+    /// Release year for movies; used as the second-line subtitle so movie
+    /// tiles in the Recently Added row don't sit empty under the title.
+    pub year: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -353,6 +356,7 @@ pub struct ContinueItem {
 }
 
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
+pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn season_poster_url(show_id: &str, season: i64) -> String {
     format!("/api/shows/{show_id}/seasons/{season}/poster")
 }

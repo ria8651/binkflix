@@ -555,14 +555,64 @@ fn Home() -> Element {
     }
 }
 
+/// Whether a media tile should render the episode still directly (already
+/// 16:9) or letterbox a movie's portrait poster onto a blurred backdrop.
+#[derive(Clone, Copy, PartialEq)]
+enum LandscapeKind {
+    Episode,
+    Movie,
+}
+
+/// 16:9 image that prefers the movie's landscape `fanart` and falls back to
+/// the portrait poster letterboxed inside a blurred copy of itself. Episodes
+/// already ship a 16:9 sidecar still, so they render directly.
+#[component]
+fn LandscapeImage(media_id: String, alt: String, kind: LandscapeKind) -> Element {
+    match kind {
+        LandscapeKind::Episode => rsx! {
+            img {
+                class: "poster",
+                src: "{media_image_url(&media_id)}",
+                loading: "lazy",
+                decoding: "async",
+                alt: "{alt}",
+            }
+        },
+        LandscapeKind::Movie => {
+            // The server falls back from fanart → poster, so a single URL is
+            // safe for both layers. When fanart exists, both layers show the
+            // backdrop and the foreground covers the (identical) blurred
+            // background; when only the poster exists, the foreground sits
+            // letterboxed inside a blurred copy of itself.
+            rsx! {
+                div { class: "poster poster-letterbox",
+                    img {
+                        class: "poster-bg",
+                        src: "{media_fanart_url(&media_id)}",
+                        loading: "lazy",
+                        decoding: "async",
+                        "aria-hidden": "true",
+                    }
+                    img {
+                        class: "poster-fg",
+                        src: "{media_fanart_url(&media_id)}",
+                        loading: "lazy",
+                        decoding: "async",
+                        alt: "{alt}",
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
-    // Episodes render as landscape cards with the 16:9 sidecar still that
-    // ships next to the .mkv (or our generated thumbnail fallback).
-    // Movies keep the 2:3 poster.
-    let is_episode = item.show_id.is_some();
+    // Every tile is a 16:9 landscape card so the row reads uniformly. Episode
+    // stills come from the sidecar thumb; movie posters get letterboxed onto
+    // a blurred backdrop by `LandscapeImage`.
+    let kind = if item.show_id.is_some() { LandscapeKind::Episode } else { LandscapeKind::Movie };
     let route = Route::MediaPlay { id: item.media_id.clone() };
-    let card_class = if is_episode { "card card-wide" } else { "card" };
     let pct = if item.duration_secs > 0.0 {
         (item.position_secs / item.duration_secs * 100.0).clamp(0.0, 100.0)
     } else {
@@ -580,15 +630,13 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
         });
     };
     rsx! {
-        article { class: "{card_class}",
+        article { class: "card card-wide",
             Link { to: route, class: "card-link",
                 div { class: "poster-wrap",
-                    img {
-                        class: "poster",
-                        src: "{media_image_url(&item.media_id)}",
-                        loading: "lazy",
-                        decoding: "async",
-                        alt: "{item.title}",
+                    LandscapeImage {
+                        media_id: item.media_id.clone(),
+                        alt: item.title.clone(),
+                        kind,
                     }
                     if pct > 0.0 {
                         div { class: "progress",
@@ -611,10 +659,11 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
 
 #[component]
 fn RecentCard(item: RecentItem) -> Element {
-    // Episodes: 16:9 still + "Show — S1E2" subtitle. Movies: portrait poster.
+    // Episodes: 16:9 still + "Show · S1E2" subtitle.
+    // Movies: 16:9 fanart (or letterboxed poster) + year subtitle.
     let is_episode = item.show_id.is_some();
+    let kind = if is_episode { LandscapeKind::Episode } else { LandscapeKind::Movie };
     let route = Route::MediaPlay { id: item.media_id.clone() };
-    let card_class = if is_episode { "card card-wide" } else { "card" };
     let subtitle = if is_episode {
         let s = item.season_number.unwrap_or(0);
         let e = item.episode_number.unwrap_or(0);
@@ -625,17 +674,15 @@ fn RecentCard(item: RecentItem) -> Element {
             format!("{prefix} · S{s}E{e}")
         }
     } else {
-        String::new()
+        item.year.map(|y| y.to_string()).unwrap_or_default()
     };
     rsx! {
-        article { class: "{card_class}",
+        article { class: "card card-wide",
             Link { to: route, class: "card-link",
-                img {
-                    class: "poster",
-                    src: "{media_image_url(&item.media_id)}",
-                    loading: "lazy",
-                    decoding: "async",
-                    alt: "{item.title}",
+                LandscapeImage {
+                    media_id: item.media_id.clone(),
+                    alt: item.title.clone(),
+                    kind,
                 }
                 h3 { class: "title", "{item.title}" }
                 if !subtitle.is_empty() {

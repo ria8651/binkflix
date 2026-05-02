@@ -136,6 +136,7 @@ pub struct RecentItem {
     pub show_title: Option<String>,
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
+    pub year: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,7 +146,11 @@ pub struct LibraryResponse {
     pub recently_added: Vec<RecentItem>,
 }
 
-const RECENTLY_ADDED_LIMIT: i64 = 20;
+const RECENTLY_ADDED_LIMIT: i64 = 10;
+/// Items older than this drop off the "Recently Added" row entirely, even if
+/// the row isn't full — a show added six months ago shouldn't keep masquerading
+/// as fresh just because the library is small.
+const RECENTLY_ADDED_MAX_AGE_DAYS: i64 = 30;
 
 async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>> {
     let movies = sqlx::query_as::<_, MovieSummary>(
@@ -170,7 +175,7 @@ async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>>
     let recently_added = sqlx::query_as::<_, RecentItem>(
         "WITH ranked AS (
              SELECT m.id, m.kind, m.title, m.show_id,
-                    m.season_number, m.episode_number,
+                    m.season_number, m.episode_number, m.year,
                     COALESCE(m.added_at, m.scanned_at) AS effective_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY CASE WHEN m.kind = 'episode' THEN m.show_id ELSE m.id END
@@ -184,13 +189,16 @@ async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>>
                 r.show_id,
                 s.title AS show_title,
                 r.season_number,
-                r.episode_number
+                r.episode_number,
+                r.year
          FROM ranked r
          LEFT JOIN shows s ON s.id = r.show_id
          WHERE r.rn = 1
+           AND r.effective_at >= datetime('now', ?)
          ORDER BY r.effective_at DESC
          LIMIT ?",
     )
+    .bind(format!("-{RECENTLY_ADDED_MAX_AGE_DAYS} days"))
     .bind(RECENTLY_ADDED_LIMIT)
     .fetch_all(&state.pool)
     .await?;
@@ -408,8 +416,14 @@ async fn media_fanart(
     Path(id): Path<String>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    let path = lookup(&state, "SELECT fanart_path FROM media WHERE id = ?", &id).await?;
-    serve(path, req).await
+    // Fall back to the regular media image (movie poster / episode thumb) when
+    // no sidecar fanart exists, so callers can always use this endpoint and
+    // let the client decide how to letterbox the result.
+    match lookup(&state, "SELECT fanart_path FROM media WHERE id = ?", &id).await {
+        Ok(path) => serve(path, req).await,
+        Err(Error::NotFound) => media_image(State(state), Path(id), req).await,
+        Err(e) => Err(e),
+    }
 }
 
 async fn show_poster(

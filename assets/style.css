@@ -309,13 +309,13 @@ h2.section {
     overflow: hidden;
     text-overflow: ellipsis;
     margin: 0;
-    padding: var(--space-6) var(--space-6) 0;
+    padding: var(--space-4) var(--space-6) 0;
 }
 .card .year {
     color: var(--text-muted);
     font-size: var(--text-xs);
     margin: var(--space-2) 0 0;
-    padding: 0 var(--space-6) var(--space-7);
+    padding: 0 var(--space-6) var(--space-6);
 }
 
 /* Continue Watching uses landscape episode stills, so the row needs wider
@@ -326,12 +326,36 @@ h2.section {
 .card-wide .poster {
     aspect-ratio: 16 / 9;
 }
-/* Continue Watching cards have no `.year` line, so the title needs its
-   own bottom padding to match the breathing room on poster cards. */
-.card-wide .title {
-    padding-bottom: var(--space-7);
-}
 
+/* Letterboxed movie tile: shows fanart full-bleed when available, otherwise
+   the portrait poster centered (`object-fit: contain`) on a blurred,
+   over-scaled copy of the same image so empty bars never show as solid black.
+   `.poster-bg` and `.poster-fg` both load fanart and fall back to the poster
+   via an inline onerror handler — when fanart exists, the foreground covers
+   the (identical) blurred background and the blur is invisible. */
+.poster-letterbox {
+    position: relative;
+    overflow: hidden;
+    padding: 0;
+}
+.poster-letterbox > .poster-bg,
+.poster-letterbox > .poster-fg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    color: transparent;
+}
+.poster-letterbox > .poster-bg {
+    object-fit: cover;
+    filter: blur(24px) saturate(1.1);
+    /* Scale up so the blur edge doesn't bleed transparent pixels into the tile. */
+    transform: scale(1.15);
+}
+.poster-letterbox > .poster-fg {
+    object-fit: contain;
+}
 .card {
     position: relative;
 }

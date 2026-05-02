@@ -629,7 +629,9 @@ async fn upsert_show(
             .await?;
 
     if let Some((id, scanned_at)) = &existing {
-        if !any_newer_than(&[&nfo_path], scanned_at) {
+        // Track the show dir's mtime alongside the NFO so adding/removing
+        // poster.jpg or fanart.jpg also triggers a re-upsert.
+        if !any_newer_than(&[&nfo_path, show_dir], scanned_at) {
             return Ok((id.clone(), false));
         }
     }
@@ -782,6 +784,10 @@ async fn upsert_episode(
         if let Some(n) = nfo_opt.as_ref() {
             sources.push(n);
         }
+        // Parent dir mtime catches sidecar thumb add/remove.
+        if let Some(parent) = video.parent() {
+            sources.push(parent);
+        }
         if *existing_size == file_size && !any_newer_than(&sources, scanned_at) {
             // Unchanged — still report the id so the caller can decide.
             return Ok(Some(UpsertOutcome {
@@ -898,9 +904,18 @@ async fn upsert_movie(
             .await?;
 
     if let Some((id, scanned_at, existing_size)) = &existing {
+        // The video, the NFO, and any sidecar (poster / fanart / thumb) all
+        // affect what we'd write to the DB. Tracking the parent directory's
+        // mtime in addition to the video covers sidecar add/remove/replace —
+        // most filesystems bump the dir's mtime when a child is added or
+        // deleted, so we don't have to enumerate every possible sidecar
+        // candidate path.
         let mut sources: Vec<&Path> = vec![video];
         if let Some(n) = nfo_path.as_ref() {
             sources.push(n);
+        }
+        if let Some(parent) = video.parent() {
+            sources.push(parent);
         }
         if *existing_size == file_size && !any_newer_than(&sources, scanned_at) {
             return Ok(Some(UpsertOutcome {
