@@ -348,9 +348,16 @@ pub struct ProgressReport {
 pub struct ContinueItem {
     pub media_id: String,
     pub kind: String,
+    /// For episodes, the episode's own title; for movies, the movie title.
+    /// The client composes the second-line subtitle ("Show · S1E2" / year)
+    /// from the structured fields below.
     pub title: String,
     /// `Some` for episodes — use the show poster, not the episode thumb.
     pub show_id: Option<String>,
+    pub show_title: Option<String>,
+    pub season_number: Option<i64>,
+    pub episode_number: Option<i64>,
+    pub year: Option<i64>,
     pub position_secs: f64,
     pub duration_secs: f64,
 }

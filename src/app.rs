@@ -611,8 +611,21 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
     // Every tile is a 16:9 landscape card so the row reads uniformly. Episode
     // stills come from the sidecar thumb; movie posters get letterboxed onto
     // a blurred backdrop by `LandscapeImage`.
-    let kind = if item.show_id.is_some() { LandscapeKind::Episode } else { LandscapeKind::Movie };
+    let is_episode = item.show_id.is_some();
+    let kind = if is_episode { LandscapeKind::Episode } else { LandscapeKind::Movie };
     let route = Route::MediaPlay { id: item.media_id.clone() };
+    let subtitle = if is_episode {
+        let s = item.season_number.unwrap_or(0);
+        let e = item.episode_number.unwrap_or(0);
+        let prefix = item.show_title.clone().unwrap_or_default();
+        if prefix.is_empty() {
+            format!("S{s}E{e}")
+        } else {
+            format!("{prefix} · S{s}E{e}")
+        }
+    } else {
+        item.year.map(|y| y.to_string()).unwrap_or_default()
+    };
     let pct = if item.duration_secs > 0.0 {
         (item.position_secs / item.duration_secs * 100.0).clamp(0.0, 100.0)
     } else {
@@ -645,6 +658,9 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
                     }
                 }
                 h3 { class: "title", "{item.title}" }
+                if !subtitle.is_empty() {
+                    p { class: "year", "{subtitle}" }
+                }
             }
             button {
                 class: "mark-watched",

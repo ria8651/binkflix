@@ -150,6 +150,7 @@ struct CwRow {
     media_id: String,
     kind: String,
     title: String,
+    year: Option<i64>,
     show_id: Option<String>,
     show_title: Option<String>,
     season_number: Option<i64>,
@@ -177,6 +178,7 @@ pub async fn continue_watching(
         "SELECT m.id            AS media_id,
                 m.kind          AS kind,
                 m.title         AS title,
+                m.year          AS year,
                 m.show_id       AS show_id,
                 s.title         AS show_title,
                 m.season_number AS season_number,
@@ -212,6 +214,10 @@ pub async fn continue_watching(
                     kind: "movie".into(),
                     title: r.title,
                     show_id: None,
+                    show_title: None,
+                    season_number: None,
+                    episode_number: None,
+                    year: r.year,
                     position_secs: r.position_secs,
                     duration_secs: r.duration_secs,
                 });
@@ -221,18 +227,16 @@ pub async fn continue_watching(
                 if !seen_shows.insert(show_id.clone()) {
                     continue;
                 }
-                let show_title = r.show_title.clone().unwrap_or_default();
                 if r.completed == 0 {
                     out.push(ContinueItem {
                         media_id: r.media_id,
                         kind: "episode".into(),
-                        title: format_episode_title(
-                            &show_title,
-                            r.season_number,
-                            r.episode_number,
-                            &r.title,
-                        ),
+                        title: r.title,
                         show_id: Some(show_id),
+                        show_title: r.show_title,
+                        season_number: r.season_number,
+                        episode_number: r.episode_number,
+                        year: None,
                         position_secs: r.position_secs,
                         duration_secs: r.duration_secs,
                     });
@@ -250,13 +254,12 @@ pub async fn continue_watching(
                     out.push(ContinueItem {
                         media_id: next.id,
                         kind: "episode".into(),
-                        title: format_episode_title(
-                            &show_title,
-                            next.season_number,
-                            next.episode_number,
-                            &next.title,
-                        ),
+                        title: next.title,
                         show_id: Some(show_id),
+                        show_title: r.show_title,
+                        season_number: next.season_number,
+                        episode_number: next.episode_number,
+                        year: None,
                         position_secs: 0.0,
                         duration_secs: 0.0,
                     });
@@ -267,18 +270,6 @@ pub async fn continue_watching(
     }
 
     Ok(Json(out))
-}
-
-fn format_episode_title(
-    show: &str,
-    season: Option<i64>,
-    episode: Option<i64>,
-    ep_title: &str,
-) -> String {
-    match (season, episode) {
-        (Some(s), Some(e)) => format!("{show} — S{s}E{e:02} — {ep_title}"),
-        _ => format!("{show} — {ep_title}"),
-    }
 }
 
 async fn next_episode(
