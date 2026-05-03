@@ -5,7 +5,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Serialize;
 use sqlx::FromRow;
 use std::path::PathBuf;
@@ -264,6 +264,9 @@ pub struct EpisodeSummary {
     pub title: String,
     pub plot: Option<String>,
     pub runtime_minutes: Option<i64>,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub completed: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -278,7 +281,11 @@ pub struct ShowResponse {
     pub seasons: Vec<Season>,
 }
 
-async fn show(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<ShowResponse>> {
+async fn show(
+    State(state): State<AppState>,
+    Extension(session): Extension<super::auth::Session>,
+    Path(id): Path<String>,
+) -> Result<Json<ShowResponse>> {
     let show = sqlx::query_as::<_, Show>(
         "SELECT id, title, original_title, year, plot, imdb_id, tmdb_id, tvdb_id
          FROM shows WHERE id = ?",
@@ -289,14 +296,20 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>) -> Result<J
     .ok_or(Error::NotFound)?;
 
     let eps = sqlx::query_as::<_, EpisodeSummary>(
-        "SELECT id,
-                COALESCE(season_number, 0)  AS season_number,
-                COALESCE(episode_number, 0) AS episode_number,
-                title, plot, runtime_minutes
-         FROM media
-         WHERE show_id = ? AND kind = 'episode'
-         ORDER BY season_number, episode_number",
+        "SELECT m.id,
+                COALESCE(m.season_number, 0)  AS season_number,
+                COALESCE(m.episode_number, 0) AS episode_number,
+                m.title, m.plot, m.runtime_minutes,
+                COALESCE(wp.position_secs, 0.0) AS position_secs,
+                COALESCE(wp.duration_secs, 0.0) AS duration_secs,
+                COALESCE(wp.completed, 0)       AS completed
+         FROM media m
+         LEFT JOIN watch_progress wp
+           ON wp.media_id = m.id AND wp.user_sub = ?
+         WHERE m.show_id = ? AND m.kind = 'episode'
+         ORDER BY m.season_number, m.episode_number",
     )
+    .bind(&session.user_sub)
     .bind(&id)
     .fetch_all(&state.pool)
     .await?;

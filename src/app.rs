@@ -820,7 +820,7 @@ fn MediaDetail(id: String) -> Element {
 #[component]
 fn ShowDetail(id: String) -> Element {
     let id_clone = id.clone();
-    let detail = use_resource(move || {
+    let mut detail = use_resource(move || {
         let id = id_clone.clone();
         async move { get_show(&id).await }
     });
@@ -886,7 +886,11 @@ fn ShowDetail(id: String) -> Element {
                         }
                     }
                     if let Some(season) = active {
-                        SeasonBlock { key: "{season.number}", season }
+                        SeasonBlock {
+                            key: "{season.number}",
+                            season,
+                            on_change: move |_| detail.restart(),
+                        }
                     }
                 }
             }
@@ -916,12 +920,16 @@ fn default_season(seasons: &[Season]) -> i64 {
 }
 
 #[component]
-fn SeasonBlock(season: Season) -> Element {
+fn SeasonBlock(season: Season, on_change: EventHandler<()>) -> Element {
     rsx! {
         section { class: "season",
             div { class: "episode-list",
                 for ep in season.episodes.iter().cloned() {
-                    EpisodeRow { key: "{ep.id}", episode: ep }
+                    EpisodeRow {
+                        key: "{ep.id}",
+                        episode: ep,
+                        on_change: move |_| on_change.call(()),
+                    }
                 }
             }
         }
@@ -929,16 +937,53 @@ fn SeasonBlock(season: Season) -> Element {
 }
 
 #[component]
-fn EpisodeRow(episode: EpisodeSummary) -> Element {
+fn EpisodeRow(episode: EpisodeSummary, on_change: EventHandler<()>) -> Element {
+    let completed = episode.completed != 0;
+    let pct = if completed {
+        100.0
+    } else if episode.duration_secs > 0.0 {
+        (episode.position_secs / episode.duration_secs * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let media_id_for_mark = episode.id.clone();
+    let on_mark = move |evt: Event<MouseData>| {
+        // The button sits inside the row's <Link>, so both stop_propagation
+        // and prevent_default are needed to keep the click from navigating
+        // to the player.
+        evt.stop_propagation();
+        evt.prevent_default();
+        let id = media_id_for_mark.clone();
+        spawn(async move {
+            let _ = mark_watched(&id).await;
+            on_change.call(());
+        });
+    };
     rsx! {
         article { class: "episode",
             Link { to: Route::MediaPlay { id: episode.id.clone() }, class: "episode-link",
-                img {
-                    class: "ep-thumb",
-                    src: "{media_image_url(&episode.id)}",
-                    loading: "lazy",
-                    decoding: "async",
-                    alt: "",
+                div { class: "ep-thumb-wrap",
+                    img {
+                        class: "ep-thumb",
+                        src: "{media_image_url(&episode.id)}",
+                        loading: "lazy",
+                        decoding: "async",
+                        alt: "",
+                    }
+                    if pct > 0.0 {
+                        div { class: "progress",
+                            div { class: "progress-bar", style: "width: {pct}%;" }
+                        }
+                    }
+                    if !completed {
+                        button {
+                            class: "mark-watched",
+                            title: "Mark as watched",
+                            "aria-label": "Mark as watched",
+                            onclick: on_mark,
+                            dangerous_inner_html: ICON_CHECK_BADGE,
+                        }
+                    }
                 }
                 div { class: "ep-body",
                     h3 { class: "ep-title",
