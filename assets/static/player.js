@@ -658,6 +658,11 @@ function ensureStreamInfo(src) {
                 mode: r.headers.get("x-stream-mode"),
                 video_action: r.headers.get("x-stream-video"),
                 audio_action: r.headers.get("x-stream-audio"),
+                // Effective ffmpeg H.264 encoder for transcode mode.
+                // libx264 / h264_vaapi / h264_qsv / h264_videotoolbox.
+                // Absent for remux. Reflects the server's view *after*
+                // any sticky runtime fallback from a hw-startup failure.
+                encoder: r.headers.get("x-stream-encoder"),
                 status: r.status,
             });
         })
@@ -782,21 +787,30 @@ async function describeHttpError(resp) {
     return `Request failed (${resp.status}).`;
 }
 
-function attach(videoId, url) {
+function attach(videoId, url, opts) {
     // Serialize attach/detach through the same per-video queue the
     // subtitle code uses so a second `attach` arriving mid-`loadHlsJs`
     // can't race past the first and leave a second Hls instance
     // `attachMedia`-d to the same element (the first one's xhr loop +
     // event listeners would leak forever).
-    return run(videoId, () => attachInner(videoId, url));
+    return run(videoId, () => attachInner(videoId, url, opts));
 }
 
-async function attachInner(videoId, url) {
+async function attachInner(videoId, url, opts) {
     const video = getVideo(videoId);
     if (!video) return;
     const existing = attached.get(videoId);
     if (existing && existing.url === url) return; // already attached to this url
     detachSource(videoId);
+    // Optional initial-time hint. Used both as hls.js `startPosition` so
+    // the player fetches segments at the user's actual playback position
+    // from the first frame (no "play from 0 then seek to N" round-trip),
+    // and threaded into init.mp4 requests as `X-Player-Time` so the
+    // server can spawn its transcode producer at the right segment
+    // instead of seg 1.
+    const initialTime = Number.isFinite(opts?.initialTime) && opts.initialTime > 0
+        ? Number(opts.initialTime)
+        : 0;
 
     const isHls = /\.m3u8($|[?#])/.test(url);
 
@@ -818,7 +832,10 @@ async function attachInner(videoId, url) {
     }
 
     // Native HLS (Safari / iOS). Just set the src and let the browser
-    // handle playlist parsing + segment fetching.
+    // handle playlist parsing + segment fetching. The server emits
+    // `#EXT-X-START:TIME-OFFSET=<t>` in the m3u8 (driven by the `?t=`
+    // query the Rust side appends), so Safari aligns to the correct
+    // start position without any client-side fragment hack.
     if (isHls && video.canPlayType("application/vnd.apple.mpegurl")) {
         video.src = url;
         attached.set(videoId, { hls: null, url });
@@ -844,6 +861,14 @@ async function attachInner(videoId, url) {
         // so a long watch doesn't accumulate unbounded memory.
         lowLatencyMode: false,
         backBufferLength: 90,
+        // Belt-and-braces alignment of the first segment fetch when the
+        // user is resuming from non-zero. The primary mechanism is the
+        // server's `#EXT-X-START:TIME-OFFSET=<t>` in the m3u8 (driven
+        // by the `?t=` query the Rust side appends to the URL); both
+        // modern hls.js and Safari respect that. `startPosition` is
+        // here as a fallback for older hls.js (<1.4) or embedded
+        // WebViews that ignore EXT-X-START.
+        startPosition: initialTime > 0 ? initialTime : -1,
     });
     // hls.js errors: non-fatal go to console (library handles them),
     // fatal surface to the overlay. We previously auto-retried MEDIA
@@ -868,6 +893,15 @@ async function attachInner(videoId, url) {
     });
     hls.loadSource(url);
     hls.attachMedia(video);
+    // Explicit startLoad after attachMedia ensures hls.js uses our
+    // start position rather than its default of 0. The Hls constructor
+    // takes startPosition in its config, but in practice the library
+    // still issues a few seg-1/seg-2 fetches during initial manifest
+    // probing before honouring it. Calling startLoad explicitly with
+    // the position narrows that window.
+    if (initialTime > 0) {
+        try { hls.startLoad(initialTime); } catch (_) { /* ignore */ }
+    }
     attached.set(videoId, { hls, url });
 }
 

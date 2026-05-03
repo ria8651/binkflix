@@ -13,6 +13,7 @@ pub fn render_m3u8(
     audio_idx: u32,
     mode: Option<&str>,
     bitrate_kbps: Option<u32>,
+    time_offset: Option<f64>,
 ) -> String {
     let target = plan
         .segments
@@ -34,6 +35,19 @@ pub fn render_m3u8(
     let mut out = String::with_capacity(64 + plan.segments.len() * 48);
     out.push_str("#EXTM3U\n");
     out.push_str("#EXT-X-VERSION:7\n");
+    // Tell the player where the user wants to start. Both hls.js and
+    // Safari respect this and align their first segment fetch to the
+    // offset, which is what stops the server from spawning ffmpeg at
+    // seg 1 when the user is resuming at e.g. 27:54. PRECISE=YES means
+    // the player must not slide forward to the next IDR — segments are
+    // already keyframe-aligned at our 6s boundaries (HLS-fmp4 +
+    // independent_segments + force_key_frames at the producer), so
+    // there's no IDR for it to slide to anyway.
+    if let Some(t) = time_offset {
+        if t.is_finite() && t > 0.0 {
+            out.push_str(&format!("#EXT-X-START:TIME-OFFSET={t:.3},PRECISE=YES\n"));
+        }
+    }
     out.push_str(&format!("#EXT-X-TARGETDURATION:{target}\n"));
     out.push_str("#EXT-X-MEDIA-SEQUENCE:1\n");
     out.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
@@ -67,7 +81,7 @@ mod tests {
 
     #[test]
     fn renders_complete_vod_playlist() {
-        let s = render_m3u8(&sample_plan(), 0, None, None);
+        let s = render_m3u8(&sample_plan(), 0, None, None, None);
         assert!(s.starts_with("#EXTM3U\n"));
         assert!(s.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(s.contains("#EXT-X-MAP:URI=\"init.mp4?a=0\""));
@@ -80,13 +94,13 @@ mod tests {
     fn target_duration_covers_longest_segment() {
         let mut plan = sample_plan();
         plan.segments.push(Segment { i: 3, t: 12.0, d: 9.7 });
-        let s = render_m3u8(&plan, 0, None, None);
+        let s = render_m3u8(&plan, 0, None, None, None);
         assert!(s.contains("#EXT-X-TARGETDURATION:10"));
     }
 
     #[test]
     fn audio_idx_threads_into_segment_uris() {
-        let s = render_m3u8(&sample_plan(), 2, None, None);
+        let s = render_m3u8(&sample_plan(), 2, None, None, None);
         assert!(s.contains("#EXT-X-MAP:URI=\"init.mp4?a=2\""));
         assert!(s.contains("seg-00001.m4s?a=2"));
         assert!(s.contains("seg-00002.m4s?a=2"));
@@ -94,8 +108,22 @@ mod tests {
 
     #[test]
     fn mode_and_bitrate_thread_into_segment_uris() {
-        let s = render_m3u8(&sample_plan(), 0, Some("transcode"), Some(4000));
+        let s = render_m3u8(&sample_plan(), 0, Some("transcode"), Some(4000), None);
         assert!(s.contains("#EXT-X-MAP:URI=\"init.mp4?a=0&mode=transcode&bitrate=4000\""));
         assert!(s.contains("seg-00001.m4s?a=0&mode=transcode&bitrate=4000"));
+    }
+
+    #[test]
+    fn time_offset_emits_ext_x_start() {
+        let s = render_m3u8(&sample_plan(), 0, None, None, Some(7.5));
+        assert!(s.contains("#EXT-X-START:TIME-OFFSET=7.500,PRECISE=YES"));
+    }
+
+    #[test]
+    fn zero_or_negative_time_offset_is_omitted() {
+        let s_zero = render_m3u8(&sample_plan(), 0, None, None, Some(0.0));
+        let s_neg = render_m3u8(&sample_plan(), 0, None, None, Some(-1.0));
+        assert!(!s_zero.contains("EXT-X-START"));
+        assert!(!s_neg.contains("EXT-X-START"));
     }
 }

@@ -26,6 +26,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:trixie-slim AS runtime
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+    intel-media-va-driver-non-free vainfo \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
