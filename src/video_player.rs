@@ -180,8 +180,217 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // User-override on top of the server's compat verdict. `mode = None`
     // means "follow whatever the probe says"; explicit Some(...) pins one
     // of Direct/Remux/Transcode. `bitrate_kbps = None` means "Auto" —
-    // the server derives a bitrate from the source. Per-session only.
+    // the server derives a bitrate from the source.
+    //
+    // Hydrated from server-side prefs on mount (see prefs_resource +
+    // hydration effect below) so reopening an episode of the same show
+    // remembers the previous Mode/Bitrate choice.
     let mut playback_override = use_signal(|| PlaybackOverride { mode: None, bitrate_kbps: None });
+
+    // ---- Sticky playback prefs ----------------------------------------
+    // Scope key: episodes share preferences across the whole show
+    // (`show:<id>`); movies key by media id. Falls back to media id when
+    // an episode is missing show_id (an oddity, but safe).
+    let scope_key = use_memo(move || -> Option<String> {
+        let m = media_resource.read_unchecked().clone();
+        match m {
+            Some(Ok(m)) => {
+                if m.kind == "episode" {
+                    Some(
+                        m.show_id
+                            .clone()
+                            .map(|sid| format!("show:{sid}"))
+                            .unwrap_or_else(|| format!("media:{}", m.id)),
+                    )
+                } else {
+                    Some(format!("media:{}", m.id))
+                }
+            }
+            _ => None,
+        }
+    });
+
+    let prefs_resource = use_resource(move || {
+        let scope = scope_key.read().clone();
+        async move {
+            match scope {
+                Some(s) => get_preferences(&s).await.ok().flatten(),
+                // No scope yet (media_resource still in flight) — keep
+                // the resource pending instead of resolving to "no
+                // prefs". A premature `None` resolution would let the
+                // hydration effect race ahead and stick `hydrated=true`
+                // before the real fetch ever runs.
+                None => std::future::pending::<Option<MediaPreferences>>().await,
+            }
+        }
+    });
+
+    let mut hydrated = use_signal(|| false);
+    let mut last_saved = use_signal(MediaPreferences::default);
+
+    // Apply prefs once tech, tracks, and prefs have all resolved. We wait
+    // on tech and tracks so audio-index / subtitle-id matching has the
+    // real track lists to work against; otherwise we'd race the player
+    // mount and hand it stale defaults.
+    use_effect(move || {
+        if *hydrated.peek() {
+            return;
+        }
+        // Wait for scope_key first: until media_resource resolves, scope
+        // is None and prefs_resource short-circuits to a "ready, but
+        // empty" Some(None). Without this gate we'd hydrate that empty
+        // value (sticking hydrated=true), then ignore the real fetch
+        // that fires once scope finally lands.
+        if scope_key.read().is_none() {
+            return;
+        }
+        let prefs_ready = prefs_resource.read_unchecked().is_some();
+        let tracks_ready = tracks.read_unchecked().is_some();
+        let tech_ready = tech.read_unchecked().is_some();
+        if !prefs_ready || !tracks_ready || !tech_ready {
+            return;
+        }
+        let prefs = prefs_resource
+            .read_unchecked()
+            .clone()
+            .flatten()
+            .unwrap_or_default();
+
+        // Subtitle: empty stored id = explicit Off; otherwise prefer
+        // exact id match, fall back to language match.
+        let sub_tracks: Vec<SubtitleTrack> = match &*tracks.read_unchecked() {
+            Some(Ok(list)) => list.clone(),
+            _ => Vec::new(),
+        };
+        match prefs.subtitle_id.as_deref() {
+            None => {} // no pref — leave default behavior
+            Some("") => user_pick.set(Some(None)),
+            Some(id) => {
+                if sub_tracks.iter().any(|t| t.id == id) {
+                    user_pick.set(Some(Some(id.to_string())));
+                } else if let Some(lang) = prefs.subtitle_lang.as_deref() {
+                    if let Some(t) = sub_tracks.iter().find(|t| t.language == lang) {
+                        user_pick.set(Some(Some(t.id.clone())));
+                    }
+                }
+            }
+        }
+
+        // Audio: if the stored index resolves (and language, if stored,
+        // still matches) trust it; otherwise hop to the first track with
+        // the same language.
+        let audio_tracks: Vec<AudioTrackInfo> = match &*tech.read_unchecked() {
+            Some(Ok(info)) => info.audio.clone(),
+            _ => Vec::new(),
+        };
+        if let Some(idx) = prefs.audio_idx {
+            let lang = prefs.audio_lang.as_deref();
+            let chosen = audio_tracks.get(idx as usize).and_then(|t| {
+                let ok = match (lang, t.language.as_deref()) {
+                    (None, _) => true,
+                    (Some(a), Some(b)) => a == b,
+                    (Some(_), None) => false,
+                };
+                if ok { Some(idx) } else { None }
+            });
+            let chosen = chosen.or_else(|| {
+                lang.and_then(|l| {
+                    audio_tracks
+                        .iter()
+                        .position(|t| t.language.as_deref() == Some(l))
+                        .map(|i| i as u32)
+                })
+            });
+            if let Some(idx) = chosen {
+                audio_pick.set(Some(idx));
+            }
+        }
+
+        // Quality: apply mode + bitrate verbatim — these are about the
+        // user's network/device, not the file's tracks.
+        let mode = match prefs.transcode_mode.as_deref() {
+            Some("direct") => Some(BrowserCompat::Direct),
+            Some("remux") => Some(BrowserCompat::Remux),
+            Some("transcode") => Some(BrowserCompat::Transcode),
+            _ => None,
+        };
+        playback_override.set(PlaybackOverride { mode, bitrate_kbps: prefs.bitrate_kbps });
+
+        last_saved.set(prefs);
+        hydrated.set(true);
+    });
+
+    // Save on change. Subscribes to user_pick / audio_pick / override;
+    // builds a fresh prefs payload and POSTs only if it differs from the
+    // last-saved snapshot. The `hydrated` gate keeps the very first run
+    // (which fires as we apply hydrated values) from immediately echoing
+    // them back.
+    use_effect(move || {
+        if !*hydrated.read() {
+            return;
+        }
+        let Some(scope) = scope_key.read().clone() else { return };
+        let sub_tracks_snap: Vec<SubtitleTrack> = match &*tracks.read_unchecked() {
+            Some(Ok(list)) => list.clone(),
+            _ => Vec::new(),
+        };
+        let audio_tracks_snap: Vec<AudioTrackInfo> = match &*tech.read_unchecked() {
+            Some(Ok(info)) => info.audio.clone(),
+            _ => Vec::new(),
+        };
+
+        let (subtitle_id, subtitle_lang) = match user_pick.read().clone() {
+            None => (None, None),
+            Some(None) => (Some(String::new()), None),
+            Some(Some(id)) => {
+                let lang = sub_tracks_snap
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.language.clone());
+                (Some(id), lang)
+            }
+        };
+        let (audio_idx, audio_lang, audio_codec) = match *audio_pick.read() {
+            None => (None, None, None),
+            Some(i) => {
+                let info = audio_tracks_snap.get(i as usize);
+                (
+                    Some(i),
+                    info.and_then(|t| t.language.clone()),
+                    info.map(|t| t.codec.clone()),
+                )
+            }
+        };
+        let ovr = *playback_override.read();
+        let transcode_mode = ovr.mode.map(|m| match m {
+            BrowserCompat::Direct => "direct".to_string(),
+            BrowserCompat::Remux => "remux".to_string(),
+            BrowserCompat::Transcode => "transcode".to_string(),
+        });
+        let cur = MediaPreferences {
+            subtitle_id,
+            subtitle_lang,
+            audio_idx,
+            audio_lang,
+            audio_codec,
+            transcode_mode,
+            bitrate_kbps: ovr.bitrate_kbps,
+        };
+        if cur == *last_saved.peek() {
+            return;
+        }
+        last_saved.set(cur.clone());
+        spawn(async move {
+            #[cfg(feature = "web")]
+            {
+                let _ = set_preferences(&scope, &cur).await;
+            }
+            #[cfg(not(feature = "web"))]
+            {
+                let _ = (scope, cur);
+            }
+        });
+    });
 
     // Auto-pick: pick the simplest mode the file supports. Direct >
     // Remux > Transcode. Probe failure falls back to Direct so the
@@ -204,9 +413,13 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     let id_for_src = id.clone();
     let stream_src = use_memo(move || -> String {
         // Wait for the probe before setting a src — otherwise we'd hit
-        // `/stream` optimistically and risk a redirect/error race.
+        // `/stream` optimistically and risk a redirect/error race. Also
+        // wait for sticky-prefs hydration so we mount the <video> with
+        // the right audio track / mode / bitrate from the get-go (avoids
+        // a re-attach when the saved pref lands a beat after probe).
         let probed = matches!(&*tech.read_unchecked(), Some(_));
-        if !probed {
+        let hyd = *hydrated.read();
+        if !probed || !hyd {
             return String::new();
         }
         let aidx = *effective_audio.read();

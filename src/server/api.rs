@@ -36,6 +36,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/continue-watching", get(super::watch::continue_watching))
         .route("/api/media/{id}/watched", post(super::watch::mark_watched).delete(super::watch::mark_unwatched))
+        .route(
+            "/api/preferences/{scope}",
+            get(super::preferences::get_preferences).post(super::preferences::set_preferences),
+        )
 }
 
 async fn scan_status(State(state): State<AppState>) -> Json<crate::types::ScanProgress> {

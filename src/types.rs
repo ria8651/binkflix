@@ -362,6 +362,36 @@ pub struct ContinueItem {
     pub duration_secs: f64,
 }
 
+// ---- Per-user playback preferences (sticky audio/subtitle/quality picks) ----
+//
+// Keyed at the *show* level for episodes (so the choice carries across
+// episodes of one series) and at the media level for movies. The key is
+// computed client-side and sent as `scope` in the URL.
+//
+// All fields are optional: a `None` means "no preference, fall back to
+// the player's auto behaviour". Track-identifying fields are stored
+// alongside the index/id so the client can fall back to language matching
+// when stream order differs between episodes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MediaPreferences {
+    /// `Some("")` = explicit Off; `Some(id)` = pick by id; `None` = no pref.
+    #[serde(default)]
+    pub subtitle_id: Option<String>,
+    #[serde(default)]
+    pub subtitle_lang: Option<String>,
+    #[serde(default)]
+    pub audio_idx: Option<u32>,
+    #[serde(default)]
+    pub audio_lang: Option<String>,
+    #[serde(default)]
+    pub audio_codec: Option<String>,
+    /// "direct" | "remux" | "transcode" | None (= auto)
+    #[serde(default)]
+    pub transcode_mode: Option<String>,
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+}
+
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
 pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn season_poster_url(show_id: &str, season: i64) -> String {

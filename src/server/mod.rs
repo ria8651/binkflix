@@ -9,6 +9,7 @@ pub mod filename;
 pub mod hls;
 pub mod media_info;
 pub mod nfo;
+pub mod preferences;
 pub mod remux;
 pub mod scanner;
 pub mod subtitles;

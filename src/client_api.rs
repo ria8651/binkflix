@@ -172,3 +172,50 @@ pub async fn mark_watched(id: &str) -> Result<(), String> {
 pub async fn mark_watched(_id: &str) -> Result<(), String> {
     Err("client fetcher invoked on non-wasm target".to_string())
 }
+
+// ---- Sticky playback preferences (audio/subtitle/quality) ----
+//
+// Scope is opaque to the server: the player builds `show:<id>` for
+// episodes and `media:<id>` for movies. Encoded with encodeURIComponent
+// equivalent so the `:` survives transit.
+
+#[cfg(feature = "web")]
+fn encode_scope(scope: &str) -> String {
+    js_sys::encode_uri_component(scope).as_string().unwrap_or_else(|| scope.to_string())
+}
+
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub async fn get_preferences(scope: &str) -> Result<Option<MediaPreferences>, String> {
+    #[cfg(feature = "web")]
+    {
+        let s = encode_scope(scope);
+        return fetch_json(&format!("/api/preferences/{s}")).await;
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = scope;
+        Err("client fetcher invoked on non-wasm target".to_string())
+    }
+}
+
+#[cfg(feature = "web")]
+pub async fn set_preferences(scope: &str, prefs: &MediaPreferences) -> Result<(), String> {
+    let url = format!("/api/preferences/{}", encode_scope(scope));
+    let resp = gloo_net::http::Request::post(&url)
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(prefs).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| format!("network error hitting {url}: {e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("{url} returned HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+#[allow(dead_code)]
+pub async fn set_preferences(_scope: &str, _prefs: &MediaPreferences) -> Result<(), String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}
