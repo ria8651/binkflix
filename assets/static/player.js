@@ -483,6 +483,92 @@ function initControls(videoId) {
     scrub?.addEventListener("change", onScrubChange);
     scrub?.addEventListener("click", stopBubble);
     scrub?.addEventListener("pointerup", blurSelf);
+
+    // ── Scrub-bar preview thumbnails ───────────────────────────
+    //
+    // Lazy-fetch the trickplay manifest on first hover. If the server has
+    // no sprite (older media not yet re-scanned, sub-30s clip, ffmpeg
+    // failure) we mark unavailable and never retry. The sprite itself is
+    // referenced via background-image so the browser HTTP-caches it.
+    const previewWrap = wrap.querySelector(".player-scrub-preview");
+    const previewImg = wrap.querySelector(".player-scrub-preview-img");
+    const previewTime = wrap.querySelector(".player-scrub-preview-time");
+    const chrome = wrap.querySelector(".player-chrome");
+    const mediaId = video.dataset.mediaId || "";
+    let previewState = "idle"; // idle | loading | ready | unavailable
+    let previewManifest = null;
+
+    const ensurePreview = async () => {
+        if (previewState !== "idle" || !mediaId || !previewImg) return;
+        previewState = "loading";
+        try {
+            const r = await fetch(`/api/media/${encodeURIComponent(mediaId)}/trickplay.json`);
+            if (!r.ok) { previewState = "unavailable"; return; }
+            previewManifest = await r.json();
+            const { cols, rows, tile_w, tile_h, padding = 0 } = previewManifest;
+            // Sprite dims include `padding` px between cells (no margin).
+            // Stride is tile + padding; total = cols*stride - padding.
+            const sw = cols * (tile_w + padding) - padding;
+            const sh = rows * (tile_h + padding) - padding;
+            previewImg.style.backgroundImage =
+                `url(/api/media/${encodeURIComponent(mediaId)}/trickplay.jpg)`;
+            previewImg.style.backgroundSize = `${sw}px ${sh}px`;
+            previewImg.style.width = `${tile_w}px`;
+            previewImg.style.height = `${tile_h}px`;
+            previewState = "ready";
+        } catch (_) {
+            previewState = "unavailable";
+        }
+    };
+
+    const updatePreview = (clientX) => {
+        if (!scrub || !chrome) return;
+        const rect = scrub.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+        const dur = isFinite(video.duration) ? video.duration : 0;
+        const t = ratio * dur;
+        if (previewTime) previewTime.textContent = fmtTime(t);
+
+        // Position the preview centered on the cursor, clamped to scrub
+        // bounds so the tile doesn't overflow the chrome at the edges.
+        const chromeRect = chrome.getBoundingClientRect();
+        const tileW = previewManifest?.tile_w || 240;
+        const xInChrome = clientX - chromeRect.left;
+        const minX = (rect.left - chromeRect.left) + tileW / 2;
+        const maxX = (rect.right - chromeRect.left) - tileW / 2;
+        const clamped = Math.min(Math.max(xInChrome, minX), maxX);
+        chrome.style.setProperty("--preview-x", `${clamped}px`);
+
+        if (previewState === "ready" && previewManifest && previewImg) {
+            const { interval, cols, count, tile_w, tile_h, padding = 0 } = previewManifest;
+            const idx = Math.min(count - 1, Math.max(0, Math.floor(t / interval)));
+            const sx = (idx % cols) * (tile_w + padding);
+            const sy = Math.floor(idx / cols) * (tile_h + padding);
+            previewImg.style.backgroundPosition = `-${sx}px -${sy}px`;
+        }
+    };
+
+    const onScrubEnter = (e) => {
+        ensurePreview();
+        if (previewState === "unavailable") return;
+        wrap.classList.add("scrub-hover");
+        updatePreview(e.clientX);
+    };
+    const onScrubMove = (e) => {
+        if (previewState === "unavailable") return;
+        // Show on first move too (covers the case where mouseenter fires
+        // before the manifest fetch resolved).
+        if (!wrap.classList.contains("scrub-hover")) {
+            wrap.classList.add("scrub-hover");
+        }
+        updatePreview(e.clientX);
+    };
+    const onScrubLeave = () => wrap.classList.remove("scrub-hover");
+
+    scrub?.addEventListener("mouseenter", onScrubEnter);
+    scrub?.addEventListener("mousemove", onScrubMove);
+    scrub?.addEventListener("mouseleave", onScrubLeave);
     volSlider?.addEventListener("input", onVolInput);
     volSlider?.addEventListener("click", stopBubble);
     volSlider?.addEventListener("pointerup", blurSelf);
@@ -617,6 +703,9 @@ function initControls(videoId) {
         scrub?.removeEventListener("change", onScrubChange);
         scrub?.removeEventListener("click", stopBubble);
         scrub?.removeEventListener("pointerup", blurSelf);
+        scrub?.removeEventListener("mouseenter", onScrubEnter);
+        scrub?.removeEventListener("mousemove", onScrubMove);
+        scrub?.removeEventListener("mouseleave", onScrubLeave);
         volSlider?.removeEventListener("input", onVolInput);
         volSlider?.removeEventListener("click", stopBubble);
         volSlider?.removeEventListener("pointerup", blurSelf);
