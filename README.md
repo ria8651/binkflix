@@ -142,6 +142,7 @@ See [.env.example](.env.example). Short version:
 - `BINKFLIX_DB` — SQLite path, default `./data/binkflix.db`.
 - `BINKFLIX_BIND` — override the bind address. If unset, `dx serve` picks one.
 - `RUST_LOG` — tracing filter, defaults to `info,binkflix=debug`.
+- `BINKFLIX_HWACCEL` — H.264 hardware encoder for the HLS transcode path. `auto` (default), `none`, `vaapi`, `qsv`, or `videotoolbox`. `auto` probes `ffmpeg -encoders` plus the relevant device files at startup; falls back to libx264 if nothing usable is found, and again at runtime if a hwenc spawn fails. Pass `/dev/dri` into the container (`devices: ["/dev/dri:/dev/dri"]` in compose, `--device /dev/dri:/dev/dri` with raw docker) to enable VAAPI/QSV; without it the server runs as before with libx264.
 
 ## API (for now)
 

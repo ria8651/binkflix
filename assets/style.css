@@ -988,10 +988,13 @@ h2.section {
 /* ── Debug / playback info floating panel ────────────────── */
 .debug-panel {
     position: absolute;
-    top: var(--space-6);
+    /* Inset clear of the player topbar (~48px content) and the bottom
+       control chrome (~75px content) so the panel never overlaps
+       either when both are visible (paused / active). */
+    top: 3.5rem;
     right: var(--space-6);
+    bottom: 5rem;
     width: 340px;
-    max-height: calc(100% - var(--space-10));
     background: rgb(20 20 20 / 0.95);
     backdrop-filter: blur(8px);
     border: 1px solid rgb(255 255 255 / 0.12);

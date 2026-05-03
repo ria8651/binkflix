@@ -569,15 +569,27 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         let capture_js = format!(
             "dioxus.send(window.binkflixPlayer?.getPlaybackState('{video_dom_id}')?.currentTime ?? 0);"
         );
-        // Attach the source first (native or hls.js, decided by the JS
-        // side based on canPlayType), then wire up the custom controls.
-        // `attach` is idempotent and re-attaches cleanly when `src`
-        // changes (e.g. user picks `?mode=remux` in the transcode prompt).
-        let js = format!(
-            "(async () => {{ await window.binkflixPlayer?.attach('{video_dom_id}', '{src}'); window.binkflixPlayer?.initControls('{video_dom_id}'); }})();"
-        );
         let id_for_resume = id_for_resume.clone();
         spawn(async move {
+            // Resolve the user's intended start position. Priority:
+            //   1. live currentTime carried over from a previous src
+            //      on the same `<video>` element (mode/bitrate/audio
+            //      switch — strictly freshest).
+            //   2. saved-progress from the API on cold loads, unless
+            //      we're joining a syncplay room currently watching
+            //      this media (the room's catch-up is authoritative).
+            //   3. zero — fresh start.
+            //
+            // The resolved time is appended to the m3u8 URL as `?t=`.
+            // The server emits `#EXT-X-START:TIME-OFFSET=<t>` in the
+            // playlist, which both hls.js and Safari respect — so the
+            // player's first segment fetch lands at the right idx and
+            // the transcode producer never spawns at seg 1 in pursuit
+            // of an init.mp4 the user doesn't care about.
+            //
+            // `initialTime` is also passed to attach() and surfaces as
+            // hls.js's `startPosition` config — belt-and-braces for
+            // older clients that don't honour EXT-X-START.
             #[cfg_attr(not(feature = "web"), allow(unused_variables))]
             let live_pos: f64 = {
                 #[cfg(feature = "web")]
@@ -588,39 +600,58 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                 #[cfg(not(feature = "web"))]
                 { let _ = capture_js; 0.0 }
             };
-            let _ = document::eval(&js).await;
+            #[allow(unused_mut)]
+            let mut initial_time: f64 = if live_pos > 5.0 { live_pos } else { 0.0 };
             #[cfg(feature = "web")]
-            {
-                // Mid-playback switch wins over the saved-progress
-                // resume because it's strictly fresher. Threshold
-                // matches the saved-progress one (>5s) so a very early
-                // switch still falls through to the resume flow.
-                if live_pos > 5.0 {
-                    let js = format!(
-                        "window.binkflixPlayer?.seekTo('{video_dom_id}', {live_pos});"
-                    );
-                    let _ = document::eval(&js).await;
-                } else if room_ctx
+            if initial_time == 0.0
+                && !room_ctx
                     .current
                     .peek()
                     .as_ref()
                     .map(|s| s.media_id == id_for_resume && room_ctx.room_id.peek().is_some())
                     .unwrap_or(false)
-                {
-                    // We're in a watch party currently watching this media —
-                    // the room's broadcast position is authoritative. Skip
-                    // the saved-progress restore so we don't snap back to
-                    // where this user was *last time alone*; the syncplay
-                    // bridge's "initial catch-up" lands us at the live spot.
-                } else if let Ok(Some(p)) = get_progress(&id_for_resume).await {
+            {
+                if let Ok(Some(p)) = get_progress(&id_for_resume).await {
                     if !p.completed && p.position_secs > 5.0 {
-                        let js = format!(
-                            "window.binkflixPlayer?.seekTo('{video_dom_id}', {});",
-                            p.position_secs
-                        );
-                        let _ = document::eval(&js).await;
+                        initial_time = p.position_secs;
                     }
                 }
+            }
+
+            // Append `?t=` to the stream URL when we have a resolved
+            // start position. Done here (rather than in `stream_src`)
+            // because the time depends on async state that isn't
+            // available at memo-evaluation time.
+            let attach_url = if initial_time > 5.0 && src.contains("/hls/") {
+                let sep = if src.contains('?') { '&' } else { '?' };
+                format!("{src}{sep}t={initial_time:.3}")
+            } else {
+                src.clone()
+            };
+
+            // Attach the source (native or hls.js, decided by the JS
+            // side based on canPlayType), then wire up the custom
+            // controls. `attach` is idempotent and re-attaches cleanly
+            // when `src` changes.
+            let js = format!(
+                "(async () => {{ await window.binkflixPlayer?.attach('{video_dom_id}', '{attach_url}', {{ initialTime: {initial_time} }}); window.binkflixPlayer?.initControls('{video_dom_id}'); }})();"
+            );
+            let _ = document::eval(&js).await;
+
+            // Force the video element's currentTime to the resolved
+            // position. EXT-X-START + hls.js startPosition handle the
+            // *segment fetch* alignment, but they don't move the video
+            // element — without this, the element's currentTime starts
+            // at 0 after the src swap and the player visibly jumps to
+            // the head of the file (and plays seg-1 audio for a frame)
+            // before hls.js's seek-driven fetch lands. seekTo waits for
+            // metadata to load before applying.
+            #[cfg(feature = "web")]
+            if initial_time > 5.0 {
+                let js = format!(
+                    "window.binkflixPlayer?.seekTo('{video_dom_id}', {initial_time});"
+                );
+                let _ = document::eval(&js).await;
             }
             #[cfg(not(feature = "web"))]
             { let _ = id_for_resume; }
@@ -1302,6 +1333,7 @@ fn DebugMenuBody(
     let observed: Option<ObservedStream> = stats.as_ref().and_then(ObservedStream::from_stats);
     let observed_mode = observed.as_ref().map(|o| o.mode);
     let observed_container = observed.as_ref().and_then(|o| o.container());
+    let observed_encoder = observed.as_ref().and_then(|o| o.encoder.clone());
     let buffered_ranges: Vec<(f64, f64)> = stats
         .as_ref()
         .and_then(|s| s.get("buffered_ranges"))
@@ -1363,6 +1395,7 @@ fn DebugMenuBody(
                         info: info.clone(),
                         effective_mode: observed_mode.unwrap_or(effective_mode),
                         observed_container: observed_container.clone(),
+                        observed_encoder: observed_encoder.clone(),
                         bitrate_override,
                     }
                 },
@@ -1380,6 +1413,10 @@ fn DebugMenuBody(
 struct ObservedStream {
     mode: BrowserCompat,
     content_type: Option<String>,
+    /// Server-reported ffmpeg H.264 encoder for transcode mode
+    /// (`libx264`, `h264_vaapi`, `h264_qsv`, `h264_videotoolbox`).
+    /// `None` for non-transcode responses or older servers.
+    encoder: Option<String>,
 }
 
 impl ObservedStream {
@@ -1391,13 +1428,14 @@ impl ObservedStream {
             .and_then(|v| v.as_str())
             .map(|s| s.to_ascii_lowercase());
         let content_type = info.get("content_type").and_then(|v| v.as_str()).map(String::from);
+        let encoder = info.get("encoder").and_then(|v| v.as_str()).map(String::from);
         let mode = match mode_hdr.as_deref() {
             Some("direct") => BrowserCompat::Direct,
             Some("remux") => BrowserCompat::Remux,
             Some("transcode") => BrowserCompat::Transcode,
             _ => return None,
         };
-        Some(Self { mode, content_type })
+        Some(Self { mode, content_type, encoder })
     }
 
     /// Human-readable container derived from the observed Content-Type.
@@ -1439,6 +1477,10 @@ fn DeliveryRows(
     info: MediaTechInfo,
     effective_mode: BrowserCompat,
     observed_container: Option<String>,
+    /// ffmpeg encoder name from the server's `X-Stream-Encoder` header
+    /// (`libx264`, `h264_vaapi`, etc.). Drives the transcode-mode label
+    /// so the panel reflects whether GPU offload is in effect.
+    observed_encoder: Option<String>,
     bitrate_override: Option<u32>,
 ) -> Element {
     // Describe what the browser is actually receiving on the wire, as a
@@ -1529,8 +1571,11 @@ fn DeliveryRows(
             } else {
                 format!("{target_bitrate} kbps (auto)")
             };
+            let encoder_label = observed_encoder
+                .clone()
+                .unwrap_or_else(|| "libx264".to_string());
             rsx! {
-                DebugRow { label: "Mode", value: "transcode (libx264)".to_string() }
+                DebugRow { label: "Mode", value: format!("transcode ({encoder_label})") }
                 DebugRow { label: "Container", value: container_label }
                 DebugRow {
                     label: "Video",

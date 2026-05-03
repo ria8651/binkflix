@@ -17,11 +17,13 @@
 //!   cache miss triggers the producer (start/resume/restart) and waits.
 
 mod cache;
+mod hwenc;
 mod plan;
 mod playlist;
 mod producer;
 
 pub use cache::{cache_root, id_is_safe, is_allowed_name, mime_for};
+pub use hwenc::{detect as detect_hwenc, HwEncoder};
 pub use plan::PLAN_VERSION;
 pub use producer::{sweep_orphan_ffmpegs, ProducerRegistry};
 
@@ -44,6 +46,13 @@ use std::sync::Arc;
 ///   HLS by passing an explicit mode).
 /// * `?bitrate=K` — target video bitrate in kbps for `mode=transcode`.
 ///   Ignored for remux. None means "auto" (derived from source bitrate).
+/// * `?t=<sec>` — desired playback start position in seconds. Surfaced
+///   into the m3u8 as `#EXT-X-START:TIME-OFFSET=<t>` so hls.js / Safari
+///   align their first segment fetch to that offset (instead of seg 1).
+///   The client computes this from the current playhead on mid-session
+///   src changes (mode/bitrate/audio switch) or from saved-progress on
+///   cold loads. Stays in the URL so the m3u8 remains a pure function
+///   of its query — safe to cache by URL behind a reverse proxy.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct HlsParams {
     #[serde(default)]
@@ -52,6 +61,8 @@ pub struct HlsParams {
     pub mode: Option<String>,
     #[serde(default)]
     pub bitrate: Option<u32>,
+    #[serde(default)]
+    pub t: Option<f64>,
 }
 
 impl HlsParams {
@@ -281,8 +292,50 @@ async fn serve(
     let path = plan_dir.join(&file);
 
     if file == "index.m3u8" {
-        let body = playlist::render_m3u8(&plan, audio_idx, params.mode.as_deref(), params.bitrate);
-        return Ok(text_response(body, "application/vnd.apple.mpegurl", false));
+        // Clamp the requested start to inside the plan's covered range.
+        // RFC 8216 says players SHOULD clamp, but some older Safari
+        // versions silently drop an out-of-range TIME-OFFSET and start
+        // at 0 — exactly the behavior we're trying to prevent. The
+        // 0.5s tail leaves room for the last segment without landing
+        // past EOF.
+        let time_offset = params.t.and_then(|t| {
+            if t.is_finite() && t > 0.0 {
+                Some(t.min((plan.duration - 0.5).max(0.0)))
+            } else {
+                None
+            }
+        });
+        let body = playlist::render_m3u8(
+            &plan,
+            audio_idx,
+            params.mode.as_deref(),
+            params.bitrate,
+            time_offset,
+        );
+        let mut resp = text_response(body, "application/vnd.apple.mpegurl", false);
+        let h = resp.headers_mut();
+        // Mirror the `/stream` endpoint's mode advertisement so the
+        // player's debug-panel `ObservedStream` parser engages — without
+        // `X-Stream-Mode` it would fall back to the cached compat
+        // verdict and miss the encoder/container we're actually serving.
+        let mode_str = match plan.mode {
+            plan::Mode::Remux => "remux",
+            plan::Mode::Transcode { .. } => "transcode",
+        };
+        if let Ok(v) = HeaderValue::from_str(mode_str) {
+            h.insert("X-Stream-Mode", v);
+        }
+        // For transcode, advertise the H.264 encoder that's effectively
+        // active. `current_encoder_name` honours the runtime-fallback
+        // sticky flag, so a second playback after a hw-startup failure
+        // already reads "libx264" here.
+        if matches!(plan.mode, plan::Mode::Transcode { .. }) {
+            let enc = producer::current_encoder_name(state.hwenc);
+            if let Ok(v) = HeaderValue::from_str(enc) {
+                h.insert("X-Stream-Encoder", v);
+            }
+        }
+        return Ok(resp);
     }
 
     let ctx = producer::ProducerCtx {
@@ -293,6 +346,7 @@ async fn serve(
         audio_idx,
         mode_tag,
         audio: plan::derive_audio_plan(&info, audio_idx),
+        hw: state.hwenc,
     };
 
     if file == "init.mp4" {
@@ -307,22 +361,57 @@ async fn serve(
     Ok(file_response(bytes, mime_for(&file), true))
 }
 
-/// Ensure init.mp4 exists. ffmpeg writes it to the canonical path as a
-/// side effect of producing the first segment, so we just kick the
-/// producer at segment 1 and wait for the file to land.
+/// Ensure init.mp4 exists. ffmpeg's HLS-fmp4 muxer writes init.mp4
+/// *before* any segment data — the moov box is flushed as soon as codec
+/// params are settled. We kick the producer at segment 1 (just to get
+/// the muxer running) but **return as soon as init.mp4 lands**, not
+/// after seg 1's full encode.
+///
+/// Why it matters: hls.js loads init.mp4 strictly before its first
+/// media-segment fetch. If the player has a saved-position resume
+/// pending (e.g. user left off at 25:00), the resume `seekTo` only
+/// fires after `attach` completes — i.e. after init.mp4 returns. If we
+/// blocked here on seg 1's full encode, ffmpeg would burn through 6+
+/// segments at the start of the file before hls.js ever gets a chance
+/// to ask for seg 250. Returning early lets the seek-driven segment
+/// fetch arrive immediately, which `ensure_segment` handles via the
+/// existing far-seek restart path (kills the seg-1 producer, relaunches
+/// at target_idx=250).
 async fn ensure_init(state: &AppState, ctx: &producer::ProducerCtx) -> Result<()> {
     let canonical = ctx.plan_dir.join("init.mp4");
     if tokio::fs::try_exists(&canonical).await.unwrap_or(false) {
         return Ok(());
     }
-    let _ = producer::ensure_segment(&state.hls_producers, ctx, 1)
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-    if tokio::fs::try_exists(&canonical).await.unwrap_or(false) {
-        return Ok(());
+    // Drive the producer in the background at seg 1. The seg-1 spawn
+    // looks like a footgun, but with `#EXT-X-START:TIME-OFFSET=N` in
+    // the m3u8 the player's first segment fetch is at the user's
+    // intended position, not seg 1 — so `ensure_segment(N)` arrives
+    // alongside (or just after) this spawn and the existing far-seek
+    // restart in `ensure_segment` kills this transient seg-1 producer
+    // and relaunches at N. Wasted work is bounded to whatever ffmpeg
+    // managed to encode in the few hundred ms before the real segment
+    // request arrived.
+    //
+    // Cancellation here doesn't kill the producer — that's the
+    // registry's job — but we don't *await* the segment, only init.mp4
+    // itself.
+    let registry = state.hls_producers.clone();
+    let ctx_bg = ctx.clone();
+    tokio::spawn(async move {
+        let _ = producer::ensure_segment(&registry, &ctx_bg, 1).await;
+    });
+    // Poll for init.mp4. The watcher promotes it the first tick (≤100ms)
+    // after ffmpeg writes it; ffmpeg writes it shortly after `-i` is
+    // probed. 60s ceiling matches the segment wait timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if tokio::fs::try_exists(&canonical).await.unwrap_or(false) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     Err(Error::Other(anyhow::anyhow!(
-        "init.mp4 not produced after producer started"
+        "init.mp4 not produced within timeout"
     )))
 }
 

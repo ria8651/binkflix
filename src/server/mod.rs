@@ -42,6 +42,10 @@ pub struct AppState {
     pub scan_lock: Arc<Mutex<()>>,
     pub libraries: Arc<Vec<(i64, PathBuf)>>,
     pub hls_producers: Arc<hls::ProducerRegistry>,
+    /// H.264 hardware encoder picked at startup. The producer reads this
+    /// (combined with the process-wide sticky-fallback flag inside
+    /// `producer.rs`) when building each ffmpeg invocation.
+    pub hwenc: hls::HwEncoder,
     /// `None` disables bastion auth entirely — set `BASTION_ORIGIN` to enable.
     pub auth: Option<auth::AuthState>,
 }
@@ -212,6 +216,9 @@ async fn run_async() -> anyhow::Result<()> {
     // producers for the same plan dirs.
     hls::sweep_orphan_ffmpegs().await;
 
+    // Probe ffmpeg once for hw H.264 encoders; pinned for the process.
+    let hwenc = hls::detect_hwenc().await;
+
     // Register each path as its own row in `libraries` and kick off scans in
     // the background so startup isn't blocked on large trees.
     let mut scan_jobs: Vec<(i64, PathBuf)> = Vec::with_capacity(library_paths.len());
@@ -262,6 +269,7 @@ async fn run_async() -> anyhow::Result<()> {
         scan_lock,
         libraries,
         hls_producers: hls::ProducerRegistry::new(),
+        hwenc,
         auth: auth_state.clone(),
     };
 

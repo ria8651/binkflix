@@ -69,6 +69,7 @@
 //! * **Idle**: 30s of no requests reaps the producer entirely.
 
 use super::cache;
+use super::hwenc::HwEncoder;
 use super::plan::{AudioPlan, Mode, StreamPlan};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
@@ -209,6 +210,32 @@ pub struct ProducerCtx {
     /// ffmpeg gets `-map 0:a:N?` either way; the optional flag just means
     /// "no audio in the output" if the stream is missing.
     pub audio: Option<AudioPlan>,
+    /// H.264 hardware encoder picked at server startup. Note that the
+    /// *effective* encoder may degrade to `None` mid-process if the
+    /// sticky fallback flag has been set by a prior failed launch — see
+    /// [`effective_hw`].
+    pub hw: HwEncoder,
+}
+
+/// Process-wide sticky flag: once a hwenc producer fails to start, every
+/// subsequent producer (this one and future) uses libx264. Cheaper to
+/// reason about than per-media retry state, and a hwenc that fails once
+/// will keep failing for the same reason (missing driver, busted device,
+/// codec rejection by the kernel module).
+static HW_DISABLED: AtomicBool = AtomicBool::new(false);
+
+fn effective_hw(ctx_hw: HwEncoder) -> HwEncoder {
+    if HW_DISABLED.load(Ordering::Acquire) {
+        HwEncoder::None
+    } else {
+        ctx_hw
+    }
+}
+
+/// What the m3u8 endpoint should advertise as `X-Stream-Encoder` for a
+/// given context — accounts for the sticky fallback flag.
+pub fn current_encoder_name(ctx_hw: HwEncoder) -> &'static str {
+    effective_hw(ctx_hw).ffmpeg_name()
 }
 
 pub async fn ensure_segment(
@@ -337,6 +364,62 @@ async fn launch_producer(
     target_idx: u32,
     slot: Arc<Mutex<Option<ProducerHandle>>>,
 ) -> anyhow::Result<ProducerHandle> {
+    // Retry loop for the hw-encoder runtime fallback. We try with the
+    // resolved hw encoder; if the ffmpeg child dies within 750ms (the
+    // signature of a driver/kernel-module rejection — by the time
+    // surfaces are negotiated the encoder has either claimed the device
+    // or thrown), we set the process-wide `HW_DISABLED` flag, log, and
+    // retry once with libx264. Software won't trip the same path so the
+    // loop is at most two iterations.
+    loop {
+        let active_hw = effective_hw(ctx.hw);
+        let mut handle = launch_once(ctx.clone(), target_idx, slot.clone()).await?;
+        if active_hw == HwEncoder::None {
+            return Ok(handle);
+        }
+        match wait_for_early_exit(&mut handle.child, Duration::from_millis(750)).await {
+            EarlyExit::Alive => return Ok(handle),
+            EarlyExit::Exited(status) => {
+                tracing::warn!(
+                    media = %ctx.media_id,
+                    encoder = active_hw.ffmpeg_name(),
+                    ?status,
+                    "hwenc producer exited during startup; falling back to libx264 process-wide"
+                );
+                HW_DISABLED.store(true, Ordering::Release);
+                handle.shutdown().await;
+                // Loop body re-resolves `effective_hw(ctx.hw)`, which
+                // now returns `None` because of the flag we just set.
+            }
+        }
+    }
+}
+
+enum EarlyExit {
+    Alive,
+    Exited(std::process::ExitStatus),
+}
+
+async fn wait_for_early_exit(child: &mut Child, total: Duration) -> EarlyExit {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return EarlyExit::Exited(status),
+            Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+            // `try_wait` errors are basically "the OS lost the child" —
+            // treat like alive so we don't trigger a fallback over an
+            // unrelated kernel hiccup.
+            Err(_) => return EarlyExit::Alive,
+        }
+    }
+    EarlyExit::Alive
+}
+
+async fn launch_once(
+    ctx: ProducerCtx,
+    target_idx: u32,
+    slot: Arc<Mutex<Option<ProducerHandle>>>,
+) -> anyhow::Result<ProducerHandle> {
     tokio::fs::create_dir_all(&ctx.plan_dir).await?;
 
     // ffmpeg starts a bit before target_idx so the first encoded
@@ -461,6 +544,7 @@ fn spawn_ffmpeg(
     start_t: f64,
     run_dir: &Path,
 ) -> anyhow::Result<(Child, Vec<String>)> {
+    let hw = effective_hw(ctx.hw);
     // Common preamble + HLS muxer flags. Codec args (video copy vs
     // libx264) come from `apply_video_args` based on plan mode. Key
     // shared pieces:
@@ -480,7 +564,28 @@ fn spawn_ffmpeg(
     cmd.current_dir(run_dir)
         .arg("-hide_banner")
         .arg("-loglevel").arg("warning")
-        .arg("-nostdin")
+        .arg("-nostdin");
+    // VAAPI/QSV need a `-init_hw_device` + `-filter_hw_device` pair before
+    // `-i` so the encoder and the `hwupload` filter share a device. Pure
+    // VideoToolbox doesn't need any device init since the encoder owns
+    // its own session; we just keep the software input + sw scale and
+    // let h264_videotoolbox handle the upload internally.
+    if matches!(ctx.plan.mode, Mode::Transcode { .. }) {
+        match hw {
+            HwEncoder::Vaapi => {
+                cmd.arg("-init_hw_device")
+                    .arg("vaapi=va:/dev/dri/renderD128")
+                    .arg("-filter_hw_device").arg("va");
+            }
+            HwEncoder::Qsv => {
+                cmd.arg("-init_hw_device")
+                    .arg("qsv=qsv:hw_any")
+                    .arg("-filter_hw_device").arg("qsv");
+            }
+            _ => {}
+        }
+    }
+    cmd
         // Generous probe defaults: matroska sources with many streams
         // (multi-audio, fonts, attachments) can need >5MB to resolve all
         // codec parameters. ffmpeg's default warning ("Consider
@@ -495,7 +600,7 @@ fn spawn_ffmpeg(
         .arg("-map").arg("0:v:0")
         .arg("-map").arg(format!("0:a:{}?", ctx.audio_idx))
         .arg("-avoid_negative_ts").arg("disabled");
-    apply_video_args(&mut cmd, &ctx.plan.mode);
+    apply_video_args(&mut cmd, &ctx.plan.mode, hw);
     apply_audio_args(&mut cmd, ctx.audio.as_ref(), &ctx.plan.mode);
     cmd.arg("-sn").arg("-dn")
         .arg("-f").arg("hls")
@@ -564,7 +669,7 @@ fn format_argv(argv: &[String]) -> String {
     out
 }
 
-fn apply_video_args(cmd: &mut Command, mode: &Mode) {
+fn apply_video_args(cmd: &mut Command, mode: &Mode, hw: HwEncoder) {
     match mode {
         Mode::Remux => {
             cmd.arg("-c:v").arg("copy");
@@ -573,26 +678,65 @@ fn apply_video_args(cmd: &mut Command, mode: &Mode) {
             // `scale=-2:'min(H,ih)'` keeps source aspect, never
             // upscales, and the `-2` rounds width to the nearest even
             // multiple (libx264 + yuv420p require even dimensions).
-            // The trailing `format=yuv420p` runs the 10-bit→8-bit
-            // conversion *inside* the filter graph rather than relying
-            // on `-pix_fmt`'s implicit auto-insertion. On 10-bit HEVC
-            // (yuv420p10le) sources this gives libx264 a deterministic
-            // 8-bit input and avoids HDR metadata leaking into the SPS
-            // emitted into init.mp4.
-            let vf = format!("scale=-2:'min({max_height},ih)':flags=lanczos,format=yuv420p");
+            // For libx264 / videotoolbox we keep `format=yuv420p` so
+            // the 10-bit→8-bit conversion runs *inside* the filter
+            // graph rather than relying on `-pix_fmt`'s implicit
+            // auto-insertion. For VAAPI/QSV the HW encoder needs nv12
+            // and the surface uploaded to the device, hence
+            // `format=nv12,hwupload` instead.
+            let vf = match hw {
+                HwEncoder::Vaapi => format!(
+                    "scale=-2:'min({max_height},ih)':flags=lanczos,format=nv12,hwupload"
+                ),
+                HwEncoder::Qsv => format!(
+                    "scale=-2:'min({max_height},ih)':flags=lanczos,format=nv12,hwupload=extra_hw_frames=64"
+                ),
+                _ => format!(
+                    "scale=-2:'min({max_height},ih)':flags=lanczos,format=yuv420p"
+                ),
+            };
             let maxrate = bitrate_kbps.saturating_mul(15) / 10; // 1.5×
             let bufsize = bitrate_kbps.saturating_mul(2);
-            // `force_key_frames "expr:gte(t,n_forced*6)"` makes ffmpeg
-            // insert IDRs exactly at our 6s segment boundaries so each
-            // produced segment is independently decodable — which is
-            // what `independent_segments` advertises in the playlist.
-            cmd.arg("-vf").arg(vf)
-                .arg("-c:v").arg("libx264")
-                .arg("-preset").arg("veryfast")
-                .arg("-profile:v").arg("high")
-                .arg("-level").arg("4.1")
-                .arg("-pix_fmt").arg("yuv420p")
-                .arg("-b:v").arg(format!("{bitrate_kbps}k"))
+
+            cmd.arg("-vf").arg(vf).arg("-c:v").arg(hw.ffmpeg_name());
+
+            // Per-encoder knobs. VAAPI/QSV reject `-pix_fmt`/`-preset`
+            // (they get pixfmt from the input HW frame) and use a
+            // numeric `-level 41` form. VideoToolbox needs `-allow_sw 1`
+            // so it gracefully handles formats the GPU can't take and
+            // `-realtime 1` to keep latency in the segment-budget
+            // ballpark.
+            match hw {
+                HwEncoder::None => {
+                    cmd.arg("-preset").arg("veryfast")
+                        .arg("-profile:v").arg("high")
+                        .arg("-level").arg("4.1")
+                        .arg("-pix_fmt").arg("yuv420p");
+                }
+                HwEncoder::VideoToolbox => {
+                    cmd.arg("-profile:v").arg("high")
+                        .arg("-level").arg("4.1")
+                        .arg("-allow_sw").arg("1")
+                        .arg("-realtime").arg("1");
+                }
+                HwEncoder::Vaapi => {
+                    cmd.arg("-profile:v").arg("high")
+                        .arg("-level").arg("41");
+                }
+                HwEncoder::Qsv => {
+                    cmd.arg("-preset").arg("veryfast")
+                        .arg("-profile:v").arg("high")
+                        .arg("-level").arg("41");
+                }
+            }
+
+            // Bitrate ladder + IDR-on-segment-boundary work for every
+            // backend. `force_key_frames "expr:gte(t,n_forced*6)"`
+            // makes ffmpeg insert IDRs exactly at our 6s segment
+            // boundaries so each produced segment is independently
+            // decodable — which is what `independent_segments`
+            // advertises in the playlist.
+            cmd.arg("-b:v").arg(format!("{bitrate_kbps}k"))
                 .arg("-maxrate").arg(format!("{maxrate}k"))
                 .arg("-bufsize").arg(format!("{bufsize}k"))
                 .arg("-force_key_frames").arg("expr:gte(t,n_forced*6)");
@@ -678,18 +822,6 @@ fn spawn_watcher(
     let mut prev_sizes: HashMap<u32, u64> = HashMap::new();
     tokio::spawn(async move {
         loop {
-            // init.mp4 is byte-identical across runs for a given plan,
-            // so first-write-wins is fine. ffmpeg writes init.mp4 once
-            // before the first segment so by the time any scratch
-            // seg-*.m4s exists, init.mp4 is closed.
-            if !tokio::fs::try_exists(&canonical_init).await.unwrap_or(false)
-                && tokio::fs::try_exists(&scratch_init).await.unwrap_or(false)
-            {
-                if let Err(e) = atomic_link_or_copy(&scratch_init, &canonical_init).await {
-                    tracing::warn!(error = %e, "failed to promote init.mp4");
-                }
-            }
-
             // Snapshot the scratch dir: idx → (path, size).
             let mut scratch: BTreeMap<u32, (PathBuf, u64)> = BTreeMap::new();
             if let Ok(mut rd) = tokio::fs::read_dir(&run_dir).await {
@@ -699,6 +831,23 @@ fn spawn_watcher(
                     let Some(idx) = cache::segment_index(name_str) else { continue };
                     let Ok(meta) = entry.metadata().await else { continue };
                     scratch.insert(idx, (entry.path(), meta.len()));
+                }
+            }
+
+            // init.mp4 is byte-identical across runs for a given plan,
+            // so first-write-wins is fine. ffmpeg's HLS-fmp4 muxer
+            // writes init.mp4 in order: open, write moov, close, then
+            // start the first segment. So the existence of *any* scratch
+            // `seg-*.m4s` proves init.mp4 has been closed and is safe
+            // to promote — without this gate the watcher could copy a
+            // mid-write file (DEMUXER_ERROR_COULD_NOT_PARSE on the
+            // client side).
+            if !tokio::fs::try_exists(&canonical_init).await.unwrap_or(false)
+                && tokio::fs::try_exists(&scratch_init).await.unwrap_or(false)
+                && !scratch.is_empty()
+            {
+                if let Err(e) = atomic_link_or_copy(&scratch_init, &canonical_init).await {
+                    tracing::warn!(error = %e, "failed to promote init.mp4");
                 }
             }
 
