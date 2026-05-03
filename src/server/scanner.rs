@@ -1,6 +1,6 @@
 use super::filename;
 use super::nfo::{self, EpisodeNfo, MovieNfo};
-use super::{subtitles, thumbnails};
+use super::{subtitles, thumbnails, trickplay};
 use crate::types::ScanProgress;
 use chrono::NaiveDateTime;
 use futures::stream::{self, StreamExt};
@@ -483,6 +483,13 @@ pub async fn scan_library_with_progress(
                     if !job.has_sidecar_image {
                         thumbnails::scan_for_media(&pool, &job.media_id, &job.video).await;
                     }
+                    trickplay::scan_for_media(
+                        &pool,
+                        &job.media_id,
+                        &job.video,
+                        tech_info.as_ref().and_then(|i| i.duration_seconds),
+                    )
+                    .await;
                     if let Some(info) = tech_info {
                         if let Err(e) = super::media_info::store(&pool, &job.media_id, &info).await {
                             warn!(media_id = %job.media_id, %e, "failed to cache tech info");
