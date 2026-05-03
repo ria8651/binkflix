@@ -641,6 +641,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                             autoplay: true,
                             preload: "metadata",
                             "data-fps": "{fps_attr}",
+                            "data-media-id": "{id}",
                         }
                     }
                 } else {
@@ -743,6 +744,10 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                 }
             }
             div { class: "player-chrome",
+                div { class: "player-scrub-preview", aria_hidden: "true",
+                    div { class: "player-scrub-preview-img" }
+                    div { class: "player-scrub-preview-time", "0:00" }
+                }
                 input {
                     class: "player-scrub",
                     r#type: "range",

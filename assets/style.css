@@ -651,6 +651,42 @@ h2.section {
     cursor: auto !important;
 }
 
+/* Scrub-bar preview thumbnail. JS sets `--preview-x` (cursor X within the
+   scrub bar in px) on the .player-chrome and toggles `.scrub-hover` on the
+   wrap. The inner img is a fixed tile from the sprite sheet — JS sets
+   background-image / background-position / background-size inline. */
+.player-scrub-preview {
+    position: absolute;
+    left: var(--preview-x, 0);
+    bottom: calc(100% - var(--space-7));
+    transform: translateX(-50%);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 120ms ease;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+.video-wrap.scrub-hover .player-scrub-preview {
+    opacity: 1;
+}
+.player-scrub-preview-img {
+    width: 240px;
+    height: 135px;
+    border-radius: var(--radius-button);
+    background-color: #000;
+    background-repeat: no-repeat;
+    box-shadow: 0 4px 16px rgb(0 0 0 / 0.6);
+    border: 1px solid rgb(255 255 255 / 0.15);
+}
+.player-scrub-preview-time {
+    color: #fff;
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 2px rgb(0 0 0 / 0.9);
+}
+
 .player-scrub {
     --played: 0%;
     --buffered: 0%;

@@ -14,6 +14,7 @@ pub mod scanner;
 pub mod subtitles;
 pub mod syncplay;
 pub mod thumbnails;
+pub mod trickplay;
 pub mod watch;
 
 use crate::app::App;

@@ -1,5 +1,5 @@
 use super::error::{Error, Result};
-use super::{media_info, subtitles, thumbnails};
+use super::{media_info, subtitles, thumbnails, trickplay};
 use super::AppState;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -22,6 +22,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/media/{id}/subtitle/{track}", get(media_subtitle))
         .route("/api/media/{id}/tech", get(media_tech))
         .route("/api/media/{id}/image", get(media_image))
+        .route("/api/media/{id}/trickplay.json", get(media_trickplay_manifest))
+        .route("/api/media/{id}/trickplay.jpg", get(media_trickplay_sprite))
         .route("/api/media/{id}/fanart", get(media_fanart))
         .route("/api/shows/{id}", get(show))
         .route("/api/shows/{id}/poster", get(show_poster))
@@ -409,6 +411,50 @@ async fn media_image(
     }
 
     Err(Error::NotFound)
+}
+
+async fn media_trickplay_manifest(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response> {
+    match trickplay::get_manifest(&state.pool, &id)
+        .await
+        .map_err(Error::Other)?
+    {
+        Some(m) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400, immutable"),
+            );
+            Ok((StatusCode::OK, headers, Json(m)).into_response())
+        }
+        None => Err(Error::NotFound),
+    }
+}
+
+async fn media_trickplay_sprite(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response> {
+    match trickplay::get_sprite(&state.pool, &id)
+        .await
+        .map_err(Error::Other)?
+    {
+        Some((bytes, mime)) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&mime).unwrap_or(HeaderValue::from_static("image/jpeg")),
+            );
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400, immutable"),
+            );
+            Ok((StatusCode::OK, headers, bytes).into_response())
+        }
+        None => Err(Error::NotFound),
+    }
 }
 
 async fn media_fanart(
