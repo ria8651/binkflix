@@ -24,7 +24,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp -r /src/target/dx/binkflix/release/web /out/web
 
 FROM debian:trixie-slim AS runtime
-RUN apt-get update \
+# intel-media-va-driver-non-free lives in the non-free component; enable it on
+# the default deb822 sources before installing.
+RUN sed -i 's/^Components: main$/Components: main non-free non-free-firmware/' \
+        /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
     intel-media-va-driver-non-free vainfo \
  && rm -rf /var/lib/apt/lists/*
