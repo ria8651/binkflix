@@ -117,6 +117,14 @@
   --shadow-button: none;
   --shadow-button-hover: none;
   --shadow-raised: none;
+
+  /* Topbar — separate from --bg-surface so glassy themes can override */
+  --bg-topbar: var(--bg-surface);
+  --topbar-backdrop-filter: none;
+  --topbar-border-bottom: var(--stroke-default);
+
+  /* Page backdrop — themes can paint a gradient or image behind --bg-page */
+  --bg-page-overlay: none;
 }
 
 /* ── Classic light theme ─────────────────────────────────────── */
@@ -318,4 +326,73 @@
     0 6px 12px -4px rgb(0 0 0 / 0.1),
     0 12px 24px 0 rgb(0 0 0 / 0.06),
     0 4px 24px 0 rgb(0 0 0 / 0.04);
+}
+
+/* ── ElegantFin theme ────────────────────────────────────────── */
+
+[data-theme="elegantfin"] {
+  /* Deep desaturated indigo base with a subtle radial gradient overlay */
+  --bg-page: #0e1018;
+  --bg-page-overlay:
+    radial-gradient(1200px 800px at 15% -10%, rgb(120 90 200 / 0.18), transparent 60%),
+    radial-gradient(1000px 700px at 110% 10%, rgb(60 130 220 / 0.14), transparent 60%);
+
+  --bg-surface: rgb(22 24 34 / 0.72);
+  --bg-surface-raised: rgb(28 30 42 / 0.85);
+  --bg-surface-hover: rgb(40 42 58 / 0.85);
+  --bg-button: rgb(255 255 255 / 0.06);
+  --bg-button-hover: rgb(255 255 255 / 0.1);
+  --bg-button-secondary: rgb(255 255 255 / 0.08);
+  --bg-button-secondary-hover: rgb(255 255 255 / 0.12);
+  --bg-tile: rgb(28 30 42 / 0.7);
+  --bg-hover-subtle: rgb(255 255 255 / 0.05);
+  --bg-row: rgb(255 255 255 / 0.03);
+  --bg-row-hover: rgb(255 255 255 / 0.07);
+  --bg-accent-ghost: rgb(140 110 240 / 0.18);
+  --bg-accent-ghost-hover: rgb(140 110 240 / 0.28);
+  --bg-backdrop: rgb(8 10 16 / 0.6);
+
+  /* Frosted topbar — fades blur + bg to transparent at the bottom edge so
+   * scrolled content slips under the topbar without a hard cutoff. */
+  --bg-topbar: rgb(14 16 24 / 0.55);
+  --topbar-backdrop-filter: blur(18px) saturate(1.4);
+  --topbar-border-bottom: none;
+  --topbar-shadow: none;
+  --topbar-mask: linear-gradient(to bottom, black 0%, black 55%, transparent 100%);
+  --topbar-fade-extend: 42px;
+
+  --text-primary: rgb(236 238 248);
+  --text-secondary: rgb(208 212 226);
+  --text-tertiary: rgb(170 175 195);
+  --text-muted: rgb(135 140 160);
+  --text-on-accent: #fff;
+  --text-accent: #a78bfa;
+  --text-accent-hover: #c4b5fd;
+  --text-icon-muted: rgb(255 255 255 / 0.2);
+
+  --border-default: rgb(255 255 255 / 0.06);
+  --border-raised: rgb(255 255 255 / 0.12);
+  --border-strong: rgb(255 255 255 / 0.2);
+  --border-dialog: rgb(255 255 255 / 0.1);
+  --border-accent: #a78bfa;
+
+  --accent: #8b5cf6;
+  --accent-hover: #a78bfa;
+  --accent-rgb: 139 92 246;
+
+  --font-body: "Inter", "Open Sans", system-ui, -apple-system, sans-serif;
+  --font-heading: "Inter", "Chivo", system-ui, sans-serif;
+
+  --radius-button: 10px;
+  --radius-input: 10px;
+  --radius-tile: 14px;
+  --radius-dialog: 16px;
+  --radius-row: 10px;
+  --radius-toast: 12px;
+
+  --shadow-tile: 0 2px 8px rgb(0 0 0 / 0.3);
+  --shadow-raised: 0 1px 0 rgb(255 255 255 / 0.04) inset, 0 8px 24px rgb(0 0 0 / 0.35);
+  --shadow-dialog: 0 20px 60px rgb(0 0 0 / 0.55);
+  --shadow-button: 0 1px 0 rgb(255 255 255 / 0.05) inset;
+  --shadow-button-hover: 0 1px 0 rgb(255 255 255 / 0.08) inset, 0 4px 12px rgb(0 0 0 / 0.25);
 }

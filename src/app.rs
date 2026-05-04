@@ -141,6 +141,7 @@ const THEMES: &[(&str, &str)] = &[
     ("classic-light", "Classic light"),
     ("terminal", "Terminal"),
     ("material", "Material"),
+    ("elegantfin", "ElegantFin"),
 ];
 
 #[component]
