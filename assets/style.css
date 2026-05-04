@@ -23,12 +23,14 @@
 html, body {
     margin: 0;
     padding: 0;
-    background: var(--bg-page);
+    background-color: var(--bg-page);
+    background-image: var(--bg-page-overlay);
+    background-attachment: fixed;
     color: var(--text-primary);
     font-family: var(--font-body);
     font-size: var(--text-base);
     min-height: 100vh;
-    transition: background var(--motion-hover), color var(--motion-hover);
+    transition: background-color var(--motion-hover), color var(--motion-hover);
 }
 
 h1, h2, h3, h4 {
@@ -47,13 +49,41 @@ header.topbar {
     justify-content: space-between;
     padding-block: var(--space-7);
     padding-inline: max(var(--space-9), calc((100% - 1400px) / 2 + var(--space-9)));
-    background: var(--bg-surface);
+    background: transparent;
     position: sticky;
     top: 0;
     z-index: 10;
-    border-bottom: var(--stroke-default);
-    box-shadow: var(--shadow-raised);
+    border-bottom: var(--topbar-border-bottom);
+    box-shadow: var(--topbar-shadow, var(--shadow-raised));
     gap: var(--space-7);
+    isolation: isolate;
+}
+
+/* Background + blur live on a pseudo so they can be masked separately from
+ * the brand/buttons. Themes that don't want a fade leave --topbar-mask as
+ * `none` (no masking) and --topbar-fade-extend as 0 (flush with the bar). */
+header.topbar::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: calc(0px - var(--topbar-fade-extend, 0px));
+    background: var(--bg-topbar);
+    -webkit-mask-image: var(--topbar-mask, none);
+    mask-image: var(--topbar-mask, none);
+    pointer-events: none;
+    z-index: -1;
+}
+
+/* Wrap in @supports so the CSS minifier (lightningcss in dx) doesn't merge
+ * the two declarations and drop the unprefixed `backdrop-filter` — Chromium
+ * needs the unprefixed form, Safari needs the -webkit- one. */
+@supports (backdrop-filter: blur(1px)) {
+    header.topbar::before { backdrop-filter: var(--topbar-backdrop-filter); }
+}
+@supports (-webkit-backdrop-filter: blur(1px)) {
+    header.topbar::before { -webkit-backdrop-filter: var(--topbar-backdrop-filter); }
 }
 
 header.topbar .brand {
@@ -1618,4 +1648,73 @@ h2.section {
     inset: 0;
     background: transparent;
     z-index: 9;
+}
+
+/* ── Sky theme: decorative chrome ───────────────────────────────
+ * Sky-blue gradient page, a sun in the top-right, a soft gray cloud
+ * band along the top, and fluffy white halos around cards (driven by
+ * the theme's --shadow-tile token, with an extra ::before for fluff). */
+
+[data-theme="sky"] body {
+    background:
+        linear-gradient(to bottom, #7ec5e8 0%, #b7e0f4 55%, #d6ecf7 100%);
+    background-attachment: fixed;
+    min-height: 100vh;
+}
+
+[data-theme="sky"] body::before {
+    content: "";
+    position: fixed;
+    top: -80px;
+    right: -80px;
+    width: 280px;
+    height: 280px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, #fff4b0 0%, #ffd86b 45%, #f5a623 100%);
+    box-shadow: 0 0 80px 30px rgb(255 220 120 / 0.55);
+    pointer-events: none;
+    z-index: 0;
+}
+
+[data-theme="sky"] body::after {
+    content: "";
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 120px;
+    background:
+        radial-gradient(60px 36px at 8%  60%, rgb(150 155 165 / 0.65) 60%, transparent 62%),
+        radial-gradient(80px 44px at 22% 50%, rgb(160 165 175 / 0.7)  60%, transparent 62%),
+        radial-gradient(70px 40px at 38% 65%, rgb(150 155 165 / 0.65) 60%, transparent 62%),
+        radial-gradient(90px 50px at 55% 45%, rgb(165 170 180 / 0.7)  60%, transparent 62%),
+        radial-gradient(70px 38px at 72% 60%, rgb(150 155 165 / 0.65) 60%, transparent 62%),
+        radial-gradient(85px 46px at 88% 50%, rgb(160 165 175 / 0.7)  60%, transparent 62%),
+        linear-gradient(to bottom, rgb(170 175 185 / 0.55) 0%, rgb(170 175 185 / 0.25) 60%, transparent 100%);
+    pointer-events: none;
+    z-index: 0;
+}
+
+/* Page chrome should sit above the sun + cloud-band decorations. */
+[data-theme="sky"] body > * {
+    position: relative;
+    z-index: 1;
+}
+
+/* Extra fluffy halo around cards — a blurred white puff sized larger
+ * than the tile, behind it. The token --shadow-tile gives the inner
+ * white ring; this gives the soft outer cloud edge. */
+[data-theme="sky"] .card {
+    position: relative;
+    isolation: isolate;
+}
+[data-theme="sky"] .card::before {
+    content: "";
+    position: absolute;
+    inset: -22px -28px;
+    background: radial-gradient(ellipse at center, rgb(255 255 255 / 0.95) 35%, rgb(255 255 255 / 0.55) 60%, transparent 75%);
+    filter: blur(10px);
+    z-index: -1;
+    pointer-events: none;
+    border-radius: 50%;
 }
