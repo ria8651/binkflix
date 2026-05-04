@@ -614,17 +614,22 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
     let is_episode = item.show_id.is_some();
     let kind = if is_episode { LandscapeKind::Episode } else { LandscapeKind::Movie };
     let route = Route::MediaPlay { id: item.media_id.clone() };
-    let subtitle = if is_episode {
+    let ep_se = if is_episode {
         let s = item.season_number.unwrap_or(0);
         let e = item.episode_number.unwrap_or(0);
-        let prefix = item.show_title.clone().unwrap_or_default();
-        if prefix.is_empty() {
-            format!("S{s}E{e}")
-        } else {
-            format!("{prefix} · S{s}E{e}")
-        }
+        Some(format!("S{s}E{e}"))
     } else {
-        item.year.map(|y| y.to_string()).unwrap_or_default()
+        None
+    };
+    let show_link = item
+        .show_id
+        .clone()
+        .zip(item.show_title.clone())
+        .filter(|(_, t)| !t.is_empty());
+    let year = if !is_episode {
+        item.year.map(|y| y.to_string())
+    } else {
+        None
     };
     let pct = if item.duration_secs > 0.0 {
         (item.position_secs / item.duration_secs * 100.0).clamp(0.0, 100.0)
@@ -658,9 +663,7 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
                     }
                 }
                 h3 { class: "title", "{item.title}" }
-                if !subtitle.is_empty() {
-                    p { class: "year", "{subtitle}" }
-                }
+                SubtitleLine { show_link, ep_se, year }
             }
             button {
                 class: "mark-watched",
@@ -680,17 +683,22 @@ fn RecentCard(item: RecentItem) -> Element {
     let is_episode = item.show_id.is_some();
     let kind = if is_episode { LandscapeKind::Episode } else { LandscapeKind::Movie };
     let route = Route::MediaPlay { id: item.media_id.clone() };
-    let subtitle = if is_episode {
+    let ep_se = if is_episode {
         let s = item.season_number.unwrap_or(0);
         let e = item.episode_number.unwrap_or(0);
-        let prefix = item.show_title.clone().unwrap_or_default();
-        if prefix.is_empty() {
-            format!("S{s}E{e}")
-        } else {
-            format!("{prefix} · S{s}E{e}")
-        }
+        Some(format!("S{s}E{e}"))
     } else {
-        item.year.map(|y| y.to_string()).unwrap_or_default()
+        None
+    };
+    let show_link = item
+        .show_id
+        .clone()
+        .zip(item.show_title.clone())
+        .filter(|(_, t)| !t.is_empty());
+    let year = if !is_episode {
+        item.year.map(|y| y.to_string())
+    } else {
+        None
     };
     rsx! {
         article { class: "card card-wide",
@@ -701,11 +709,42 @@ fn RecentCard(item: RecentItem) -> Element {
                     kind,
                 }
                 h3 { class: "title", "{item.title}" }
-                if !subtitle.is_empty() {
-                    p { class: "year", "{subtitle}" }
-                }
+                SubtitleLine { show_link, ep_se, year }
             }
         }
+    }
+}
+
+/// Card subtitle for `ContinueCard` / `RecentCard`.
+///
+/// The show name (when present) is a clickable span that navigates to
+/// `ShowDetail` while suppressing the outer card link. Using a span instead
+/// of a nested `Link` avoids invalid nested `<a>` tags.
+#[component]
+fn SubtitleLine(
+    show_link: Option<(String, String)>,
+    ep_se: Option<String>,
+    year: Option<String>,
+) -> Element {
+    let nav = use_navigator();
+    match (show_link, ep_se, year) {
+        (Some((sid, title)), Some(se), _) => rsx! {
+            p { class: "year",
+                span {
+                    class: "show-link",
+                    onclick: move |evt: Event<MouseData>| {
+                        evt.stop_propagation();
+                        evt.prevent_default();
+                        nav.push(Route::ShowDetail { id: sid.clone() });
+                    },
+                    "{title}"
+                }
+                " · {se}"
+            }
+        },
+        (None, Some(se), _) => rsx! { p { class: "year", "{se}" } },
+        (_, _, Some(y)) if !y.is_empty() => rsx! { p { class: "year", "{y}" } },
+        _ => rsx! {},
     }
 }
 

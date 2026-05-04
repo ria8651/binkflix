@@ -317,6 +317,14 @@ h2.section {
     margin: var(--space-2) 0 0;
     padding: 0 var(--space-6) var(--space-6);
 }
+.card .year .show-link {
+    cursor: pointer;
+    color: inherit;
+}
+.card .year .show-link:hover {
+    color: var(--text-primary);
+    text-decoration: underline;
+}
 
 /* Continue Watching uses landscape episode stills, so the row needs wider
    columns than the portrait-poster grids. */
