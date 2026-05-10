@@ -477,6 +477,7 @@ pub async fn scan_library_with_progress(
             subtitles_ms: u64,
             thumbnail_ms: u64,
             trickplay_ms: u64,
+            keyframe_count: Option<u32>,
             started: std::time::Instant,
         }
 
@@ -548,6 +549,7 @@ pub async fn scan_library_with_progress(
                         subtitles_ms,
                         thumbnail_ms: 0,
                         trickplay_ms: 0,
+                        keyframe_count: None,
                         started,
                     }
                 }
@@ -631,7 +633,7 @@ pub async fn scan_library_with_progress(
                         add_active(p, &f.job.media_id, &f.job.title, "trickplay").await;
                     }
                     let t = std::time::Instant::now();
-                    trickplay::scan_for_media(
+                    f.keyframe_count = trickplay::scan_for_media(
                         &pool,
                         &f.job.media_id,
                         &f.job.video,
@@ -677,6 +679,31 @@ pub async fn scan_library_with_progress(
                     if let Some(p) = &progress {
                         add_active(p, &f.job.media_id, &f.job.title, "saving").await;
                     }
+                    // Pull source-side fields out before the `take()` below
+                    // hands ownership of `tech_info` to media_info::store.
+                    // Default audio = the track flagged `default`, else the
+                    // first one, mirroring how compute_compat picks it.
+                    let (
+                        video_codec, audio_codec, container,
+                        width, height, duration_ms, bitrate_kbps, pixel_format,
+                    ) = match f.tech_info.as_ref() {
+                        Some(info) => {
+                            let v = info.video.as_ref();
+                            let a = info.audio.iter().find(|a| a.default).or_else(|| info.audio.first());
+                            (
+                                v.map(|v| v.codec.clone()),
+                                a.map(|a| a.codec.clone()),
+                                info.container.clone(),
+                                v.and_then(|v| v.width),
+                                v.and_then(|v| v.height),
+                                info.duration_seconds.map(|s| (s * 1000.0) as u64),
+                                info.bitrate_kbps,
+                                v.and_then(|v| v.pix_fmt.clone()),
+                            )
+                        }
+                        None => (None, None, None, None, None, None, None, None),
+                    };
+
                     let t = std::time::Instant::now();
                     if let Some(info) = f.tech_info.take() {
                         if let Err(e) = super::media_info::store(&pool, &f.job.media_id, &info).await {
@@ -697,6 +724,15 @@ pub async fn scan_library_with_progress(
                             trickplay_ms: f.trickplay_ms,
                             save_ms,
                             total_ms,
+                            video_codec,
+                            audio_codec,
+                            container,
+                            width,
+                            height,
+                            duration_ms,
+                            bitrate_kbps,
+                            pixel_format,
+                            keyframe_count: f.keyframe_count,
                         },
                     )
                     .await;

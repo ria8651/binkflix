@@ -75,19 +75,23 @@ pub async fn get_sprite(
 
 /// Build (or rebuild) the sprite for `media_id`. Idempotent UPSERT.
 /// Logs and swallows failures so a missing ffmpeg or weird container
-/// can't fail a library scan.
+/// can't fail a library scan. On success, returns the number of source
+/// keyframes the ffmpeg call processed (useful for analytics correlation
+/// — average GOP = duration / keyframe_count). `None` means trickplay
+/// didn't run or its frame count couldn't be parsed; caller should treat
+/// that as "no signal," not zero.
 pub async fn scan_for_media(
     pool: &SqlitePool,
     media_id: &str,
     video: &Path,
     duration_secs: Option<f64>,
-) {
+) -> Option<u32> {
     let Some(duration) = duration_secs else {
         tracing::debug!(media_id, "trickplay skipped: no duration");
-        return;
+        return None;
     };
     if duration < MIN_DURATION_S {
-        return;
+        return None;
     }
 
     // Tile count: cover the full duration; clamp by MAX_TILES by stretching
@@ -105,7 +109,7 @@ pub async fn scan_for_media(
     let rows = (count + cols - 1) / cols;
 
     match build_sprite(video, interval, cols, rows).await {
-        Ok(bytes) => {
+        Ok((bytes, keyframe_count)) => {
             if let Err(e) = sqlx::query(
                 "INSERT INTO media_trickplay
                     (media_id, content, mime, interval_s, tile_w, tile_h, padding, cols, rows, count)
@@ -135,6 +139,7 @@ pub async fn scan_for_media(
             .await
             {
                 tracing::warn!(media_id, %e, "failed to persist trickplay sprite");
+                None
             } else {
                 tracing::debug!(
                     media_id,
@@ -143,12 +148,15 @@ pub async fn scan_for_media(
                     rows,
                     count,
                     bytes = bytes.len(),
+                    keyframe_count,
                     "built trickplay"
                 );
+                keyframe_count
             }
         }
         Err(e) => {
             tracing::debug!(media_id, video = %video.display(), %e, "trickplay extract failed");
+            None
         }
     }
 }
@@ -158,17 +166,38 @@ async fn build_sprite(
     interval: u32,
     cols: u32,
     rows: u32,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(Vec<u8>, Option<u32>)> {
     let started = std::time::Instant::now();
-    // 1/interval = one frame every `interval` seconds. We scale to exact
-    // tile dims (no pad/letterbox dance) — `tile` requires uniform input
-    // sizes, and pad+scale together stumble on pixel-format rounding for
-    // many sources ("Padded dimensions cannot be smaller than input").
-    // For 16:9 sources (the overwhelming majority) 240×135 is exact; on
-    // odd aspects the tile is mildly squished, which is fine for hover
-    // previews. `tile` then packs frames into the `cols x rows` grid.
+    // `-skip_frame nokey` makes the decoder discard P/B frames, so we only
+    // pay the cost of decoding I-frames — typically a 5–50× speedup
+    // depending on GOP size. The `fps=1/interval` filter then picks the
+    // keyframe nearest each interval slot, so a tile labelled e.g. "1m20s"
+    // may actually show the keyframe at 1m18s or 1m22s. Invisible at
+    // hover-preview fidelity; the data model (fixed interval → tile index)
+    // is preserved.
+    //
+    // `showinfo=checksum=0` is inserted *before* `fps` so it sees every
+    // input (keyframe-only) frame the decoder emits, not the
+    // post-decimation output. Each frame produces one stderr line of the
+    // form `[Parsed_showinfo_0 @ 0x…] n:N pts:…`; we count those after the
+    // run to populate `scan_timings.keyframe_count`.
+    //
+    // `checksum=0` is **load-bearing**: by default showinfo hashes every
+    // frame's pixel data (checksum, plane_checksum, mean, stdev), which
+    // for intra-only VP9 (~50 keyframes/sec at 1080p) bottlenecks the
+    // whole pipeline on memory bandwidth and is much slower than the
+    // decode itself. With it off we just pay for a stringified frame
+    // index per keyframe — negligible.
+    //
+    // We scale to exact tile dims (no pad/letterbox dance) — `tile`
+    // requires uniform input sizes, and pad+scale together stumble on
+    // pixel-format rounding for many sources ("Padded dimensions cannot be
+    // smaller than input"). For 16:9 sources (the overwhelming majority)
+    // 240×135 is exact; on odd aspects the tile is mildly squished, which
+    // is fine for hover previews. `tile` then packs frames into the
+    // `cols x rows` grid.
     let vf = format!(
-        "fps=1/{interval},scale={tw}:{th},setsar=1,tile={cols}x{rows}:padding={pad}:color=black",
+        "showinfo=checksum=0,fps=1/{interval},scale={tw}:{th},setsar=1,tile={cols}x{rows}:padding={pad}:color=black",
         interval = interval,
         tw = TILE_W,
         th = TILE_H,
@@ -176,10 +205,14 @@ async fn build_sprite(
         rows = rows,
         pad = TILE_PADDING,
     );
+    // `-v info` is needed for `showinfo`'s per-frame log lines; on success
+    // we discard stderr (after counting), on failure the extra context is
+    // useful for diagnosing.
     let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-y"])
+        .args(["-v", "info", "-nostdin", "-y"])
         .args(["-analyzeduration", "1000000"])
         .args(["-probesize", "1000000"])
+        .args(["-skip_frame", "nokey"])
         .arg("-i")
         .arg(video)
         .args(["-vf", &vf])
@@ -196,11 +229,24 @@ async fn build_sprite(
         );
     }
 
+    let keyframe_count = parse_showinfo_count(&output.stderr);
     tracing::debug!(
         video = %video.display(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         bytes = output.stdout.len(),
+        keyframe_count,
         "extracted trickplay sprite"
     );
-    Ok(output.stdout)
+    Ok((output.stdout, keyframe_count))
+}
+
+/// Count `Parsed_showinfo_0` lines in ffmpeg's stderr — one per source
+/// frame the decoder fed into the filter graph. With `-skip_frame nokey`
+/// upstream, that equals the number of keyframes in the file. Returns
+/// `None` if the marker is absent (older/altered ffmpeg log format) so
+/// the caller can distinguish "no signal" from "zero keyframes."
+fn parse_showinfo_count(stderr: &[u8]) -> Option<u32> {
+    let s = std::str::from_utf8(stderr).ok()?;
+    let n = s.matches("Parsed_showinfo_0").count();
+    if n == 0 { None } else { Some(n as u32) }
 }

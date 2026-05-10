@@ -29,7 +29,7 @@ fn now_ms() -> i64 {
 
 // ---- scan_timings --------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ScanTiming {
     pub probe_ms: u64,
     pub subtitles_ms: u64,
@@ -38,14 +38,30 @@ pub struct ScanTiming {
     pub trickplay_ms: u64,
     pub save_ms: u64,
     pub total_ms: u64,
+    // Source-side encoding info — populated from the pass-1 ffprobe
+    // results so a slow `trickplay_ms` can be correlated with the file's
+    // characteristics (codec, resolution, bitrate, GOP) without re-probing.
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub container: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub bitrate_kbps: Option<u64>,
+    pub pixel_format: Option<String>,
+    /// Number of keyframes ffmpeg saw while building the trickplay sprite.
+    /// Combined with `duration_ms` this gives an effective average GOP.
+    pub keyframe_count: Option<u32>,
 }
 
 pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming) {
     let res = sqlx::query(
         "INSERT INTO scan_timings
             (media_id, scanned_at, probe_ms, subtitles_ms, subtitle_tracks,
-             thumbnail_ms, trickplay_ms, save_ms, total_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             thumbnail_ms, trickplay_ms, save_ms, total_ms,
+             video_codec, audio_codec, container, width, height,
+             duration_ms, bitrate_kbps, pixel_format, keyframe_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(media_id)
     .bind(now_secs())
@@ -56,6 +72,15 @@ pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming
     .bind(t.trickplay_ms as i64)
     .bind(t.save_ms as i64)
     .bind(t.total_ms as i64)
+    .bind(t.video_codec)
+    .bind(t.audio_codec)
+    .bind(t.container)
+    .bind(t.width.map(|n| n as i64))
+    .bind(t.height.map(|n| n as i64))
+    .bind(t.duration_ms.map(|n| n as i64))
+    .bind(t.bitrate_kbps.map(|n| n as i64))
+    .bind(t.pixel_format)
+    .bind(t.keyframe_count.map(|n| n as i64))
     .execute(pool)
     .await;
     if let Err(e) = res {
