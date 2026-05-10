@@ -1,6 +1,7 @@
 //! Server-side runtime: DB, filesystem scanner, REST + WebSocket routes.
 //! Everything in this tree is `#[cfg(feature = "server")]` — never compiled for the WASM client.
 
+pub mod analytics;
 pub mod api;
 pub mod auth;
 pub mod db;
@@ -117,6 +118,7 @@ pub async fn run_scans(
             last_finished_at: prev_finished,
             last_summary: prev_summary,
             last_elapsed_ms: prev_elapsed,
+            active: Vec::new(),
         };
     }
     let mut agg = scanner::ScanStats::default();
@@ -154,6 +156,7 @@ pub async fn run_scans(
     p.running = false;
     p.phase = "idle".into();
     p.current = None;
+    p.active.clear();
     p.message = err;
     p.last_finished_at = Some(now);
     p.last_summary = Some(summary);

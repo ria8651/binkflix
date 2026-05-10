@@ -377,6 +377,12 @@ fn RescanButton() -> Element {
                         strong {
                             if running {
                                 if s.phase == "indexing" { "Indexing library…" }
+                                else if s.phase == "subtitles" { "Extracting subtitles…" }
+                                else if s.phase == "thumbnails" { "Extracting thumbnails…" }
+                                else if s.phase == "trickplay" { "Building trickplay…" }
+                                else if s.phase == "saving" { "Saving metadata…" }
+                                // Pre-0.9 builds and the brief moment between
+                                // phase 1 → phase 2 still report "assets".
                                 else if s.phase == "assets" { "Extracting assets…" }
                                 else { "Scanning…" }
                             } else {
@@ -404,7 +410,20 @@ fn RescanButton() -> Element {
                                 },
                             }
                         }
-                        if let Some(cur) = s.current.as_deref() {
+                        // Phase 2 (asset extraction) runs up to N files in
+                        // parallel, so list each one with its current stage.
+                        // Phase 1 (indexing) is sequential — fall back to the
+                        // single `current` filename row.
+                        if !s.active.is_empty() {
+                            div { class: "rescan-active",
+                                for j in s.active.iter() {
+                                    div { class: "rescan-active-row",
+                                        span { class: "rescan-active-title", "{j.title}" }
+                                        span { class: "rescan-active-stage", "{j.stage}" }
+                                    }
+                                }
+                            }
+                        } else if let Some(cur) = s.current.as_deref() {
                             div { class: "rescan-row muted rescan-current", "{cur}" }
                         }
                     } else {

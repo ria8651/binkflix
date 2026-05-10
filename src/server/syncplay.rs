@@ -1,3 +1,4 @@
+use super::analytics;
 use super::auth::Session;
 use super::AppState;
 use crate::types::{Broadcast, ClientMsg, Member, RoomState};
@@ -8,6 +9,8 @@ use axum::routing::get;
 use axum::{Extension, Router};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
+use serde_json::json;
+use sqlx::SqlitePool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -170,10 +173,28 @@ async fn ws_handler(
     Extension(session): Extension<Session>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.hub.clone(), room, session))
+    let hub = state.hub.clone();
+    let pool = state.pool.clone();
+    ws.on_upgrade(move |socket| handle_socket(socket, hub, pool, room, session))
 }
 
-async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, session: Session) {
+/// Pull the current media_id (if any) out of a room entry — best effort,
+/// returns None if the lock is poisoned or no media is set yet.
+fn current_media_id(entry: &RoomEntry) -> Option<String> {
+    entry
+        .state
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|s| s.media_id.clone()))
+}
+
+async fn handle_socket(
+    mut socket: WebSocket,
+    hub: Arc<Hub>,
+    pool: SqlitePool,
+    room: String,
+    session: Session,
+) {
     let Some(entry) = hub.get(&room) else {
         // Unknown room: send a close frame and bail. Prevents silent ghost-room creation.
         let _ = socket.send(Message::Close(None)).await;
@@ -228,6 +249,16 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
         left: None,
     });
 
+    analytics::record_event(
+        &pool,
+        "room.join",
+        Some(&session.user_sub),
+        current_media_id(&entry).as_deref(),
+        Some(&room),
+        &json!({ "client_id": client_id }),
+    )
+    .await;
+
     // Task: forward room broadcasts to this client.
     let outbound_id = client_id.clone();
     let mut outbound = tokio::spawn(async move {
@@ -262,6 +293,9 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
     let entry_in = entry.clone();
     let tx_in = tx.clone();
     let me_in = me.clone();
+    let pool_in = pool.clone();
+    let room_in = room.clone();
+    let user_sub_in = session.user_sub.clone();
     let mut inbound = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_stream.next().await {
             let text = match msg {
@@ -274,6 +308,10 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
                 continue;
             };
 
+            // (kind, media_id, data) for the analytics event, or None to skip
+            // (Ping/Heartbeat aren't user-meaningful actions).
+            let mut event: Option<(&'static str, Option<String>, serde_json::Value)> = None;
+
             let out = match parsed {
                 ClientMsg::Play { position_ms } => {
                     let version = update_state(&entry_in, |s| {
@@ -282,6 +320,11 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
                         s.updated_at = now_ms();
                     });
                     let Some(version) = version else { continue };
+                    event = Some((
+                        "room.play",
+                        current_media_id(&entry_in),
+                        json!({ "position_ms": position_ms, "version": version }),
+                    ));
                     Broadcast::Play {
                         position_ms,
                         server_ts: now_ms(),
@@ -296,6 +339,11 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
                         s.updated_at = now_ms();
                     });
                     let Some(version) = version else { continue };
+                    event = Some((
+                        "room.pause",
+                        current_media_id(&entry_in),
+                        json!({ "position_ms": position_ms, "version": version }),
+                    ));
                     Broadcast::Pause {
                         position_ms,
                         server_ts: now_ms(),
@@ -309,6 +357,11 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
                         s.updated_at = now_ms();
                     });
                     let Some(version) = version else { continue };
+                    event = Some((
+                        "room.seek",
+                        current_media_id(&entry_in),
+                        json!({ "position_ms": position_ms, "version": version }),
+                    ));
                     Broadcast::Seek {
                         position_ms,
                         server_ts: now_ms(),
@@ -329,6 +382,11 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
                         });
                         next
                     };
+                    event = Some((
+                        "room.set_media",
+                        Some(media_id.clone()),
+                        json!({ "version": version }),
+                    ));
                     Broadcast::SetMedia {
                         media_id,
                         server_ts: now_ms(),
@@ -346,6 +404,17 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
                     continue;
                 }
             };
+            if let Some((kind, media_id, data)) = event {
+                analytics::record_event(
+                    &pool_in,
+                    kind,
+                    Some(&user_sub_in),
+                    media_id.as_deref(),
+                    Some(&room_in),
+                    &data,
+                )
+                .await;
+            }
             let _ = tx_in.send(out);
         }
     });
@@ -375,6 +444,15 @@ async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>, room: String, sessi
         joined: None,
         left: Some(me.clone()),
     });
+    analytics::record_event(
+        &pool,
+        "room.leave",
+        Some(&session.user_sub),
+        current_media_id(&entry).as_deref(),
+        Some(&room),
+        &json!({ "client_id": client_id }),
+    )
+    .await;
     info!(%room, %client_id, username = %me.username, "syncplay client left");
     drop(entry);
     hub.maybe_drop(&room);

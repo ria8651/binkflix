@@ -1,7 +1,8 @@
+use super::analytics::{self, ScanTiming};
 use super::filename;
 use super::nfo::{self, EpisodeNfo, MovieNfo};
 use super::{subtitles, thumbnails, trickplay};
-use crate::types::ScanProgress;
+use crate::types::{ActiveJob, ScanProgress};
 use chrono::NaiveDateTime;
 use futures::stream::{self, StreamExt};
 use sqlx::SqlitePool;
@@ -19,6 +20,14 @@ pub type ProgressHandle = Arc<RwLock<ScanProgress>>;
 async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)) {
     let mut p = handle.write().await;
     f(&mut p);
+}
+
+async fn add_active(handle: &ProgressHandle, media_id: &str, title: &str, stage: &str) {
+    handle.write().await.active.push(ActiveJob {
+        media_id: media_id.into(),
+        title: title.into(),
+        stage: stage.into(),
+    });
 }
 
 const VIDEO_EXTENSIONS: &[&str] =
@@ -438,34 +447,62 @@ pub async fn scan_library_with_progress(
         "library indexed — extracting assets",
     );
 
-    // --- Phase 2: extract subtitles + thumbnails in parallel. Bounded
-    // concurrency so we don't thrash spinning disks; each job is independent
-    // and writes back to the pool directly.
+    // --- Phase 2: stage-by-stage passes prioritised by user value.
+    //
+    // Subtitles are the only asset that unlocks playability, so we finish
+    // them for *every* file before any thumbnail or trickplay sprite is
+    // touched. Likewise thumbnails (browse-page eye candy) before trickplay
+    // (scrub-bar polish). Within each pass we still run up to `concurrency`
+    // files in parallel, just at the same stage.
+    //
+    // Trade-off: a file that would have been "fully done" 30 seconds in
+    // (under the old per-file pipeline) now waits until pass 3 to get its
+    // trickplay. The win is the global ordering — playable library faster.
     let total = asset_jobs.len();
-    if let Some(p) = &progress {
-        set_progress(p, |s| {
-            s.phase = "assets".into();
-            s.done = 0;
-            s.total = total;
-            s.current = None;
-        })
-        .await;
-    }
     if total > 0 {
         let assets_started = std::time::Instant::now();
         let pool = pool.clone();
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let progress = progress.clone();
-        stream::iter(asset_jobs.into_iter())
-            .for_each_concurrent(concurrency, |job| {
+
+        // Per-file accumulator carried through the four passes. We capture
+        // each stage's elapsed_ms here and INSERT one `scan_timings` row at
+        // the end so the row is whole rather than written piecemeal.
+        // Per-file accumulator threaded through the four passes. `save_ms`
+        // is computed inline in pass 4 (no need to store).
+        struct PerFile {
+            job: AssetJob,
+            tech_info: Option<crate::types::MediaTechInfo>,
+            sub_tracks: u32,
+            probe_ms: u64,
+            subtitles_ms: u64,
+            thumbnail_ms: u64,
+            trickplay_ms: u64,
+            started: std::time::Instant,
+        }
+
+        // -- Pass 1: probe + subtitles -----------------------------------
+        if let Some(p) = &progress {
+            set_progress(p, |s| {
+                s.phase = "subtitles".into();
+                s.done = 0;
+                s.total = total;
+                s.current = None;
+                s.active.clear();
+            })
+            .await;
+        }
+        let done_p1 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pass1: Vec<PerFile> = stream::iter(asset_jobs.into_iter())
+            .map(|job| {
                 let pool = pool.clone();
-                let done = done.clone();
                 let progress = progress.clone();
+                let done = done_p1.clone();
                 async move {
-                    let job_started = std::time::Instant::now();
-                    // Single ffprobe per file: gives us tech info AND the
-                    // embedded subtitle stream list, so subtitles::scan_for_media
-                    // doesn't have to spawn its own ffprobe.
+                    let started = std::time::Instant::now();
+                    if let Some(p) = &progress {
+                        add_active(p, &job.media_id, &job.title, "subtitles").await;
+                    }
+                    let t = std::time::Instant::now();
                     let (tech_info, embedded_subs) = match super::media_info::probe_full(&job.video).await {
                         Ok(pair) => (Some(pair.0), pair.1),
                         Err(e) => {
@@ -473,6 +510,9 @@ pub async fn scan_library_with_progress(
                             (None, Vec::new())
                         }
                     };
+                    let probe_ms = t.elapsed().as_millis() as u64;
+
+                    let t = std::time::Instant::now();
                     let sub_count = match subtitles::scan_for_media(&pool, &job.media_id, &job.video, &embedded_subs).await {
                         Ok(n) => n,
                         Err(e) => {
@@ -480,41 +520,210 @@ pub async fn scan_library_with_progress(
                             0
                         }
                     };
-                    if !job.has_sidecar_image {
-                        thumbnails::scan_for_media(&pool, &job.media_id, &job.video).await;
-                    }
-                    trickplay::scan_for_media(
-                        &pool,
-                        &job.media_id,
-                        &job.video,
-                        tech_info.as_ref().and_then(|i| i.duration_seconds),
-                    )
-                    .await;
-                    if let Some(info) = tech_info {
-                        if let Err(e) = super::media_info::store(&pool, &job.media_id, &info).await {
-                            warn!(media_id = %job.media_id, %e, "failed to cache tech info");
-                        }
-                    }
+                    let subtitles_ms = t.elapsed().as_millis() as u64;
+
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = job.title.clone();
+                        let media_id = job.media_id.clone();
                         set_progress(p, |s| {
                             s.done = n;
                             s.current = Some(title);
+                            s.active.retain(|j| j.media_id != media_id);
+                        })
+                        .await;
+                    }
+                    debug!(
+                        progress = format!("{n}/{total}"),
+                        title = %job.title,
+                        subs = sub_count,
+                        elapsed_ms = subtitles_ms,
+                        "subtitles done",
+                    );
+                    PerFile {
+                        job,
+                        tech_info,
+                        sub_tracks: embedded_subs.len() as u32,
+                        probe_ms,
+                        subtitles_ms,
+                        thumbnail_ms: 0,
+                        trickplay_ms: 0,
+                        started,
+                    }
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+        info!(
+            total = pass1.len(),
+            elapsed_ms = assets_started.elapsed().as_millis() as u64,
+            "subtitles pass complete",
+        );
+
+        // -- Pass 2: thumbnails ------------------------------------------
+        if let Some(p) = &progress {
+            set_progress(p, |s| {
+                s.phase = "thumbnails".into();
+                s.done = 0;
+                s.total = pass1.len();
+                s.active.clear();
+            })
+            .await;
+        }
+        let done_p2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pass1_total = pass1.len();
+        let pass2: Vec<PerFile> = stream::iter(pass1.into_iter())
+            .map(|mut f| {
+                let pool = pool.clone();
+                let progress = progress.clone();
+                let done = done_p2.clone();
+                async move {
+                    if !f.job.has_sidecar_image {
+                        if let Some(p) = &progress {
+                            add_active(p, &f.job.media_id, &f.job.title, "thumbnail").await;
+                        }
+                        let t = std::time::Instant::now();
+                        thumbnails::scan_for_media(&pool, &f.job.media_id, &f.job.video).await;
+                        f.thumbnail_ms = t.elapsed().as_millis() as u64;
+                    }
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some(p) = &progress {
+                        let title = f.job.title.clone();
+                        let media_id = f.job.media_id.clone();
+                        set_progress(p, |s| {
+                            s.done = n;
+                            s.current = Some(title);
+                            s.active.retain(|j| j.media_id != media_id);
+                        })
+                        .await;
+                    }
+                    f
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+        info!(
+            total = pass1_total,
+            elapsed_ms = assets_started.elapsed().as_millis() as u64,
+            "thumbnails pass complete",
+        );
+
+        // -- Pass 3: trickplay -------------------------------------------
+        if let Some(p) = &progress {
+            set_progress(p, |s| {
+                s.phase = "trickplay".into();
+                s.done = 0;
+                s.total = pass2.len();
+                s.active.clear();
+            })
+            .await;
+        }
+        let done_p3 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pass3: Vec<PerFile> = stream::iter(pass2.into_iter())
+            .map(|mut f| {
+                let pool = pool.clone();
+                let progress = progress.clone();
+                let done = done_p3.clone();
+                async move {
+                    if let Some(p) = &progress {
+                        add_active(p, &f.job.media_id, &f.job.title, "trickplay").await;
+                    }
+                    let t = std::time::Instant::now();
+                    trickplay::scan_for_media(
+                        &pool,
+                        &f.job.media_id,
+                        &f.job.video,
+                        f.tech_info.as_ref().and_then(|i| i.duration_seconds),
+                    )
+                    .await;
+                    f.trickplay_ms = t.elapsed().as_millis() as u64;
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some(p) = &progress {
+                        let title = f.job.title.clone();
+                        let media_id = f.job.media_id.clone();
+                        set_progress(p, |s| {
+                            s.done = n;
+                            s.current = Some(title);
+                            s.active.retain(|j| j.media_id != media_id);
+                        })
+                        .await;
+                    }
+                    f
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        // -- Pass 4: save tech info + record scan_timings -----------------
+        if let Some(p) = &progress {
+            set_progress(p, |s| {
+                s.phase = "saving".into();
+                s.done = 0;
+                s.total = pass3.len();
+                s.active.clear();
+            })
+            .await;
+        }
+        let done_p4 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        stream::iter(pass3.into_iter())
+            .map(|mut f| {
+                let pool = pool.clone();
+                let progress = progress.clone();
+                let done = done_p4.clone();
+                async move {
+                    if let Some(p) = &progress {
+                        add_active(p, &f.job.media_id, &f.job.title, "saving").await;
+                    }
+                    let t = std::time::Instant::now();
+                    if let Some(info) = f.tech_info.take() {
+                        if let Err(e) = super::media_info::store(&pool, &f.job.media_id, &info).await {
+                            warn!(media_id = %f.job.media_id, %e, "failed to cache tech info");
+                        }
+                    }
+                    let save_ms = t.elapsed().as_millis() as u64;
+
+                    let total_ms = f.started.elapsed().as_millis() as u64;
+                    analytics::record_scan_timing(
+                        &pool,
+                        &f.job.media_id,
+                        ScanTiming {
+                            probe_ms: f.probe_ms,
+                            subtitles_ms: f.subtitles_ms,
+                            subtitle_tracks: f.sub_tracks,
+                            thumbnail_ms: f.thumbnail_ms,
+                            trickplay_ms: f.trickplay_ms,
+                            save_ms,
+                            total_ms,
+                        },
+                    )
+                    .await;
+
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if let Some(p) = &progress {
+                        let title = f.job.title.clone();
+                        let media_id = f.job.media_id.clone();
+                        set_progress(p, |s| {
+                            s.done = n;
+                            s.current = Some(title);
+                            s.active.retain(|j| j.media_id != media_id);
                         })
                         .await;
                     }
                     info!(
                         progress = format!("{n}/{total}"),
-                        title = %job.title,
-                        subs = sub_count,
-                        thumb = !job.has_sidecar_image,
-                        elapsed_ms = job_started.elapsed().as_millis() as u64,
+                        title = %f.job.title,
+                        elapsed_ms = total_ms,
                         "assets extracted",
                     );
                 }
             })
+            .buffer_unordered(concurrency)
+            .for_each(|_| async {})
             .await;
+
         info!(
             total,
             assets_elapsed_ms = assets_started.elapsed().as_millis() as u64,

@@ -1,3 +1,4 @@
+use super::analytics::{self, PlaybackSample};
 use super::error::{Error, Result};
 use super::{media_info, subtitles, thumbnails, trickplay};
 use super::AppState;
@@ -6,7 +7,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -42,6 +43,43 @@ pub fn router() -> Router<AppState> {
             "/api/preferences/{scope}",
             get(super::preferences::get_preferences).post(super::preferences::set_preferences),
         )
+        .route("/api/playback/sample", post(playback_sample))
+}
+
+#[derive(Deserialize)]
+struct PlaybackSampleBody {
+    session_id: String,
+    position_ms: i64,
+    buffered_ahead_ms: Option<i64>,
+    transcode_position_ms: Option<i64>,
+    /// Transcode rate as `realtime × 100` (e.g. 125 == 1.25× realtime).
+    /// Integer rather than float so SQL aggregation (avg, min, max) is
+    /// straightforward and we don't pay for `REAL` storage on every row.
+    transcode_rate_x100: Option<i64>,
+    observed_kbps: Option<i64>,
+    /// `idle` | `loading` | `stalled` — matches the HTMLMediaElement
+    /// `networkState` enum surface the player can observe.
+    network_state: Option<String>,
+}
+
+async fn playback_sample(
+    State(state): State<AppState>,
+    Json(body): Json<PlaybackSampleBody>,
+) -> StatusCode {
+    analytics::record_playback_sample(
+        &state.pool,
+        PlaybackSample {
+            session_id: &body.session_id,
+            position_ms: body.position_ms,
+            buffered_ahead_ms: body.buffered_ahead_ms,
+            transcode_position_ms: body.transcode_position_ms,
+            transcode_rate_x100: body.transcode_rate_x100,
+            observed_kbps: body.observed_kbps,
+            network_state: body.network_state.as_deref(),
+        },
+    )
+    .await;
+    StatusCode::NO_CONTENT
 }
 
 async fn scan_status(State(state): State<AppState>) -> Json<crate::types::ScanProgress> {

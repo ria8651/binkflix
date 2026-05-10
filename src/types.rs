@@ -262,6 +262,17 @@ pub struct CreateRoomResp {
     pub id: String,
 }
 
+/// One asset-extraction job currently in flight during phase 2. Phase 2 runs
+/// up to `BINKFLIX_SCAN_CONCURRENCY` of these in parallel, and `current`
+/// can only hold one filename, so we list them out separately for the UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActiveJob {
+    pub media_id: String,
+    pub title: String,
+    /// "probing" | "subtitles" | "thumbnail" | "trickplay" | "saving"
+    pub stage: String,
+}
+
 /// Live status of a library scan. Polled by the UI to drive the rescan button
 /// and progress bar. `total` is 0 until phase 1 finishes (we don't know the
 /// asset-job count yet).
@@ -279,6 +290,10 @@ pub struct ScanProgress {
     pub last_summary: Option<String>,
     /// Elapsed time of the last completed scan.
     pub last_elapsed_ms: Option<u64>,
+    /// Phase-2 jobs currently running, with their stage. Phase 1 leaves this
+    /// empty and uses `current` instead.
+    #[serde(default)]
+    pub active: Vec<ActiveJob>,
 }
 
 /// Messages a client sends to the server.

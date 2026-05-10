@@ -13,6 +13,7 @@
 use crate::server::media_info::EmbeddedSubtitleStream;
 use crate::types::SubtitleTrack;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -110,10 +111,24 @@ pub async fn scan_for_media(
         }
     }
 
-    // Embedded: one ffmpeg per text track. (Stream list pre-probed by caller.)
-    for e in classify_embedded(embedded) {
-        match extract_embedded(video, e.stream_index, &e.codec, e.target_format).await {
-            Ok(content) => tracks.push(Extracted {
+    // Embedded: one ffmpeg invocation extracts every text track in one read
+    // pass. On failure (e.g. one corrupt stream poisoning the batch) we fall
+    // back to per-track invocations so the rest of the tracks still land.
+    let classified = classify_embedded(embedded);
+    let by_index: HashMap<u32, Vec<u8>> = match extract_all_embedded(video, &classified).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(
+                video = %video.display(),
+                %e,
+                "batched subtitle extract failed; falling back to per-track"
+            );
+            extract_per_track_fallback(video, &classified).await
+        }
+    };
+    for e in classified {
+        if let Some(content) = by_index.get(&e.stream_index).cloned() {
+            tracks.push(Extracted {
                 track_id: format!("embed-{}", e.stream_index),
                 format: e.target_format,
                 language: e.language,
@@ -121,13 +136,7 @@ pub async fn scan_for_media(
                 default: e.default,
                 forced: e.forced,
                 content,
-            }),
-            Err(err) => tracing::warn!(
-                video = %video.display(),
-                stream = e.stream_index,
-                %err,
-                "embedded subtitle extract failed"
-            ),
+            });
         }
     }
 
@@ -268,6 +277,100 @@ fn classify_embedded(streams: &[EmbeddedSubtitleStream]) -> Vec<EmbeddedMeta> {
             default: s.disposition.get("default").copied().unwrap_or(0) != 0,
             forced: s.disposition.get("forced").copied().unwrap_or(0) != 0,
         });
+    }
+    out
+}
+
+/// Extract every embedded text track in `embeds` with a single ffmpeg
+/// invocation (one input read pass, N outputs to a tempdir). Returns a map
+/// keyed by `stream_index` so the caller can pair each blob with its
+/// `EmbeddedMeta`.
+///
+/// On slow storage the saving here is large: ffmpeg opens the input once,
+/// runs the demuxer once, and writes all subtitle outputs from the same
+/// packet stream — versus N opens + N demuxer inits with the per-track path.
+async fn extract_all_embedded(
+    video: &Path,
+    embeds: &[EmbeddedMeta],
+) -> anyhow::Result<HashMap<u32, Vec<u8>>> {
+    if embeds.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let dir = tempfile::Builder::new().prefix("binkflix-subs-").tempdir()?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error", "-nostdin", "-y"])
+        // See `extract_per_track_fallback` for why these caps matter.
+        .args(["-analyzeduration", "1000000"])
+        .args(["-probesize", "1000000"])
+        .args(["-fflags", "+nobuffer"])
+        .arg("-i")
+        .arg(video);
+
+    let mut outputs: Vec<(u32, PathBuf)> = Vec::with_capacity(embeds.len());
+    for e in embeds {
+        let copy_ok = (e.target_format == "ass" && (e.codec == "ass" || e.codec == "ssa"))
+            || (e.target_format == "vtt" && e.codec == "webvtt");
+        let fmt = if e.target_format == "ass" { "ass" } else { "webvtt" };
+        let ext = if e.target_format == "ass" { "ass" } else { "vtt" };
+        let path = dir.path().join(format!("{}.{ext}", e.stream_index));
+        // Per-output options bind to the next output file in argv — so
+        // mixing copy (for already-text codecs) and transcode (for
+        // mov_text → webvtt etc.) within one invocation is fine.
+        cmd.args(["-map", &format!("0:{}", e.stream_index)]);
+        if copy_ok {
+            cmd.args(["-c:s", "copy"]);
+        }
+        cmd.args(["-f", fmt]).arg(&path);
+        outputs.push((e.stream_index, path));
+    }
+
+    let started = std::time::Instant::now();
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "ffmpeg extract failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let mut map = HashMap::with_capacity(outputs.len());
+    for (idx, p) in &outputs {
+        match tokio::fs::read(p).await {
+            Ok(b) => {
+                map.insert(*idx, b);
+            }
+            Err(e) => tracing::warn!(stream = idx, %e, "subtitle output missing"),
+        }
+    }
+    tracing::debug!(
+        video = %video.display(),
+        tracks = map.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "extracted embedded subtitles (batched)",
+    );
+    Ok(map)
+}
+
+/// Per-track fallback when the batched path fails (e.g. one corrupt stream).
+/// Spawns one ffmpeg per track and discards individual failures so a single
+/// bad track can't take down the whole file's subtitles.
+async fn extract_per_track_fallback(
+    video: &Path,
+    embeds: &[EmbeddedMeta],
+) -> HashMap<u32, Vec<u8>> {
+    let mut out = HashMap::new();
+    for e in embeds {
+        match extract_embedded(video, e.stream_index, &e.codec, e.target_format).await {
+            Ok(content) => {
+                out.insert(e.stream_index, content);
+            }
+            Err(err) => tracing::warn!(
+                video = %video.display(),
+                stream = e.stream_index,
+                %err,
+                "embedded subtitle extract failed (per-track fallback)"
+            ),
+        }
     }
     out
 }

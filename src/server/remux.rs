@@ -25,9 +25,11 @@
 //! ffmpeg is killed when the HTTP response body drops (client disconnect,
 //! tab close, new src) via `Child::kill_on_drop`.
 
+use super::analytics::{self, PlaybackSessionStart};
+use super::auth::Session;
 use super::error::{Error, Result};
 use super::AppState;
-use crate::types::BrowserCompat;
+use crate::types::{BrowserCompat, MediaTechInfo};
 use axum::body::Body;
 use bytes::Bytes;
 use axum::extract::{Path, Query, State};
@@ -35,6 +37,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::stream;
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
@@ -76,9 +79,33 @@ pub async fn media_stream(
         None => verdict_for(&state, &id, &path).await,
     };
 
+    // Snapshot enough source detail to make later analysis self-contained
+    // (codecs may change if the user replaces a file). Probe-on-miss so
+    // freshly-added files still record real codecs rather than NULL.
+    let info = load_or_probe_info(&state, &id, &path).await;
+    // Pull request-scoped data out into owned values *before* the next
+    // `.await` so the handler future stays `Send` — borrowing through
+    // `&req` across an await trips axum's Handler trait inference.
+    let user_sub = req.extensions().get::<Session>().map(|s| s.user_sub.clone());
+    let browser = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(analytics::parse_ua);
+    let session_id = open_playback_session(
+        &state.pool,
+        &id,
+        mode,
+        q.mode.is_some(),
+        &info,
+        user_sub,
+        browser,
+    )
+    .await;
+
     match mode {
         BrowserCompat::Direct => direct_stream(&path, req).await,
-        BrowserCompat::Remux => remux_stream(&state, &id, &path).await,
+        BrowserCompat::Remux => remux_stream(&state, &id, &path, session_id).await,
         // Transcode is delivered via the HLS pipeline (`-c:v libx264`
         // segmented into fMP4). The client picks that URL directly when
         // the compat verdict is Transcode; this branch only fires for
@@ -93,6 +120,78 @@ pub async fn media_stream(
                 .into_response())
         }
     }
+}
+
+async fn load_or_probe_info(state: &AppState, id: &str, path: &str) -> Option<MediaTechInfo> {
+    if let Ok(Some(info)) = super::media_info::load(&state.pool, id).await {
+        return Some(info);
+    }
+    super::media_info::probe(std::path::Path::new(path)).await.ok()
+}
+
+fn delivery_mode_str(m: BrowserCompat) -> &'static str {
+    match m {
+        BrowserCompat::Direct => "direct",
+        BrowserCompat::Remux => "remux",
+        BrowserCompat::Transcode => "transcode",
+    }
+}
+
+/// INSERT a `playback_sessions` row and return its id. Best-effort: if the
+/// insert fails the session id is still useful as a correlation key for
+/// downstream samples, even though they'll lack the parent row.
+async fn open_playback_session(
+    pool: &SqlitePool,
+    media_id: &str,
+    mode: BrowserCompat,
+    forced_via_query: bool,
+    info: &Option<MediaTechInfo>,
+    user_sub: Option<String>,
+    browser: Option<String>,
+) -> String {
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+
+    let src_video_codec = info.as_ref().and_then(|i| i.video.as_ref()).map(|v| v.codec.clone());
+    let src_audio_codec = info
+        .as_ref()
+        .and_then(|i| i.audio.iter().find(|a| a.default).or_else(|| i.audio.first()))
+        .map(|a| a.codec.clone());
+    let src_container = info.as_ref().and_then(|i| i.container.clone());
+
+    // The verdict's free-text rationale (e.g. "container matroska needs
+    // repackaging to mp4") is the most useful "why" we have. For ?mode=
+    // overrides, prefix to make the override obvious in queries.
+    let chosen_reason = if forced_via_query {
+        Some(format!("forced_via_query:{}", delivery_mode_str(mode)))
+    } else {
+        info.as_ref().and_then(|i| i.compat_reason.clone())
+    };
+
+    analytics::open_playback_session(
+        pool,
+        PlaybackSessionStart {
+            id: &session_id,
+            user_sub: user_sub.as_deref(),
+            media_id,
+            delivery_mode: delivery_mode_str(mode),
+            chosen_reason: chosen_reason.as_deref(),
+            src_video_codec: src_video_codec.as_deref(),
+            src_audio_codec: src_audio_codec.as_deref(),
+            src_container: src_container.as_deref(),
+            // `out_*` and `target_bitrate_kbps` are filled in by the per-mode
+            // path once it knows them (currently only remux_stream).
+            out_video_codec: None,
+            out_audio_codec: None,
+            out_container: None,
+            target_bitrate_kbps: None,
+            browser: browser.as_deref(),
+            room_id: None,
+            forced_via_query,
+        },
+    )
+    .await;
+
+    session_id
 }
 
 async fn verdict_for(state: &AppState, id: &str, path: &str) -> BrowserCompat {
@@ -138,7 +237,12 @@ enum OutputFamily {
     WebM,
 }
 
-async fn remux_stream(state: &AppState, id: &str, path: &str) -> Result<Response> {
+async fn remux_stream(
+    state: &AppState,
+    id: &str,
+    path: &str,
+    session_id: String,
+) -> Result<Response> {
     // Cached probe carries both the duration (for mvhd) and the video
     // codec (which decides MP4 vs WebM output). Cache miss = live probe
     // so freshly-added files still work.
@@ -251,6 +355,29 @@ async fn remux_stream(state: &AppState, id: &str, path: &str) -> Result<Response
         .take()
         .ok_or_else(|| Error::Other(anyhow::anyhow!("ffmpeg stdout missing")))?;
 
+    // Now that we know the actual output codecs/container, fill them into
+    // the session row. `audio_action` is "copy" when we keep the source
+    // codec — record the source codec in that case rather than the literal
+    // string "copy", so queries against `out_audio_codec` see real codecs.
+    let out_audio_codec_label: String = match audio_action {
+        "copy" => src_audio_codec.unwrap_or("copy").to_string(),
+        other => other.to_string(),
+    };
+    let out_container_label = match family {
+        OutputFamily::Mp4 => "mp4",
+        OutputFamily::WebM => "webm",
+    };
+    analytics::set_playback_outputs(
+        &state.pool,
+        &session_id,
+        // `-c:v copy` always: report the actual source codec, not "copy".
+        info.as_ref().and_then(|i| i.video.as_ref()).map(|v| v.codec.as_str()),
+        Some(&out_audio_codec_label),
+        Some(out_container_label),
+        None,
+    )
+    .await;
+
     // Hold the Child inside the stream's state so kill_on_drop fires the
     // instant the response body is dropped (client disconnects, switches
     // source, etc.). If we let `child` drop here, ffmpeg would be killed
@@ -269,6 +396,10 @@ async fn remux_stream(state: &AppState, id: &str, path: &str) -> Result<Response
         StreamState {
             stdout,
             _child: child,
+            _session: SessionEndGuard {
+                pool: state.pool.clone(),
+                session_id,
+            },
             phase: if patch_moov {
                 Phase::Buffering { buf: Vec::with_capacity(64 * 1024), total_secs: duration }
             } else {
@@ -361,7 +492,31 @@ async fn remux_stream(state: &AppState, id: &str, path: &str) -> Result<Response
 struct StreamState {
     stdout: ChildStdout,
     _child: Child,
+    _session: SessionEndGuard,
     phase: Phase,
+}
+
+/// Closes the `playback_sessions` row when the response body terminates —
+/// either a clean stream end (unfold returns None and drops the state) or a
+/// client disconnect (axum drops the body, which drops the state). Spawned
+/// async so Drop stays sync; the close is idempotent at the SQL level
+/// (`WHERE ended_at IS NULL`).
+struct SessionEndGuard {
+    pool: SqlitePool,
+    session_id: String,
+}
+
+impl Drop for SessionEndGuard {
+    fn drop(&mut self) {
+        if self.session_id.is_empty() {
+            return;
+        }
+        let pool = self.pool.clone();
+        let id = std::mem::take(&mut self.session_id);
+        tokio::spawn(async move {
+            analytics::close_playback_session(&pool, &id, None).await;
+        });
+    }
 }
 
 enum Phase {
