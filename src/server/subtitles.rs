@@ -297,7 +297,7 @@ async fn extract_all_embedded(
         return Ok(HashMap::new());
     }
 
-    let dir = tempfile::Builder::new().prefix("binkflix-subs-").tempdir()?;
+    let dir = crate::server::tmp::tempdir("binkflix-subs-")?;
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-nostdin", "-y"])
         // See `extract_per_track_fallback` for why these caps matter.

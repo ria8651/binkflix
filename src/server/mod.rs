@@ -16,6 +16,7 @@ pub mod scanner;
 pub mod subtitles;
 pub mod syncplay;
 pub mod thumbnails;
+pub mod tmp;
 pub mod trickplay;
 pub mod watch;
 
@@ -218,6 +219,10 @@ async fn run_async() -> anyhow::Result<()> {
     // before we start fresh so they don't compete with the new
     // producers for the same plan dirs.
     hls::sweep_orphan_ffmpegs().await;
+
+    // Same idea for the unified scratch dir: ensure it exists and clear
+    // any leftovers from a prior crashed run.
+    tmp::init_and_sweep().await;
 
     // Probe ffmpeg once for hw H.264 encoders; pinned for the process.
     let hwenc = hls::detect_hwenc().await;

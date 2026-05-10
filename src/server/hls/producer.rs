@@ -172,8 +172,12 @@ pub struct ProducerHandle {
     pub child: Child,
     /// Per-run scratch dir. ffmpeg writes here; watcher promotes to
     /// canonical (only for segments at-or-after target_idx, only if
-    /// canonical is empty — first-write-wins).
-    pub run_dir: PathBuf,
+    /// canonical is empty — first-write-wins). Held only for its
+    /// `Drop` side-effect, which removes the directory on producer
+    /// shutdown (or panic). Co-located under `plan_dir` because the
+    /// watcher promotes via `tokio::fs::hard_link`, which can't cross
+    /// filesystems.
+    _run_dir: tempfile::TempDir,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -190,7 +194,9 @@ impl ProducerHandle {
         }
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
-        let _ = tokio::fs::remove_dir_all(&self.run_dir).await;
+        // `self._run_dir` (TempDir) is dropped at end-of-scope, which
+        // removes the scratch dir synchronously. A handful of small
+        // segments — fine to do inline rather than via spawn_blocking.
     }
 }
 
@@ -428,15 +434,15 @@ async fn launch_once(
     let ff_start_idx = target_idx.saturating_sub(PREROLL_SEGMENTS).max(1);
 
     // Per-run scratch dir. Each run gets its own folder so concurrent
-    // promotions can hard-link into canonical without colliding. Run id
-    // mixes pid with a monotonic counter so back-to-back launches in
-    // the same process can't share a directory name.
-    static RUN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let run_id = ((std::process::id() as u64) << 32)
-        | RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let run_dir = ctx.plan_dir.join(format!("_run-{run_id:016x}"));
-    let _ = tokio::fs::remove_dir_all(&run_dir).await;
-    tokio::fs::create_dir_all(&run_dir).await?;
+    // promotions can hard-link into canonical without colliding. The
+    // tempfile-generated random suffix makes back-to-back launches
+    // collision-free; Drop removes the dir on producer shutdown (or
+    // crash). Parent stays `plan_dir` because the watcher hard-links
+    // segments into the canonical paths and hard-links can't cross
+    // filesystems.
+    let run_dir = tempfile::Builder::new()
+        .prefix("_run-")
+        .tempdir_in(&ctx.plan_dir)?;
 
     let seg = ctx
         .plan
@@ -450,7 +456,7 @@ async fn launch_once(
         target_idx, ff_start_idx, start_t,
         "launching producer ffmpeg"
     );
-    let (mut child, argv) = spawn_ffmpeg(&ctx, ff_start_idx, start_t, &run_dir)?;
+    let (mut child, argv) = spawn_ffmpeg(&ctx, ff_start_idx, start_t, run_dir.path())?;
 
     // Persist the exact ffmpeg invocation per plan so a future failure
     // can be diagnosed without scraping container logs — "ask the user
@@ -512,7 +518,7 @@ async fn launch_once(
 
     let watcher = spawn_watcher(
         ctx.plan_dir.clone(),
-        run_dir.clone(),
+        run_dir.path().to_path_buf(),
         head.clone(),
         total_segments,
         target_idx,
@@ -533,7 +539,7 @@ async fn launch_once(
         paused,
         last_request_at,
         child,
-        run_dir,
+        _run_dir: run_dir,
         tasks: vec![watcher, reaper],
     })
 }
