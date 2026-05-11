@@ -125,6 +125,20 @@
 
   /* Page backdrop — themes can paint a gradient or image behind --bg-page */
   --bg-page-overlay: none;
+
+  /* Video player scrub bar — hitbox is always --scrub-hitbox tall so the
+   * cursor has somewhere generous to land for trickplay previews; the
+   * visible track sits inside via padding (idle/hover) and grows on hover
+   * without changing the hitbox. Stops on the played/buffered gradient are
+   * offset by half the thumb width so the fill aligns with the thumb's
+   * centre across the full travel. */
+  --scrub-hitbox: 20px;
+  --scrub-thumb: 16px;
+  --scrub-pad-idle: 6px;
+  --scrub-pad-hover: 4.5px;
+  --scrub-track-played: var(--accent);
+  --scrub-track-buffered: rgb(255 255 255 / 0.38);
+  --scrub-track-rest: rgb(255 255 255 / 0.18);
 }
 
 /* ── Classic light theme ─────────────────────────────────────── */

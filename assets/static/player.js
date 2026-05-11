@@ -286,8 +286,8 @@ function initControls(videoId) {
             } catch (_) { /* ignore */ }
         }
         buffered = Math.max(buffered, played);
-        scrub.style.setProperty("--played", played + "%");
-        scrub.style.setProperty("--buffered", buffered + "%");
+        scrub.style.setProperty("--played", played);
+        scrub.style.setProperty("--buffered", buffered);
     };
 
     const syncTime = () => {

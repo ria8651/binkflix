@@ -761,39 +761,42 @@ h2.section {
 }
 
 .player-scrub {
-    --played: 0%;
-    --buffered: 0%;
+    --played: 0;
+    --buffered: 0;
     width: 100%;
     -webkit-appearance: none;
     appearance: none;
-    height: 5px;
-    background: linear-gradient(
-        to right,
-        var(--accent) 0%,
-        var(--accent) var(--played),
-        rgb(255 255 255 / 0.38) var(--played),
-        rgb(255 255 255 / 0.38) var(--buffered),
-        rgb(255 255 255 / 0.18) var(--buffered),
-        rgb(255 255 255 / 0.18) 100%
-    );
+    height: var(--scrub-hitbox);
+    background:
+        linear-gradient(
+            to right,
+            var(--scrub-track-played) 0%,
+            var(--scrub-track-played) calc(var(--scrub-thumb) / 2 + (100% - var(--scrub-thumb)) * var(--played) / 100),
+            var(--scrub-track-buffered) calc(var(--scrub-thumb) / 2 + (100% - var(--scrub-thumb)) * var(--played) / 100),
+            var(--scrub-track-buffered) calc(var(--scrub-thumb) / 2 + (100% - var(--scrub-thumb)) * var(--buffered) / 100),
+            var(--scrub-track-rest) calc(var(--scrub-thumb) / 2 + (100% - var(--scrub-thumb)) * var(--buffered) / 100),
+            var(--scrub-track-rest) 100%
+        )
+        content-box;
+    padding: var(--scrub-pad-idle) 0;
     border-radius: 3px;
     cursor: pointer;
-    margin: 0 0 var(--space-5);
-    transition: height 120ms ease;
+    margin: 0;
+    transition: padding 120ms ease;
 }
-.player-scrub:hover { height: 7px; }
+.player-scrub:hover { padding: var(--scrub-pad-hover) 0; }
 .player-scrub::-webkit-slider-thumb {
     -webkit-appearance: none;
-    width: 14px;
-    height: 14px;
+    width: var(--scrub-thumb);
+    height: var(--scrub-thumb);
     border-radius: 50%;
     background: var(--accent);
     cursor: pointer;
     border: none;
 }
 .player-scrub::-moz-range-thumb {
-    width: 14px;
-    height: 14px;
+    width: var(--scrub-thumb);
+    height: var(--scrub-thumb);
     border-radius: 50%;
     background: var(--accent);
     cursor: pointer;
