@@ -584,6 +584,13 @@ function initControls(videoId) {
         if (e.target === video) onPlayBtn();
     };
     wrap.addEventListener("click", onVideoClick);
+    // Double-click toggles fullscreen. The two preceding `click` events
+    // still fire and toggle play twice — that nets to the original
+    // play state, so no extra suppression is needed.
+    const onVideoDblClick = (e) => {
+        if (e.target === video) onFsBtn();
+    };
+    wrap.addEventListener("dblclick", onVideoDblClick);
 
     // Auto-hide: show chrome on mouse activity, hide after 2s of idle playback.
     const bumpActive = () => {
@@ -716,6 +723,7 @@ function initControls(videoId) {
         fsBtn?.removeEventListener("click", stopBubble);
         fsBtn?.removeEventListener("pointerup", blurSelf);
         wrap.removeEventListener("click", onVideoClick);
+        wrap.removeEventListener("dblclick", onVideoDblClick);
         wrap.removeEventListener("mousemove", bumpActive);
         wrap.removeEventListener("pointerdown", bumpActive);
         wrap.removeEventListener("mouseleave", onLeave);
