@@ -593,9 +593,13 @@ function initControls(videoId) {
     wrap.addEventListener("dblclick", onVideoDblClick);
 
     // Auto-hide: show chrome on mouse activity, hide after 2s of idle playback.
+    // While the pointer is over a control bar, suppress the idle timer entirely
+    // so the chrome doesn't fade out from under the user's cursor.
+    let overControls = false;
     const bumpActive = () => {
         wrap.classList.add("active");
         if (activeTimer) clearTimeout(activeTimer);
+        if (overControls) return;
         activeTimer = setTimeout(() => {
             if (!video.paused) wrap.classList.remove("active");
         }, 2000);
@@ -610,6 +614,21 @@ function initControls(videoId) {
     // the idle timer was already near zero.
     wrap.addEventListener("pointerdown", bumpActive);
     wrap.addEventListener("mouseleave", onLeave);
+
+    const topbar = $(".player-topbar");
+    const onControlsEnter = () => {
+        overControls = true;
+        wrap.classList.add("active");
+        if (activeTimer) { clearTimeout(activeTimer); activeTimer = null; }
+    };
+    const onControlsLeave = () => {
+        overControls = false;
+        bumpActive();
+    };
+    topbar?.addEventListener("mouseenter", onControlsEnter);
+    topbar?.addEventListener("mouseleave", onControlsLeave);
+    chrome?.addEventListener("mouseenter", onControlsEnter);
+    chrome?.addEventListener("mouseleave", onControlsLeave);
 
     // Keyboard shortcuts (document-level so the user doesn't have to click the
     // video first). Bail if they're typing in a form field.
@@ -727,6 +746,10 @@ function initControls(videoId) {
         wrap.removeEventListener("mousemove", bumpActive);
         wrap.removeEventListener("pointerdown", bumpActive);
         wrap.removeEventListener("mouseleave", onLeave);
+        topbar?.removeEventListener("mouseenter", onControlsEnter);
+        topbar?.removeEventListener("mouseleave", onControlsLeave);
+        chrome?.removeEventListener("mouseenter", onControlsEnter);
+        chrome?.removeEventListener("mouseleave", onControlsLeave);
         document.removeEventListener("keydown", onKey);
         if (activeTimer) clearTimeout(activeTimer);
         controllers.delete(videoId);
