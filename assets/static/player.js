@@ -801,8 +801,14 @@ function getDebugStats(videoId) {
         }
     } catch (_) { /* ignore */ }
     const readyStates = ["HAVE_NOTHING", "HAVE_METADATA", "HAVE_CURRENT_DATA", "HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA"];
-    const src = video.currentSrc || video.src;
-    ensureStreamInfo(src);
+    // Under hls.js, `currentSrc` is the MSE `blob:` URL — HEAD-probing it
+    // returns nothing useful, so the cached `stream_info` would stay null
+    // and the debug panel would never see `X-Stream-Encoder`. Prefer the
+    // attached m3u8 URL when we have one; fall back to currentSrc for
+    // native HLS (Safari) and the non-HLS `?mode=direct` path.
+    const attachedUrl = attached.get(videoId)?.url || null;
+    const probeSrc = attachedUrl || video.currentSrc || video.src;
+    ensureStreamInfo(probeSrc);
     return {
         videoWidth: video.videoWidth,
         videoHeight: video.videoHeight,
@@ -817,9 +823,9 @@ function getDebugStats(videoId) {
         total_frames: totalFrames,
         muted: video.muted,
         volume: Number(video.volume.toFixed(2)),
-        current_src: src,
+        current_src: video.currentSrc || video.src,
         error: video.error ? { code: video.error.code, message: video.error.message || null } : null,
-        stream_info: streamInfoCache.get(src) || null,
+        stream_info: streamInfoCache.get(probeSrc) || null,
     };
 }
 
