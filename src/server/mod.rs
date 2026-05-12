@@ -167,13 +167,7 @@ pub async fn run_scans(
 pub fn run() {
     let _ = dotenvy::dotenv();
 
-    tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,binkflix=debug")),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let _log_guard = init_logging();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -183,6 +177,55 @@ pub fn run() {
     if let Err(e) = rt.block_on(run_async()) {
         tracing::error!(%e, "server exited with error");
         std::process::exit(1);
+    }
+}
+
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::Layer;
+
+    let filter = || {
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,binkflix=debug"))
+    };
+
+    let stdout_layer = tracing_subscriber::fmt::layer().with_filter(filter());
+
+    let log_dir = PathBuf::from(env_or("BINKFLIX_LOG_DIR", "./data/logs"));
+    let file_setup = std::fs::create_dir_all(&log_dir).and_then(|_| {
+        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let path = log_dir.join(format!("binkflix-{ts}.log"));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map(|f| (path, f))
+    });
+
+    match file_setup {
+        Ok((path, file)) => {
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(filter());
+
+            tracing_subscriber::registry()
+                .with(stdout_layer)
+                .with(file_layer)
+                .init();
+
+            tracing::info!(path = %path.display(), "file logging enabled");
+            Some(guard)
+        }
+        Err(e) => {
+            tracing_subscriber::registry().with(stdout_layer).init();
+            tracing::warn!(
+                %e,
+                dir = %log_dir.display(),
+                "could not open log file; continuing with stdout only",
+            );
+            None
+        }
     }
 }
 

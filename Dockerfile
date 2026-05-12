@@ -43,7 +43,8 @@ COPY --from=builder /out/web/ /app/
 COPY --from=builder /src/assets /app/assets
 
 ENV BINKFLIX_DB=/data/binkflix.db \
-    BINKFLIX_BIND=0.0.0.0:9356
+    BINKFLIX_BIND=0.0.0.0:9356 \
+    BINKFLIX_LOG_DIR=/data/logs
 
 EXPOSE 9356
 VOLUME ["/data"]

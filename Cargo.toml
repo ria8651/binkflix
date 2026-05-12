@@ -34,6 +34,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 quick-xml = { version = "0.37", features = ["serialize"], optional = true }
 walkdir = { version = "2", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing-appender = { version = "0.2", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 dashmap = { version = "6", optional = true }
@@ -64,7 +65,7 @@ server = [
     "dioxus/server",
     "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",
     "dep:sqlx", "dep:quick-xml", "dep:walkdir",
-    "dep:tracing", "dep:tracing-subscriber",
+    "dep:tracing", "dep:tracing-subscriber", "dep:tracing-appender",
     "dep:chrono", "dep:uuid", "dep:dashmap", "dep:dotenvy",
     "dep:bytes", "dep:libc", "dep:tempfile",
     "dep:jsonwebtoken", "dep:reqwest", "dep:axum-extra",
