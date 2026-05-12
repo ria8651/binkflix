@@ -585,14 +585,15 @@ enum LandscapeKind {
 
 /// 16:9 image that prefers the movie's landscape `fanart` and falls back to
 /// the portrait poster letterboxed inside a blurred copy of itself. Episodes
-/// already ship a 16:9 sidecar still, so they render directly.
+/// use the parent show's fanart (the server falls back to the episode still
+/// when no show fanart exists), so they render directly without letterboxing.
 #[component]
 fn LandscapeImage(media_id: String, alt: String, kind: LandscapeKind) -> Element {
     match kind {
         LandscapeKind::Episode => rsx! {
             img {
                 class: "poster",
-                src: "{media_image_url(&media_id)}",
+                src: "{media_fanart_url(&media_id)}",
                 loading: "lazy",
                 decoding: "async",
                 alt: "{alt}",

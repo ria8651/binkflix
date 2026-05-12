@@ -517,12 +517,27 @@ async fn media_fanart(
     Path(id): Path<String>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    // Fall back to the regular media image (movie poster / episode thumb) when
-    // no sidecar fanart exists, so callers can always use this endpoint and
-    // let the client decide how to letterbox the result.
+    // For episodes, prefer the parent show's fanart over the per-episode still
+    // so home-page tiles read as "the show" rather than a random frame. Falls
+    // back to the regular media image (movie poster / episode thumb) when no
+    // fanart exists at either level.
     match lookup(&state, "SELECT fanart_path FROM media WHERE id = ?", &id).await {
         Ok(path) => serve(path, req).await,
-        Err(Error::NotFound) => media_image(State(state), Path(id), req).await,
+        Err(Error::NotFound) => {
+            let show_fanart = lookup(
+                &state,
+                "SELECT s.fanart_path FROM media m \
+                 JOIN shows s ON s.id = m.show_id \
+                 WHERE m.id = ? AND m.kind = 'episode'",
+                &id,
+            )
+            .await;
+            match show_fanart {
+                Ok(path) => serve(path, req).await,
+                Err(Error::NotFound) => media_image(State(state), Path(id), req).await,
+                Err(e) => Err(e),
+            }
+        }
         Err(e) => Err(e),
     }
 }
