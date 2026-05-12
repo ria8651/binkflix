@@ -336,27 +336,47 @@ h2.section {
 }
 
 .card {
-    background: var(--bg-tile);
-    border: var(--stroke-tile);
-    border-radius: var(--radius-tile);
+    background: var(--bg-tile-card);
+    border: var(--stroke-tile-card);
+    border-radius: var(--radius-tile-card);
     overflow: hidden;
-    transition: transform var(--motion-hover), box-shadow var(--motion-hover), border-color var(--motion-hover);
+    transition: transform var(--motion-tile-hover), box-shadow var(--motion-tile-hover), border-color var(--motion-tile-hover);
     cursor: pointer;
-    box-shadow: var(--shadow-tile);
+    box-shadow: var(--shadow-tile-card);
 }
 .card:hover {
-    transform: translateY(-3px);
+    transform: var(--tile-hover-transform);
     border-color: var(--border-tile-hover);
-    box-shadow: var(--shadow-button-hover), 0 6px 18px rgb(0 0 0 / 0.3);
+    box-shadow: var(--shadow-tile-card-hover);
+}
+.card:hover .poster,
+.card:hover .poster-wrap,
+.card:hover .poster-letterbox {
+    box-shadow: var(--shadow-tile-poster-hover);
+}
+/* Nested poster inside .poster-wrap still gets its shadow stripped on
+ * hover so the wrapper's shadow doesn't stack with the inner one. */
+.card:hover .poster-wrap > .poster,
+.card:hover .poster-wrap > .poster-letterbox {
+    box-shadow: none;
 }
 
 .card .poster {
     width: 100%;
     aspect-ratio: 2 / 3;
-    background: var(--bg-surface-hover);
+    background: var(--bg-tile-poster);
+    box-shadow: var(--shadow-tile-poster);
     display: block;
     object-fit: cover;
     color: transparent;
+    transition: transform var(--motion-tile-hover);
+}
+/* Inner-image hover scale (in addition to the card-level transform).
+ * Skip `.poster-letterbox` and its children — `.poster-bg` already
+ * carries `transform: scale(1.15)` for the blur trick, and scaling the
+ * letterbox would break the bg/fg parallax. */
+.card:hover img.poster {
+    transform: var(--tile-poster-hover-transform);
 }
 
 .card-link {
@@ -371,13 +391,15 @@ h2.section {
     overflow: hidden;
     text-overflow: ellipsis;
     margin: 0;
-    padding: var(--space-4) var(--space-6) 0;
+    padding: var(--space-4) var(--tile-text-padding-x) 0;
+    text-align: var(--tile-text-align);
 }
 .card .year {
     color: var(--text-muted);
     font-size: var(--text-xs);
     margin: var(--space-2) 0 0;
-    padding: 0 var(--space-6) var(--space-6);
+    padding: 0 var(--tile-text-padding-x) var(--tile-text-padding-bottom);
+    text-align: var(--tile-text-align);
 }
 .card .year .show-link {
     cursor: pointer;
@@ -407,6 +429,8 @@ h2.section {
     position: relative;
     overflow: hidden;
     padding: 0;
+    border-radius: var(--radius-tile-poster);
+    box-shadow: var(--shadow-tile-poster);
 }
 .poster-letterbox > .poster-bg,
 .poster-letterbox > .poster-fg {
@@ -431,6 +455,54 @@ h2.section {
 }
 .card .poster-wrap {
     position: relative;
+    border-radius: var(--radius-tile-poster);
+    overflow: hidden;
+    box-shadow: var(--shadow-tile-poster);
+}
+/* Inset border overlay — a 1px line painted on top of the poster via a
+ * pseudo-element so the image (which fully covers the wrapper's content
+ * area) can't hide it. `border` set on `::before` rather than `outline`
+ * because outline ignores `border-radius` clipping inside positioned
+ * children in some browsers. Sits above the sheen (z-index 2 vs 1). */
+.card .poster-wrap::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border: var(--outline-tile-poster);
+    border-radius: var(--radius-tile-poster);
+    transition: border-color var(--motion-tile-hover);
+    z-index: 2;
+}
+.card:hover .poster-wrap::before {
+    border: var(--outline-tile-poster-hover);
+}
+/* Glossy sheen overlay — a translucent white band defined by
+ * --tile-poster-sheen. The pseudo-element is translated up by half its
+ * height at rest so only the lower edge of the gradient is visible at
+ * the top of the poster; on hover it slides downward off the bottom
+ * and fades out. Themes that leave --tile-poster-sheen at `none` get an
+ * invisible (but still present) pseudo-element — zero painted pixels. */
+.card .poster-wrap::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: var(--tile-poster-sheen);
+    transform: translateY(-50%);
+    transition: transform var(--motion-tile-sheen), opacity var(--motion-tile-sheen);
+    z-index: 1;
+}
+.card:hover .poster-wrap::after {
+    transform: translateY(50%);
+    opacity: 0;
+}
+/* Avoid stacking the poster shadow twice when a .poster (or
+ * .poster-letterbox, which carries the .poster class) is nested
+ * inside .poster-wrap — the wrapper paints it. */
+.card .poster-wrap > .poster,
+.card .poster-wrap > .poster-letterbox {
+    box-shadow: none;
 }
 
 /* "Mark as watched" overlay button. Hidden until the user hovers (or
@@ -466,25 +538,31 @@ h2.section {
 .card .progress,
 .episode .progress {
     position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    height: 3px;
-    background: rgb(0 0 0 / 0.55);
+    left: var(--progress-inset);
+    right: var(--progress-inset);
+    bottom: var(--progress-inset);
+    height: var(--progress-height);
+    background: var(--progress-track-bg);
+    border-radius: var(--progress-radius);
+    overflow: hidden;
+    box-shadow: var(--progress-shadow);
+    z-index: 3;
 }
 .card .progress-bar,
 .episode .progress-bar {
     height: 100%;
-    background: var(--accent, #e50914);
+    background: var(--progress-fill-bg);
+    border-radius: inherit;
 }
 
 /* ── Detail page ───────────────────────────────────────────── */
 
 .detail {
     display: grid;
-    grid-template-columns: 280px 1fr;
+    grid-template-columns: var(--show-detail-grid);
     gap: var(--space-10);
     align-items: start;
+    margin-top: var(--show-detail-margin-top);
 }
 @media (max-width: 640px) {
     .detail {
@@ -495,6 +573,7 @@ h2.section {
     }
 }
 .detail .poster {
+    display: var(--show-detail-poster-display);
     width: 100%;
     aspect-ratio: 2 / 3;
     background: var(--bg-surface-hover) center/cover no-repeat;
@@ -506,6 +585,57 @@ h2.section {
     margin-top: 0;
     font-size: var(--text-2xl);
     letter-spacing: -0.01em;
+}
+
+/* Show detail backdrop — themed via token. Default (`--show-backdrop-display:
+ * none`) hides the element entirely; themes that opt in (currently
+ * elegantfin) flip the display token and paint the fanart full-viewport
+ * with the mask gradient sliding over it as the page scrolls. */
+.show-backdrop {
+    display: var(--show-backdrop-display);
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    background-size: cover;
+    background-position: center top;
+    background-repeat: no-repeat;
+    filter: var(--show-backdrop-filter);
+    pointer-events: none;
+}
+.show-backdrop-mask {
+    display: var(--show-backdrop-mask-display);
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--show-backdrop-mask-height);
+    z-index: 1;
+    pointer-events: none;
+    /* `main` is capped at 1400px; escape it so the mask spans the full
+     * viewport width on ultrawide displays. */
+    margin-left: calc(50% - 50vw);
+    margin-right: calc(50% - 50vw);
+    width: 100vw;
+    background-image: var(--show-backdrop-mask-image);
+}
+.show-clearlogo {
+    display: block;
+    max-width: var(--show-clearlogo-max-width);
+    max-height: var(--show-clearlogo-max-height);
+    width: auto;
+    height: auto;
+    margin: 0 0 var(--show-clearlogo-margin-bottom);
+    filter: var(--show-clearlogo-filter);
+}
+
+/* Lift route content above the (potentially) fixed backdrop and absolute
+ * mask. Harmless when those layers aren't painted — z-index has no visual
+ * effect without a sibling stacking context to compete with. */
+main > .detail,
+main > .season-picker,
+main > .season {
+    position: relative;
+    z-index: 2;
 }
 .detail .plot { color: var(--text-tertiary); line-height: 1.6; font-size: var(--text-lg); }
 .detail .meta-row {
@@ -1306,31 +1436,66 @@ h2.section {
     display: grid;
     grid-template-columns: 160px 1fr;
     gap: var(--space-7);
-    padding: var(--space-5);
-    border-radius: var(--radius-tile);
-    background: var(--bg-tile);
-    border: var(--stroke-default);
+    padding: var(--episode-row-padding);
+    border-radius: var(--radius-episode-row);
+    background: var(--bg-episode-row);
+    border: var(--stroke-episode-row);
     color: inherit;
     transition: background var(--motion-hover), border-color var(--motion-hover);
-    box-shadow: var(--shadow-tile);
+    box-shadow: var(--shadow-episode-row);
 }
 .episode-link:hover {
-    background: var(--bg-surface-hover);
-    border-color: var(--border-raised);
+    background: var(--bg-episode-row-hover);
+    border-color: var(--border-episode-row-hover);
 }
 .ep-thumb-wrap {
     position: relative;
-    border-radius: var(--radius-row);
+    border-radius: var(--radius-ep-thumb);
     overflow: hidden;
+    box-shadow: var(--shadow-ep-thumb);
+}
+/* Inset outline (hover-coloured) and glossy sheen — same machinery as the
+ * card-tile poster, controlled by the `--*-ep-thumb*` tokens. Default theme
+ * leaves these as `none`, so the pseudo-elements paint nothing. */
+.ep-thumb-wrap::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border: var(--outline-ep-thumb);
+    border-radius: var(--radius-ep-thumb);
+    transition: border-color var(--motion-tile-hover);
+    z-index: 2;
+}
+.episode-link:hover .ep-thumb-wrap::before {
+    border: var(--outline-ep-thumb-hover);
+}
+.ep-thumb-wrap::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: var(--ep-thumb-sheen);
+    transform: translateY(-50%);
+    transition: transform var(--motion-tile-sheen), opacity var(--motion-tile-sheen);
+    z-index: 1;
+}
+.episode-link:hover .ep-thumb-wrap::after {
+    transform: translateY(50%);
+    opacity: 0;
 }
 .ep-thumb {
     width: 100%;
     aspect-ratio: 16 / 9;
-    background: var(--bg-surface-hover);
-    border-radius: var(--radius-row);
+    background: var(--bg-ep-thumb);
+    border-radius: inherit;
     display: block;
     object-fit: cover;
     color: transparent;
+    transition: transform var(--motion-tile-hover);
+}
+.episode-link:hover .ep-thumb {
+    transform: var(--ep-thumb-hover-transform);
 }
 .ep-body { padding: var(--space-2) 0; }
 .ep-title {

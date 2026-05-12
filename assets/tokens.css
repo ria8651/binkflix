@@ -111,12 +111,81 @@
   --motion-focus-appear: 150ms cubic-bezier(0.33, 1, 0.68, 1);
   --motion-spinner: 0.8s linear;
 
+  /* Tile motion — separated from the generic --motion-hover so themes can
+   * dial in different feel for card hover/lift and the glossy sheen pass.
+   * Curve refs:
+   *   cubic-bezier(0.16, 1, 0.3, 1)   "ease-out-expo-ish" — premium settle
+   *   cubic-bezier(0.22, 1, 0.36, 1)  Apple-ish ease-out
+   *   cubic-bezier(0.33, 1, 0.68, 1)  ease-out-cubic (current default) */
+  --motion-tile-hover: var(--motion-hover);
+  --motion-tile-sheen: 500ms linear;
+
   /* Elevation */
   --shadow-tile: none;
   --shadow-dialog: 0 12px 32px rgb(0 0 0 / 0.5);
   --shadow-button: none;
   --shadow-button-hover: none;
   --shadow-raised: none;
+
+  /* Tile chrome — split between the .card wrapper (which contains poster
+   * + title + year) and the poster itself, so themes can pick where the
+   * visible tile lives. Defaults keep everything on the wrapper, matching
+   * historic behavior. Elegantfin flips it so the poster *is* the tile and
+   * the text sits on the page background. */
+  --bg-tile-card: var(--bg-tile);
+  --stroke-tile-card: var(--stroke-tile);
+  --shadow-tile-card: var(--shadow-tile);
+  --shadow-tile-card-hover: var(--shadow-button-hover), 0 6px 18px rgb(0 0 0 / 0.3);
+  --radius-tile-card: var(--radius-tile);
+  --bg-tile-poster: var(--bg-surface-hover);
+  --radius-tile-poster: 0;
+  --shadow-tile-poster: none;
+  --shadow-tile-poster-hover: none;
+  --outline-tile-poster: none;
+  --outline-tile-poster-hover: none;
+  --tile-text-padding-x: var(--space-6);
+  --tile-text-padding-bottom: var(--space-6);
+  --tile-text-align: left;
+  --tile-hover-transform: translateY(-3px);
+  --tile-poster-hover-transform: none;
+  /* Glossy sheen overlaid on the poster. `none` (the default) disables
+   * the pseudo-element entirely. Themes set a gradient to enable it; the
+   * sheen sits at the top of the poster at rest and slides downward off
+   * the bottom on hover. */
+  --tile-poster-sheen: none;
+
+  /* Progress bar painted over the bottom of `.card` / `.episode` thumbnails.
+   * Defaults reproduce the historic Netflix-style edge bar: full-width,
+   * pinned to the bottom, square corners, dark track, accent fill. Themes
+   * can pull it inwards (--progress-inset > 0), round it, and recolor it. */
+  --progress-track-bg: rgb(0 0 0 / 0.55);
+  --progress-fill-bg: var(--accent);
+  --progress-height: 3px;
+  --progress-radius: 0;
+  --progress-inset: 0;
+  --progress-shadow: none;
+
+  /* Episode row chrome (on the show-detail page). Same split as the card
+   * tile: the row container vs the thumbnail inside. Defaults reproduce the
+   * historic boxed-row look; elegantfin flips the row to transparent so the
+   * thumbnail reads as the only "tile" and the text sits on the page bg. */
+  --bg-episode-row: var(--bg-tile);
+  --stroke-episode-row: var(--stroke-default);
+  --radius-episode-row: var(--radius-tile);
+  --shadow-episode-row: var(--shadow-tile);
+  --episode-row-padding: var(--space-5);
+  --bg-episode-row-hover: var(--bg-surface-hover);
+  --border-episode-row-hover: var(--border-raised);
+  /* Thumbnail inside the row — default keeps the historic small inset
+   * `--radius-row` corners with no extra chrome; elegantfin pulls in the
+   * tile-poster tokens so the thumb visually matches a home-page card. */
+  --bg-ep-thumb: var(--bg-surface-hover);
+  --radius-ep-thumb: var(--radius-row);
+  --shadow-ep-thumb: none;
+  --outline-ep-thumb: none;
+  --outline-ep-thumb-hover: none;
+  --ep-thumb-sheen: none;
+  --ep-thumb-hover-transform: none;
 
   /* Topbar — separate from --bg-surface so glassy themes can override */
   --bg-topbar: var(--bg-surface);
@@ -125,6 +194,24 @@
 
   /* Page backdrop — themes can paint a gradient or image behind --bg-page */
   --bg-page-overlay: none;
+
+  /* Show-detail backdrop — themes can paint a fanart image behind the show
+   * detail page and fade it out as the page scrolls. Defaults are no-ops:
+   * the backdrop element is invisible and takes no layout space. */
+  --show-backdrop-display: none;
+  --show-backdrop-filter: none;
+  --show-backdrop-mask-display: none;
+  --show-backdrop-mask-image: none;
+  --show-backdrop-mask-height: 0;
+  --show-detail-margin-top: 0;
+  --show-detail-poster-display: block;
+  --show-detail-grid: 280px 1fr;
+
+  /* Clearlogo title — themes can swap the show <h1> for a clearlogo image. */
+  --show-clearlogo-max-width: 380px;
+  --show-clearlogo-max-height: 96px;
+  --show-clearlogo-margin-bottom: var(--space-6);
+  --show-clearlogo-filter: none;
 
   /* Video player scrub bar — hitbox is always --scrub-hitbox tall so the
    * cursor has somewhere generous to land for trickplay previews; the
@@ -345,54 +432,60 @@
 /* ── ElegantFin theme ────────────────────────────────────────── */
 
 [data-theme="elegantfin"] {
-  /* Deep desaturated indigo base with a subtle radial gradient overlay */
-  --bg-page: #0e1018;
-  --bg-page-overlay:
-    radial-gradient(1200px 800px at 15% -10%, rgb(120 90 200 / 0.18), transparent 60%),
-    radial-gradient(1000px 700px at 110% 10%, rgb(60 130 220 / 0.14), transparent 60%);
+  /* Palette adapted from lscambo13/ElegantFin (Jellyfin theme):
+   *   --darkerGradientPoint:  #111827
+   *   --lighterGradientPoint: #1d2635
+   *   --activeColor:          rgb(119 91 244)   (purple)
+   *   --uiAccentColor:        rgb(117 111 226)
+   *   --textColor:            rgb(209 213 219)
+   *   --dimTextColor:         rgb(156 163 175)
+   * The page itself uses the lighter slate at the top, darker at the
+   * bottom — matches the original's --backgroundGradient. */
+  --bg-page: #111827;
+  --bg-page-overlay: linear-gradient(0deg, #111827 35%, #1d2635);
 
-  --bg-surface: rgb(22 24 34 / 0.72);
-  --bg-surface-raised: rgb(28 30 42 / 0.85);
-  --bg-surface-hover: rgb(40 42 58 / 0.85);
+  --bg-surface: rgba(29, 38, 53, 0.72);
+  --bg-surface-raised: rgba(29, 38, 53, 0.9);
+  --bg-surface-hover: rgba(40, 50, 68, 0.9);
   --bg-button: rgb(255 255 255 / 0.06);
   --bg-button-hover: rgb(255 255 255 / 0.1);
   --bg-button-secondary: rgb(255 255 255 / 0.08);
   --bg-button-secondary-hover: rgb(255 255 255 / 0.12);
-  --bg-tile: rgb(28 30 42 / 0.7);
+  --bg-tile: #1d2635;
   --bg-hover-subtle: rgb(255 255 255 / 0.05);
   --bg-row: rgb(255 255 255 / 0.03);
   --bg-row-hover: rgb(255 255 255 / 0.07);
-  --bg-accent-ghost: rgb(140 110 240 / 0.18);
-  --bg-accent-ghost-hover: rgb(140 110 240 / 0.28);
+  --bg-accent-ghost: rgb(119 91 244 / 0.18);
+  --bg-accent-ghost-hover: rgb(119 91 244 / 0.28);
   --bg-backdrop: rgb(8 10 16 / 0.6);
 
-  /* Frosted topbar — fades blur + bg to transparent at the bottom edge so
-   * scrolled content slips under the topbar without a hard cutoff. */
-  --bg-topbar: rgb(14 16 24 / 0.55);
+  /* Frosted topbar — matches the original's translucent header
+   * (rgba(30,40,54,0.8)) with the binkflix mask/blur treatment. */
+  --bg-topbar: rgba(30, 40, 54, 0.8);
   --topbar-backdrop-filter: blur(18px) saturate(1.4);
   --topbar-border-bottom: none;
   --topbar-shadow: none;
   --topbar-mask: linear-gradient(to bottom, black 0%, black 55%, transparent 100%);
   --topbar-fade-extend: 42px;
 
-  --text-primary: rgb(236 238 248);
-  --text-secondary: rgb(208 212 226);
-  --text-tertiary: rgb(170 175 195);
-  --text-muted: rgb(135 140 160);
+  --text-primary: rgb(209 213 219);
+  --text-secondary: rgb(190 195 205);
+  --text-tertiary: rgb(170 175 190);
+  --text-muted: rgb(156 163 175);
   --text-on-accent: #fff;
-  --text-accent: #a78bfa;
-  --text-accent-hover: #c4b5fd;
+  --text-accent: rgb(117 111 226);
+  --text-accent-hover: rgb(150 145 240);
   --text-icon-muted: rgb(255 255 255 / 0.2);
 
   --border-default: rgb(255 255 255 / 0.06);
   --border-raised: rgb(255 255 255 / 0.12);
   --border-strong: rgb(255 255 255 / 0.2);
   --border-dialog: rgb(255 255 255 / 0.1);
-  --border-accent: #a78bfa;
+  --border-accent: rgb(117 111 226);
 
-  --accent: #8b5cf6;
-  --accent-hover: #a78bfa;
-  --accent-rgb: 139 92 246;
+  --accent: rgb(119 91 244);
+  --accent-hover: rgb(140 115 250);
+  --accent-rgb: 119 91 244;
 
   --font-body: "Inter", "Open Sans", system-ui, -apple-system, sans-serif;
   --font-heading: "Inter", "Chivo", system-ui, sans-serif;
@@ -409,4 +502,84 @@
   --shadow-dialog: 0 20px 60px rgb(0 0 0 / 0.55);
   --shadow-button: 0 1px 0 rgb(255 255 255 / 0.05) inset;
   --shadow-button-hover: 0 1px 0 rgb(255 255 255 / 0.08) inset, 0 4px 12px rgb(0 0 0 / 0.25);
+
+  /* Detach the title from the tile: poster carries the chrome, text sits
+   * flush on the page gradient. */
+  --bg-tile-card: transparent;
+  --stroke-tile-card: none;
+  --shadow-tile-card: none;
+  --shadow-tile-card-hover: none;
+  --radius-tile-card: 0;
+  --bg-tile-poster: var(--bg-tile);
+  --radius-tile-poster: var(--radius-tile);
+  --shadow-tile-poster: var(--shadow-tile);
+  --shadow-tile-poster-hover: 0 8px 24px rgb(0 0 0 / 0.4);
+  --outline-tile-poster: 2px solid transparent;
+  --outline-tile-poster-hover: 2px solid white;
+  --tile-text-padding-x: 0;
+  --tile-text-padding-bottom: 0;
+  --tile-text-align: center;
+  --tile-hover-transform: scale(1.02);
+  --tile-poster-hover-transform: scale(1.025);
+  --tile-poster-sheen: linear-gradient(
+    180deg,
+    transparent,
+    rgb(255 255 255 / 0.18) 45%,
+    rgb(255 255 255 / 0.18) 55%,
+    transparent
+  );
+
+  --motion-tile-hover: 220ms ease;
+  --motion-tile-sheen: 350ms ease;
+
+  /* Floating, rounded gray/white playback bar — matches the original
+   * ElegantFin's progress treatment (--osdSeekBarBufferedColorAlpha
+   * track, --dimTextColor fill) with a subtle drop shadow so it lifts
+   * off whatever poster is behind it. */
+  --progress-track-bg: rgb(209 213 219 / 0.9);
+  --progress-fill-bg: var(--accent);
+  --progress-height: 6px;
+  --progress-radius: 9999px;
+  --progress-inset: var(--space-6);
+  --progress-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
+
+  /* Show detail — fanart fills the viewport and fades behind the content
+   * as the page scrolls. The clearlogo replaces the show <h1>; the small
+   * left-side poster is hidden in favour of the wide fanart hero. */
+  --show-backdrop-display: block;
+  --show-backdrop-filter: brightness(0.55) saturate(0.9);
+  --show-backdrop-mask-display: block;
+  --show-backdrop-mask-height: 200vh;
+  --show-backdrop-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 40vh,
+    var(--bg-page) 75vh,
+    var(--bg-page) 100%
+  );
+  --show-detail-margin-top: 28vh;
+  --show-detail-poster-display: none;
+  --show-detail-grid: 1fr;
+  --show-clearlogo-margin-bottom: var(--space-5);
+  --show-clearlogo-filter: drop-shadow(0 2px 8px rgb(0 0 0 / 0.6));
+
+  /* Episode rows lose their card chrome: thumbnail is the only tile,
+   * title + plot sit on the page background. Hover treatment lives on
+   * the thumbnail (via the shared --outline-tile-poster / sheen tokens)
+   * rather than the row, so leave the row hover bg transparent. */
+  --bg-episode-row: transparent;
+  --stroke-episode-row: none;
+  --radius-episode-row: 0;
+  --shadow-episode-row: none;
+  --episode-row-padding: 0;
+  --bg-episode-row-hover: transparent;
+  --border-episode-row-hover: transparent;
+  /* Thumb picks up the same tile-poster treatment as a home-page card. */
+  --bg-ep-thumb: var(--bg-tile-poster);
+  --radius-ep-thumb: var(--radius-tile-poster);
+  --shadow-ep-thumb: var(--shadow-tile-poster);
+  --outline-ep-thumb: var(--outline-tile-poster);
+  --outline-ep-thumb-hover: var(--outline-tile-poster-hover);
+  --ep-thumb-sheen: var(--tile-poster-sheen);
+  --ep-thumb-hover-transform: var(--tile-poster-hover-transform);
 }

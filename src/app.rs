@@ -575,52 +575,53 @@ fn Home() -> Element {
     }
 }
 
-/// Whether a media tile should render the episode still directly (already
-/// 16:9) or letterbox a movie's portrait poster onto a blurred backdrop.
+/// How a card tile's image should be rendered. The aspect ratio is
+/// applied by CSS based on the surrounding `.card` / `.card-wide` class,
+/// not by the shape itself — this enum just chooses the markup (plain
+/// img vs. a letterbox div that puts the foreground image over a blurred
+/// copy so empty bars never show as solid black).
 #[derive(Clone, Copy, PartialEq)]
-enum LandscapeKind {
-    Episode,
-    Movie,
+enum PosterShape {
+    Plain,
+    Letterbox,
 }
 
-/// 16:9 image that prefers the movie's landscape `fanart` and falls back to
-/// the portrait poster letterboxed inside a blurred copy of itself. Episodes
-/// use the parent show's fanart (the server falls back to the episode still
-/// when no show fanart exists), so they render directly without letterboxing.
+/// Image element used inside `.poster-wrap` across every card type
+/// (`MovieCard`, `ShowCard`, `ContinueCard`, `RecentCard`). The caller
+/// supplies the URL appropriate for what's being shown (portrait poster,
+/// show poster, episode fanart, movie fanart with poster fallback) and a
+/// shape; the surrounding CSS handles aspect ratio and rounding.
 #[component]
-fn LandscapeImage(media_id: String, alt: String, kind: LandscapeKind) -> Element {
-    match kind {
-        LandscapeKind::Episode => rsx! {
+fn Poster(src: String, alt: String, shape: PosterShape) -> Element {
+    match shape {
+        PosterShape::Plain => rsx! {
             img {
                 class: "poster",
-                src: "{media_fanart_url(&media_id)}",
+                src: "{src}",
                 loading: "lazy",
                 decoding: "async",
                 alt: "{alt}",
             }
         },
-        LandscapeKind::Movie => {
-            // The server falls back from fanart → poster, so a single URL is
-            // safe for both layers. When fanart exists, both layers show the
-            // backdrop and the foreground covers the (identical) blurred
-            // background; when only the poster exists, the foreground sits
+        PosterShape::Letterbox => rsx! {
+            // The same URL feeds both layers; when fanart exists the
+            // foreground covers its (identical) blurred backdrop, and when
+            // only the portrait poster is available the foreground sits
             // letterboxed inside a blurred copy of itself.
-            rsx! {
-                div { class: "poster poster-letterbox",
-                    img {
-                        class: "poster-bg",
-                        src: "{media_fanart_url(&media_id)}",
-                        loading: "lazy",
-                        decoding: "async",
-                        "aria-hidden": "true",
-                    }
-                    img {
-                        class: "poster-fg",
-                        src: "{media_fanart_url(&media_id)}",
-                        loading: "lazy",
-                        decoding: "async",
-                        alt: "{alt}",
-                    }
+            div { class: "poster poster-letterbox",
+                img {
+                    class: "poster-bg",
+                    src: "{src}",
+                    loading: "lazy",
+                    decoding: "async",
+                    "aria-hidden": "true",
+                }
+                img {
+                    class: "poster-fg",
+                    src: "{src}",
+                    loading: "lazy",
+                    decoding: "async",
+                    alt: "{alt}",
                 }
             }
         }
@@ -630,10 +631,10 @@ fn LandscapeImage(media_id: String, alt: String, kind: LandscapeKind) -> Element
 #[component]
 fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
     // Every tile is a 16:9 landscape card so the row reads uniformly. Episode
-    // stills come from the sidecar thumb; movie posters get letterboxed onto
-    // a blurred backdrop by `LandscapeImage`.
+    // stills come from the show fanart (with server-side fallback to the
+    // episode still); movie posters get letterboxed onto a blurred backdrop.
     let is_episode = item.show_id.is_some();
-    let kind = if is_episode { LandscapeKind::Episode } else { LandscapeKind::Movie };
+    let shape = if is_episode { PosterShape::Plain } else { PosterShape::Letterbox };
     let route = Route::MediaPlay { id: item.media_id.clone() };
     let ep_se = if is_episode {
         let s = item.season_number.unwrap_or(0);
@@ -672,10 +673,10 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
         article { class: "card card-wide",
             Link { to: route, class: "card-link",
                 div { class: "poster-wrap",
-                    LandscapeImage {
-                        media_id: item.media_id.clone(),
+                    Poster {
+                        src: media_fanart_url(&item.media_id),
                         alt: item.title.clone(),
-                        kind,
+                        shape,
                     }
                     if pct > 0.0 {
                         div { class: "progress",
@@ -702,7 +703,7 @@ fn RecentCard(item: RecentItem) -> Element {
     // Episodes: 16:9 still + "Show · S1E2" subtitle.
     // Movies: 16:9 fanart (or letterboxed poster) + year subtitle.
     let is_episode = item.show_id.is_some();
-    let kind = if is_episode { LandscapeKind::Episode } else { LandscapeKind::Movie };
+    let shape = if is_episode { PosterShape::Plain } else { PosterShape::Letterbox };
     let route = Route::MediaPlay { id: item.media_id.clone() };
     let ep_se = if is_episode {
         let s = item.season_number.unwrap_or(0);
@@ -724,10 +725,12 @@ fn RecentCard(item: RecentItem) -> Element {
     rsx! {
         article { class: "card card-wide",
             Link { to: route, class: "card-link",
-                LandscapeImage {
-                    media_id: item.media_id.clone(),
-                    alt: item.title.clone(),
-                    kind,
+                div { class: "poster-wrap",
+                    Poster {
+                        src: media_fanart_url(&item.media_id),
+                        alt: item.title.clone(),
+                        shape,
+                    }
                 }
                 h3 { class: "title", "{item.title}" }
                 SubtitleLine { show_link, ep_se, year }
@@ -776,12 +779,12 @@ fn MovieCard(movie: MovieSummary) -> Element {
     rsx! {
         article { class: "card",
             Link { to: Route::MediaDetail { id: movie.id.clone() }, class: "card-link",
-                img {
-                    class: "poster",
-                    src: "{media_image_url(&movie.id)}",
-                    loading: "lazy",
-                    decoding: "async",
-                    alt: "{movie.title}",
+                div { class: "poster-wrap",
+                    Poster {
+                        src: media_image_url(&movie.id),
+                        alt: movie.title.clone(),
+                        shape: PosterShape::Plain,
+                    }
                 }
                 h3 { class: "title", "{movie.title}" }
                 p { class: "year", "{year}" }
@@ -798,12 +801,12 @@ fn ShowCard(show: ShowSummary) -> Element {
     rsx! {
         article { class: "card",
             Link { to: Route::ShowDetail { id: show.id.clone() }, class: "card-link",
-                img {
-                    class: "poster",
-                    src: "{show_poster_url(&show.id)}",
-                    loading: "lazy",
-                    decoding: "async",
-                    alt: "{show.title}",
+                div { class: "poster-wrap",
+                    Poster {
+                        src: show_poster_url(&show.id),
+                        alt: show.title.clone(),
+                        shape: PosterShape::Plain,
+                    }
                 }
                 h3 { class: "title", "{show.title}" }
                 p { class: "year",
@@ -904,13 +907,30 @@ fn ShowDetail(id: String) -> Element {
                 };
                 let active = d.seasons.iter().find(|s| s.number == current).cloned();
                 rsx! {
+                    if d.show.has_fanart {
+                        div {
+                            class: "show-backdrop",
+                            style: "background-image: url('{show_fanart_url(&d.show.id)}')",
+                        }
+                        div { class: "show-backdrop-mask" }
+                    }
                     article { class: "detail",
                         div {
                             class: "poster",
                             style: "background-image: url('{show_poster_url(&d.show.id)}')",
                         }
                         header { class: "detail-info",
-                            h1 { "{d.show.title}" }
+                            if d.show.has_clearlogo {
+                                img {
+                                    class: "show-clearlogo",
+                                    src: "{show_clearlogo_url(&d.show.id)}",
+                                    alt: "{d.show.title}",
+                                    loading: "eager",
+                                    decoding: "async",
+                                }
+                            } else {
+                                h1 { "{d.show.title}" }
+                            }
                             if let Some(y) = d.show.year {
                                 p { class: "meta-row", "{y}" }
                             }
