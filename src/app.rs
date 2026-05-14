@@ -115,6 +115,17 @@ fn Shell() -> Element {
 
     rsx! {
         header { class: "topbar",
+            // Five-layer progressive blur stack. Each div applies a
+            // `backdrop-filter: blur(N)` and is masked into a band, so
+            // the blur ramps from light at the bottom of the bar to
+            // heavy at the top. Each layer compounds the blur of the
+            // layer beneath it. Decorative — themes that don't want
+            // the effect leave the blur tokens as `none`.
+            div { class: "topbar-blur topbar-blur-1", aria_hidden: "true" }
+            div { class: "topbar-blur topbar-blur-2", aria_hidden: "true" }
+            div { class: "topbar-blur topbar-blur-3", aria_hidden: "true" }
+            div { class: "topbar-blur topbar-blur-4", aria_hidden: "true" }
+            div { class: "topbar-blur topbar-blur-5", aria_hidden: "true" }
             Link {
                 to: Route::Home {},
                 class: "brand",
@@ -614,7 +625,7 @@ fn Poster(src: String, alt: String, shape: PosterShape) -> Element {
                     src: "{src}",
                     loading: "lazy",
                     decoding: "async",
-                    "aria-hidden": "true",
+                    aria_hidden: "true",
                 }
                 img {
                     class: "poster-fg",
@@ -629,7 +640,15 @@ fn Poster(src: String, alt: String, shape: PosterShape) -> Element {
 }
 
 #[component]
-fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
+fn ContinueCard(
+    item: ContinueItem,
+    on_change: EventHandler<()>,
+    /// When true (used on the show-detail page), episode tiles show
+    /// the per-episode thumbnail instead of the show fanart so the
+    /// "play next" affordance is visually specific to that episode.
+    #[props(default = false)]
+    use_episode_thumb: bool,
+) -> Element {
     // Every tile is a 16:9 landscape card so the row reads uniformly. Episode
     // stills come from the show fanart (with server-side fallback to the
     // episode still); movie posters get letterboxed onto a blurred backdrop.
@@ -669,14 +688,22 @@ fn ContinueCard(item: ContinueItem, on_change: EventHandler<()>) -> Element {
             on_change.call(());
         });
     };
+    let poster_src = if is_episode && use_episode_thumb {
+        media_image_url(&item.media_id)
+    } else {
+        media_fanart_url(&item.media_id)
+    };
     rsx! {
         article { class: "card card-wide",
             Link { to: route, class: "card-link",
                 div { class: "poster-wrap",
                     Poster {
-                        src: media_fanart_url(&item.media_id),
+                        src: poster_src,
                         alt: item.title.clone(),
                         shape,
+                    }
+                    div { class: "play-overlay",
+                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                     if pct > 0.0 {
                         div { class: "progress",
@@ -730,6 +757,9 @@ fn RecentCard(item: RecentItem) -> Element {
                         src: media_fanart_url(&item.media_id),
                         alt: item.title.clone(),
                         shape,
+                    }
+                    div { class: "play-overlay",
+                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                 }
                 h3 { class: "title", "{item.title}" }
@@ -785,6 +815,9 @@ fn MovieCard(movie: MovieSummary) -> Element {
                         alt: movie.title.clone(),
                         shape: PosterShape::Plain,
                     }
+                    div { class: "play-overlay",
+                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
+                    }
                 }
                 h3 { class: "title", "{movie.title}" }
                 p { class: "year", "{year}" }
@@ -806,6 +839,9 @@ fn ShowCard(show: ShowSummary) -> Element {
                         src: show_poster_url(&show.id),
                         alt: show.title.clone(),
                         shape: PosterShape::Plain,
+                    }
+                    div { class: "play-overlay",
+                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                 }
                 h3 { class: "title", "{show.title}" }
@@ -888,6 +924,11 @@ fn ShowDetail(id: String) -> Element {
         async move { get_show(&id).await }
     });
 
+    // Show-scoped Continue Watching. The server returns the full global
+    // list; we filter client-side by `show_id` since the list is small
+    // and filtering here avoids a server route just for this view.
+    let mut cont = use_resource(get_continue_watching);
+
     // Currently selected season number. `None` until the resource resolves
     // and a default is chosen; once set, `selected` drives which season's
     // episode list renders. Tabs flip the value.
@@ -915,10 +956,15 @@ fn ShowDetail(id: String) -> Element {
                         div { class: "show-backdrop-mask" }
                     }
                     article { class: "detail",
+                        div { class: "detail-fade" }
                         div {
                             class: "poster",
                             style: "background-image: url('{show_poster_url(&d.show.id)}')",
                         }
+                        // header rendered after the poster so default themes
+                        // (which auto-place into the grid in source order)
+                        // keep poster-left / info-right. Elegantfin places
+                        // each child explicitly via `--show-detail-*-col`.
                         header { class: "detail-info",
                             if d.show.has_clearlogo {
                                 img {
@@ -936,6 +982,35 @@ fn ShowDetail(id: String) -> Element {
                             }
                             if let Some(plot) = d.show.plot.as_deref() {
                                 p { class: "plot", "{plot}" }
+                            }
+                            {
+                                // The single most-recent in-progress
+                                // episode for this show. Lives inside
+                                // the info column so the "play next"
+                                // affordance sits with the title/plot
+                                // rather than as a separate row.
+                                let show_id = d.show.id.clone();
+                                let next = match &*cont.read_unchecked() {
+                                    Some(Ok(items)) => items
+                                        .iter()
+                                        .find(|c| c.show_id.as_deref() == Some(show_id.as_str()))
+                                        .cloned(),
+                                    _ => None,
+                                };
+                                next.map(|c| rsx! {
+                                    div { class: "detail-continue",
+                                        h2 { class: "section", "Continue Watching" }
+                                        ContinueCard {
+                                            key: "{c.media_id}",
+                                            item: c,
+                                            use_episode_thumb: true,
+                                            on_change: move |_| {
+                                                cont.restart();
+                                                detail.restart();
+                                            },
+                                        }
+                                    }
+                                })
                             }
                         }
                     }

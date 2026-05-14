@@ -59,9 +59,9 @@ header.topbar {
     isolation: isolate;
 }
 
-/* Background + blur live on a pseudo so they can be masked separately from
- * the brand/buttons. Themes that don't want a fade leave --topbar-mask as
- * `none` (no masking) and --topbar-fade-extend as 0 (flush with the bar). */
+/* Tinted background + main fade live on a pseudo so they can be masked
+ * separately from the brand/buttons. Themes that don't want a fade leave
+ * --topbar-mask as `none` (no masking) and --topbar-fade-extend as 0. */
 header.topbar::before {
     content: "";
     position: absolute;
@@ -76,14 +76,59 @@ header.topbar::before {
     z-index: -1;
 }
 
-/* Wrap in @supports so the CSS minifier (lightningcss in dx) doesn't merge
- * the two declarations and drop the unprefixed `backdrop-filter` — Chromium
- * needs the unprefixed form, Safari needs the -webkit- one. */
+/* Five-layer progressive blur stack. Each `.topbar-blur-N` div applies
+ * a `backdrop-filter` with a different blur radius and is masked to a
+ * band of the bar. Stacked in DOM order so each layer blurs the
+ * already-blurred output of the layer beneath it — the blur compounds
+ * from light at the bottom of the bar to heavy at the top. Decorative;
+ * themes that don't want the effect leave the per-layer tokens as
+ * `none` (the @supports rules then no-op). */
+header.topbar .topbar-blur {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: calc(0px - var(--topbar-fade-extend, 0px));
+    pointer-events: none;
+    z-index: -1;
+}
+header.topbar .topbar-blur-1 {
+    -webkit-mask-image: var(--topbar-blur-1-mask, none);
+    mask-image: var(--topbar-blur-1-mask, none);
+}
+header.topbar .topbar-blur-2 {
+    -webkit-mask-image: var(--topbar-blur-2-mask, none);
+    mask-image: var(--topbar-blur-2-mask, none);
+}
+header.topbar .topbar-blur-3 {
+    -webkit-mask-image: var(--topbar-blur-3-mask, none);
+    mask-image: var(--topbar-blur-3-mask, none);
+}
+header.topbar .topbar-blur-4 {
+    -webkit-mask-image: var(--topbar-blur-4-mask, none);
+    mask-image: var(--topbar-blur-4-mask, none);
+}
+header.topbar .topbar-blur-5 {
+    -webkit-mask-image: var(--topbar-blur-5-mask, none);
+    mask-image: var(--topbar-blur-5-mask, none);
+}
+
+/* Wrap in @supports so the CSS minifier (lightningcss in dx) doesn't
+ * merge the two declarations and drop the unprefixed `backdrop-filter`
+ * — Chromium needs the unprefixed form, Safari needs the -webkit- one. */
 @supports (backdrop-filter: blur(1px)) {
-    header.topbar::before { backdrop-filter: var(--topbar-backdrop-filter); }
+    header.topbar .topbar-blur-1 { backdrop-filter: var(--topbar-blur-1, none); }
+    header.topbar .topbar-blur-2 { backdrop-filter: var(--topbar-blur-2, none); }
+    header.topbar .topbar-blur-3 { backdrop-filter: var(--topbar-blur-3, none); }
+    header.topbar .topbar-blur-4 { backdrop-filter: var(--topbar-blur-4, none); }
+    header.topbar .topbar-blur-5 { backdrop-filter: var(--topbar-blur-5, none); }
 }
 @supports (-webkit-backdrop-filter: blur(1px)) {
-    header.topbar::before { -webkit-backdrop-filter: var(--topbar-backdrop-filter); }
+    header.topbar .topbar-blur-1 { -webkit-backdrop-filter: var(--topbar-blur-1, none); }
+    header.topbar .topbar-blur-2 { -webkit-backdrop-filter: var(--topbar-blur-2, none); }
+    header.topbar .topbar-blur-3 { -webkit-backdrop-filter: var(--topbar-blur-3, none); }
+    header.topbar .topbar-blur-4 { -webkit-backdrop-filter: var(--topbar-blur-4, none); }
+    header.topbar .topbar-blur-5 { -webkit-backdrop-filter: var(--topbar-blur-5, none); }
 }
 
 header.topbar .brand {
@@ -312,7 +357,14 @@ header.topbar .top-right {
 
 /* ── Main layout ────────────────────────────────────────────── */
 
-main { padding: var(--space-9); max-width: 1400px; margin: 0 auto; }
+main {
+    padding: var(--space-9);
+    max-width: 1400px;
+    margin: 0 auto;
+    /* Positioned so absolute children (the show-detail backdrop mask)
+     * size against main's actual height rather than the viewport. */
+    position: relative;
+}
 
 .muted { color: var(--text-muted); }
 .empty { padding: 4rem 1rem; text-align: center; color: var(--text-muted); }
@@ -464,18 +516,22 @@ h2.section {
  * area) can't hide it. `border` set on `::before` rather than `outline`
  * because outline ignores `border-radius` clipping inside positioned
  * children in some browsers. Sits above the sheen (z-index 2 vs 1). */
+/* Hover ring on the poster. Idle state has a transparent border so the
+ * 2px layout slot is reserved; on hover the color fades in. Themes
+ * that don't want a ring leave the tokens as `none`. */
 .card .poster-wrap::before {
     content: "";
     position: absolute;
     inset: 0;
     pointer-events: none;
     border: var(--outline-tile-poster);
+    border-color: var(--outline-tile-poster-color, transparent);
     border-radius: var(--radius-tile-poster);
     transition: border-color var(--motion-tile-hover);
     z-index: 2;
 }
 .card:hover .poster-wrap::before {
-    border: var(--outline-tile-poster-hover);
+    border-color: var(--outline-tile-poster-hover-color, transparent);
 }
 /* Glossy sheen overlay — a translucent white band defined by
  * --tile-poster-sheen. The pseudo-element is translated up by half its
@@ -535,6 +591,40 @@ h2.section {
     background: rgb(0 0 0 / 0.92);
     transform: scale(1.05);
 }
+/* Play overlay — sits over the poster, hidden until hover. The gradient
+ * dims the bottom of the poster (which, combined with the white hover
+ * ring, gives a subtle "lit-from-top" perception on the ring's bottom
+ * edge). Centered circle holds the play glyph. Modeled after the
+ * .mark-watched pattern: positioned absolutely inside .poster-wrap,
+ * fades in on card hover. */
+.play-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(180deg, transparent 40%, rgb(0 0 0 / 0.55));
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--motion-tile-hover);
+    z-index: 2;
+}
+.card:hover .play-overlay {
+    opacity: 1;
+}
+.play-overlay .pico {
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    background: rgb(255 255 255 / 0.92);
+    color: rgb(17 24 39);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.4);
+}
+.play-overlay .pico svg { width: 18px; height: 18px; }
+
 .card .progress,
 .episode .progress {
     position: absolute;
@@ -562,24 +652,70 @@ h2.section {
     grid-template-columns: var(--show-detail-grid);
     gap: var(--space-10);
     align-items: start;
-    margin-top: var(--show-detail-margin-top);
 }
 @media (max-width: 640px) {
     .detail {
         grid-template-columns: 1fr;
     }
-    .detail .poster {
+    .detail > .poster {
         max-width: 280px;
     }
+    /* Single-column layout can't honour explicit track placement; reset
+     * to auto so both items stack in source order. */
+    .detail > .poster,
+    .detail > .detail-info {
+        grid-column: auto;
+        grid-row: auto;
+    }
 }
-.detail .poster {
+/* Direct-child selector so this only styles the show-detail page's own
+ * poster element. A descendant selector would also match `.poster`
+ * elements nested deeper (e.g. inside a `ContinueCard` placed in the
+ * info column) and clobber their `aspect-ratio`. */
+.detail > .poster {
     display: var(--show-detail-poster-display);
+    grid-column: var(--show-detail-poster-col, auto);
+    grid-row: 1;
     width: 100%;
     aspect-ratio: 2 / 3;
     background: var(--bg-surface-hover) center/cover no-repeat;
     border-radius: var(--radius-tile);
     border: var(--stroke-default);
-    box-shadow: var(--shadow-tile);
+    box-shadow: var(--show-detail-poster-shadow, var(--shadow-tile));
+}
+.detail > .detail-info {
+    grid-column: var(--show-detail-info-col, auto);
+    grid-row: 1;
+}
+/* Soft left-edge gradient behind the title/plot — gives the text contrast
+ * without boxing it in. Sits inside .detail (which is `position: relative`
+ * via the main > .detail rule) and stretches under the info column. Hidden
+ * by default — themes that want it set `--show-detail-fade-display`.
+ *
+ * Vertical bleed extends the fade up under the topbar (so its frosted
+ * blur picks up the wash, no harsh top edge against the fanart) and down
+ * past the article (so the page-bg gradient mask takes over before the
+ * fade ends). Horizontal bleed (`left: 50% - 50vw`) escapes main's
+ * max-width cap so the dark wash starts at the viewport edge. */
+.detail-fade {
+    display: var(--show-detail-fade-display, none);
+    position: absolute;
+    /* Bleed up under the topbar and down past the article. The mask
+     * (below) softens those edges so the wash dissolves into the
+     * fanart instead of cutting hard. */
+    top: var(--show-detail-fade-bleed-top, -240px);
+    bottom: var(--show-detail-fade-bleed-bottom, -240px);
+    /* Bleed past `.detail`'s box on both sides to escape main's 1400px
+     * max-width cap and reach the actual viewport edges. */
+    left: calc(50% - 50vw);
+    right: calc(50% - 50vw);
+    z-index: -1;
+    pointer-events: none;
+    background-image: var(--show-detail-fade-image, none);
+    /* Feather top/bottom edges so the dark wash fades into the fanart
+     * rather than cutting hard against it. */
+    -webkit-mask-image: var(--show-detail-fade-mask, none);
+    mask-image: var(--show-detail-fade-mask, none);
 }
 .detail h1 {
     margin-top: 0;
@@ -608,7 +744,10 @@ h2.section {
     top: 0;
     left: 0;
     right: 0;
-    height: var(--show-backdrop-mask-height);
+    /* Fill `main` exactly. The gradient stops in --show-backdrop-mask-image
+     * use viewport units (vh) so the fade timing is consistent regardless
+     * of how tall the page is. */
+    bottom: 0;
     z-index: 1;
     pointer-events: none;
     /* `main` is capped at 1400px; escape it so the mask spans the full
@@ -648,6 +787,15 @@ main > .season {
 }
 .detail-info {
     display: block;
+}
+/* "Continue Watching" tile inside the info column. Caps width so a wide
+ * info column doesn't blow the card up; the inner `.card` flexes within. */
+.detail-continue {
+    margin-top: var(--space-9);
+    max-width: 360px;
+}
+.detail-continue .section {
+    margin-bottom: var(--space-6);
 }
 .detail-actions {
     margin-top: var(--space-8);
@@ -1434,7 +1582,7 @@ main > .season {
 }
 .episode-link {
     display: grid;
-    grid-template-columns: 160px 1fr;
+    grid-template-columns: 240px 1fr;
     gap: var(--space-7);
     padding: var(--episode-row-padding);
     border-radius: var(--radius-episode-row);
@@ -1497,7 +1645,7 @@ main > .season {
 .episode-link:hover .ep-thumb {
     transform: var(--ep-thumb-hover-transform);
 }
-.ep-body { padding: var(--space-2) 0; }
+.ep-body { padding: var(--radius-ep-thumb) 0; }
 .ep-title {
     font-weight: var(--weight-semibold);
     color: var(--text-primary);

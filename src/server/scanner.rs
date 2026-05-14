@@ -103,6 +103,14 @@ fn find_show_fanart(show_dir: &Path) -> Option<PathBuf> {
     first_existing(show_dir, &["fanart", "backdrop"])
 }
 
+fn find_show_clearlogo(show_dir: &Path) -> Option<PathBuf> {
+    first_existing(show_dir, &["clearlogo", "logo"])
+}
+
+fn find_show_banner(show_dir: &Path) -> Option<PathBuf> {
+    first_existing(show_dir, &["banner"])
+}
+
 fn find_movie_image(video: &Path) -> Option<PathBuf> {
     let dir = video.parent()?;
     let base = video.file_stem()?.to_str()?;
@@ -904,6 +912,8 @@ async fn upsert_show(
     let sort_title = filename::sort_title(&title);
     let poster = find_show_poster(show_dir).map(|p| p.to_string_lossy().into_owned());
     let fanart = find_show_fanart(show_dir).map(|p| p.to_string_lossy().into_owned());
+    let clearlogo = find_show_clearlogo(show_dir).map(|p| p.to_string_lossy().into_owned());
+    let banner = find_show_banner(show_dir).map(|p| p.to_string_lossy().into_owned());
     let tvdb_id = nfo
         .uniqueid
         .iter()
@@ -915,9 +925,10 @@ async fn upsert_show(
         r#"
         INSERT INTO shows (
             id, library_id, path, title, sort_title, original_title, year, plot,
-            imdb_id, tmdb_id, tvdb_id, poster_path, fanart_path, added_at
+            imdb_id, tmdb_id, tvdb_id, poster_path, fanart_path, clearlogo_path,
+            banner_path, added_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
             sort_title = excluded.sort_title,
@@ -929,6 +940,8 @@ async fn upsert_show(
             tvdb_id = excluded.tvdb_id,
             poster_path = excluded.poster_path,
             fanart_path = excluded.fanart_path,
+            clearlogo_path = excluded.clearlogo_path,
+            banner_path = excluded.banner_path,
             scanned_at = datetime('now')
         "#,
     )
@@ -945,6 +958,8 @@ async fn upsert_show(
     .bind(&tvdb_id)
     .bind(&poster)
     .bind(&fanart)
+    .bind(&clearlogo)
+    .bind(&banner)
     .bind(&added_at)
     .execute(pool)
     .await?;

@@ -29,6 +29,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/shows/{id}", get(show))
         .route("/api/shows/{id}/poster", get(show_poster))
         .route("/api/shows/{id}/fanart", get(show_fanart))
+        .route("/api/shows/{id}/clearlogo", get(show_clearlogo))
+        .route("/api/shows/{id}/banner", get(show_banner))
         .route("/api/shows/{id}/seasons/{n}/poster", get(season_poster))
         .route("/api/rooms", get(list_rooms).post(create_room))
         .route("/api/scan", post(start_scan))
@@ -294,6 +296,9 @@ pub struct Show {
     pub imdb_id: Option<String>,
     pub tmdb_id: Option<String>,
     pub tvdb_id: Option<String>,
+    pub has_clearlogo: bool,
+    pub has_fanart: bool,
+    pub has_banner: bool,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -327,7 +332,10 @@ async fn show(
     Path(id): Path<String>,
 ) -> Result<Json<ShowResponse>> {
     let show = sqlx::query_as::<_, Show>(
-        "SELECT id, title, original_title, year, plot, imdb_id, tmdb_id, tvdb_id
+        "SELECT id, title, original_title, year, plot, imdb_id, tmdb_id, tvdb_id,
+                (clearlogo_path IS NOT NULL) AS has_clearlogo,
+                (fanart_path    IS NOT NULL) AS has_fanart,
+                (banner_path    IS NOT NULL) AS has_banner
          FROM shows WHERE id = ?",
     )
     .bind(&id)
@@ -557,6 +565,24 @@ async fn show_fanart(
     req: Request,
 ) -> Result<axum::response::Response> {
     let path = lookup(&state, "SELECT fanart_path FROM shows WHERE id = ?", &id).await?;
+    serve(path, req).await
+}
+
+async fn show_clearlogo(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request,
+) -> Result<axum::response::Response> {
+    let path = lookup(&state, "SELECT clearlogo_path FROM shows WHERE id = ?", &id).await?;
+    serve(path, req).await
+}
+
+async fn show_banner(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    req: Request,
+) -> Result<axum::response::Response> {
+    let path = lookup(&state, "SELECT banner_path FROM shows WHERE id = ?", &id).await?;
     serve(path, req).await
 }
 

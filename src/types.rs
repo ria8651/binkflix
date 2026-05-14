@@ -69,6 +69,12 @@ pub struct Show {
     pub imdb_id: Option<String>,
     pub tmdb_id: Option<String>,
     pub tvdb_id: Option<String>,
+    #[serde(default)]
+    pub has_clearlogo: bool,
+    #[serde(default)]
+    pub has_fanart: bool,
+    #[serde(default)]
+    pub has_banner: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -414,6 +420,11 @@ pub struct MediaPreferences {
 }
 
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
+pub fn show_fanart_url(id: &str) -> String { format!("/api/shows/{id}/fanart") }
+pub fn show_clearlogo_url(id: &str) -> String { format!("/api/shows/{id}/clearlogo") }
+// Endpoint is live; the show-detail UI doesn't surface banner artwork yet.
+#[allow(dead_code)]
+pub fn show_banner_url(id: &str) -> String { format!("/api/shows/{id}/banner") }
 pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn season_poster_url(show_id: &str, season: i64) -> String {
     format!("/api/shows/{show_id}/seasons/{season}/poster")
