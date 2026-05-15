@@ -609,7 +609,8 @@ h2.section {
     transition: opacity var(--motion-tile-hover);
     z-index: 2;
 }
-.card:hover .play-overlay {
+.card:hover .play-overlay,
+.episode:hover .play-overlay {
     opacity: 1;
 }
 .play-overlay .pico {
@@ -653,7 +654,7 @@ h2.section {
     gap: var(--space-10);
     align-items: start;
 }
-@media (max-width: 640px) {
+@media (max-width: 800px) {
     .detail {
         grid-template-columns: 1fr;
     }
@@ -717,6 +718,15 @@ h2.section {
     -webkit-mask-image: var(--show-detail-fade-mask, none);
     mask-image: var(--show-detail-fade-mask, none);
 }
+/* Mobile: the layout stacks (poster on top, text below) so the
+ * desktop's left-to-right vignette would dim the middle of the text.
+ * Swap to a flat dark wash that still feathers at top/bottom via the
+ * existing mask. */
+@media (max-width: 800px) {
+    .detail-fade {
+        background-image: linear-gradient(rgb(8 10 16 / 0.6), rgb(8 10 16 / 0.6));
+    }
+}
 .detail h1 {
     margin-top: 0;
     font-size: var(--text-2xl);
@@ -730,7 +740,15 @@ h2.section {
 .show-backdrop {
     display: var(--show-backdrop-display);
     position: fixed;
-    inset: 0;
+    top: 0;
+    left: 0;
+    /* Cover 100vw wide × 80vh tall. `background-size: cover` crops the
+     * fanart to fill the box, so it always reaches one of the edges.
+     * Capping height at 80vh leaves a sliver of page bg below it so
+     * the image doesn't run straight into the content area on tall
+     * viewports. */
+    width: 100vw;
+    height: 90vh;
     z-index: 0;
     background-size: cover;
     background-position: center top;
@@ -744,9 +762,6 @@ h2.section {
     top: 0;
     left: 0;
     right: 0;
-    /* Fill `main` exactly. The gradient stops in --show-backdrop-mask-image
-     * use viewport units (vh) so the fade timing is consistent regardless
-     * of how tall the page is. */
     bottom: 0;
     z-index: 1;
     pointer-events: none;
@@ -772,7 +787,8 @@ h2.section {
  * effect without a sibling stacking context to compete with. */
 main > .detail,
 main > .season-picker,
-main > .season {
+main > .season,
+main > .detail-footer-banners {
     position: relative;
     z-index: 2;
 }
@@ -796,6 +812,48 @@ main > .season {
 }
 .detail-continue .section {
     margin-bottom: var(--space-6);
+}
+
+/* Banner-row footer at the bottom of the show-detail page. Responsive
+ * grid of clickable banner tiles linking to other shows.
+ *
+ * `auto-fit` decides how many tracks fit at the cell's min width, so
+ * the layout snaps cleanly between e.g. 3 / 2 / 1 banners — never a
+ * half-clipped tile. `grid-auto-rows: 0` + `overflow: hidden` confine
+ * the layout to a single row: any banners that don't fit are placed
+ * into a zero-height implicit row and clipped, so they vanish rather
+ * than wrapping. */
+.detail-footer-banners {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    /* One explicit row sized to its content; any further rows that
+     * grid auto-creates for overflowing items have 0 height. Combined
+     * with `overflow: hidden` on the container, overflow tiles vanish. */
+    grid-template-rows: auto;
+    grid-auto-rows: 0;
+    gap: var(--space-7);
+    margin-top: var(--space-10);
+    overflow: hidden;
+}
+.detail-footer-banner {
+    display: block;
+    border-radius: var(--radius-tile);
+    overflow: hidden;
+    box-shadow: var(--shadow-tile);
+    transition: transform var(--motion-tile-hover), box-shadow var(--motion-tile-hover);
+}
+.detail-footer-banner:hover {
+    transform: var(--tile-hover-transform);
+    box-shadow: var(--shadow-tile-card-hover);
+}
+.detail-footer-banner img {
+    display: block;
+    /* Fills the grid cell width; aspect-ratio preserved by `height:
+     * auto`. Cap at the source's natural pixel width via the
+     * intrinsic-size technique below so wide cells can't upscale a
+     * low-res banner into a blur. */
+    width: 100%;
+    height: auto;
 }
 .detail-actions {
     margin-top: var(--space-8);
@@ -1583,6 +1641,10 @@ main > .season {
 .episode-link {
     display: grid;
     grid-template-columns: 240px 1fr;
+    /* Pin the row height to the thumb's natural 16:9 size so long plot
+     * text in the body cell can't drag the whole row taller — instead
+     * it clips inside the body via the line-clamp on `.ep-plot`. */
+    grid-template-rows: calc(240px * 9 / 16);
     gap: var(--space-7);
     padding: var(--episode-row-padding);
     border-radius: var(--radius-episode-row);
@@ -1595,6 +1657,16 @@ main > .season {
 .episode-link:hover {
     background: var(--bg-episode-row-hover);
     border-color: var(--border-episode-row-hover);
+}
+/* Mobile: stack thumb above title+plot. Row height drops to auto since
+ * the thumb's width is now the viewport, not a fixed 240px. Tighter
+ * breakpoint than the rest of the page because the 240px thumb only
+ * starts overwhelming the row well below the 800px page breakpoint. */
+@media (max-width: 560px) {
+    .episode-link {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto;
+    }
 }
 .ep-thumb-wrap {
     position: relative;
@@ -1645,7 +1717,16 @@ main > .season {
 .episode-link:hover .ep-thumb {
     transform: var(--ep-thumb-hover-transform);
 }
-.ep-body { padding: var(--radius-ep-thumb) 0; }
+.ep-body {
+    padding: var(--radius-ep-thumb) 0;
+    /* Flex column so the plot below the title can take whatever
+     * vertical space is left and clip with ellipsis. `min-height: 0`
+     * (plus the same on the plot) defeats the flex default that lets
+     * children expand past their basis. */
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
 .ep-title {
     font-weight: var(--weight-semibold);
     color: var(--text-primary);
@@ -1663,10 +1744,19 @@ main > .season {
     color: var(--text-tertiary);
     font-size: var(--text-md);
     line-height: 1.5;
+    /* Take whatever vertical space is left in the row after the title;
+     * `min-height: 0` lets the flex item actually shrink to its
+     * available space rather than expanding the row to fit the whole
+     * plot. `line-clamp` adds the ellipsis when the text overflows
+     * that available space. */
+    flex: 1;
+    min-height: 0;
     display: -webkit-box;
-    -webkit-line-clamp: 2;
+    -webkit-line-clamp: 100;
     -webkit-box-orient: vertical;
+    line-clamp: 100;
     overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* ---- Syncplay rooms dropdown ---- */

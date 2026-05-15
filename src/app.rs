@@ -918,16 +918,22 @@ fn MediaDetail(id: String) -> Element {
 
 #[component]
 fn ShowDetail(id: String) -> Element {
-    let id_clone = id.clone();
-    let mut detail = use_resource(move || {
-        let id = id_clone.clone();
-        async move { get_show(&id).await }
-    });
+    // `use_reactive` makes `id` a tracked dependency, so navigating from
+    // one show to another (Dioxus reuses the route component when the
+    // path matches) actually restarts the fetch with the new id rather
+    // than reusing the stale one captured at first render.
+    let mut detail = use_resource(use_reactive!(|id| async move {
+        get_show(&id).await
+    }));
 
     // Show-scoped Continue Watching. The server returns the full global
     // list; we filter client-side by `show_id` since the list is small
     // and filtering here avoids a server route just for this view.
     let mut cont = use_resource(get_continue_watching);
+
+    // Library is fetched so we can pick a sibling show's banner for the
+    // footer flourish. Cheap because the home page warms this cache.
+    let lib = use_resource(get_library);
 
     // Currently selected season number. `None` until the resource resolves
     // and a default is chosen; once set, `selected` drives which season's
@@ -1047,6 +1053,53 @@ fn ShowDetail(id: String) -> Element {
                             on_change: move |_| detail.restart(),
                         }
                     }
+                    {
+                        // Footer flourish: a responsive grid of sibling-show
+                        // banners at the bottom of the page. Picks are
+                        // deterministic per show (byte-sum seed, walking the
+                        // candidate list) so the same companion set pairs
+                        // with the same show across visits. We render up to
+                        // BANNER_COUNT and let `auto-fill` lay out one tidy
+                        // row at the current viewport width.
+                        const BANNER_COUNT: usize = 5;
+                        let picks: Vec<String> = match &*lib.read_unchecked() {
+                            Some(Ok(library)) => {
+                                let here = &d.show.id;
+                                let candidates: Vec<&ShowSummary> = library
+                                    .shows
+                                    .iter()
+                                    .filter(|s| s.has_banner && s.id != *here)
+                                    .collect();
+                                if candidates.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    let seed: usize = here.bytes().map(|b| b as usize).sum();
+                                    let take = BANNER_COUNT.min(candidates.len());
+                                    (0..take)
+                                        .map(|i| candidates[(seed + i) % candidates.len()].id.clone())
+                                        .collect()
+                                }
+                            }
+                            _ => Vec::new(),
+                        };
+                        (!picks.is_empty()).then(|| rsx! {
+                            div { class: "detail-footer-banners",
+                                for sid in picks {
+                                    Link {
+                                        key: "{sid}",
+                                        to: Route::ShowDetail { id: sid.clone() },
+                                        class: "detail-footer-banner",
+                                        img {
+                                            src: "{show_banner_url(&sid)}",
+                                            loading: "lazy",
+                                            decoding: "async",
+                                            alt: "",
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                    }
                 }
             }
         }
@@ -1124,6 +1177,9 @@ fn EpisodeRow(episode: EpisodeSummary, on_change: EventHandler<()>) -> Element {
                         loading: "lazy",
                         decoding: "async",
                         alt: "",
+                    }
+                    div { class: "play-overlay",
+                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                     if pct > 0.0 {
                         div { class: "progress",

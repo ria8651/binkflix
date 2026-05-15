@@ -15,6 +15,8 @@ pub struct ShowSummary {
     pub title: String,
     pub year: Option<i64>,
     pub episode_count: i64,
+    #[serde(default)]
+    pub has_banner: bool,
 }
 
 /// One newly-added playable item — an episode or a movie. Episodes carry
@@ -422,8 +424,6 @@ pub struct MediaPreferences {
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
 pub fn show_fanart_url(id: &str) -> String { format!("/api/shows/{id}/fanart") }
 pub fn show_clearlogo_url(id: &str) -> String { format!("/api/shows/{id}/clearlogo") }
-// Endpoint is live; the show-detail UI doesn't surface banner artwork yet.
-#[allow(dead_code)]
 pub fn show_banner_url(id: &str) -> String { format!("/api/shows/{id}/banner") }
 pub fn media_fanart_url(id: &str) -> String { format!("/api/media/{id}/fanart") }
 pub fn season_poster_url(show_id: &str, season: i64) -> String {

@@ -171,6 +171,7 @@ pub struct ShowSummary {
     pub title: String,
     pub year: Option<i64>,
     pub episode_count: i64,
+    pub has_banner: bool,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -207,7 +208,8 @@ async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>>
 
     let shows = sqlx::query_as::<_, ShowSummary>(
         "SELECT s.id, s.title, s.year,
-                (SELECT COUNT(*) FROM media m WHERE m.show_id = s.id) AS episode_count
+                (SELECT COUNT(*) FROM media m WHERE m.show_id = s.id) AS episode_count,
+                (s.banner_path IS NOT NULL) AS has_banner
          FROM shows s
          ORDER BY s.sort_title",
     )
