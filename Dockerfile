@@ -20,10 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=binkflix-target \
     --mount=type=cache,target=/root/.cache/dioxus \
     dx bundle --platform web --release \
- && cargo build --release -p import-jellyfin \
- && mkdir -p /out/bin \
- && cp -r /src/target/dx/binkflix/release/web /out/web \
- && cp /src/target/release/import-jellyfin /out/bin/
+ && cp -r /src/target/dx/binkflix/release/web /out/web
 
 FROM debian:trixie-slim AS runtime
 # intel-media-va-driver-non-free lives in the non-free component; enable it on
@@ -37,14 +34,16 @@ RUN sed -i 's/^Components: main$/Components: main non-free non-free-firmware/' \
 
 WORKDIR /app
 
-# Dioxus bundle (server binary + public/ web assets).
+# Dioxus bundle (server binary + public/ web assets). The server binary also
+# hosts one-shot subcommands like `import-jellyfin` and `cleanup`, exposed on
+# PATH as `binkflix` via the symlink below — e.g.
+# `docker exec <container> binkflix import-jellyfin /data/jf.db`.
 COPY --from=builder /out/web/ /app/
+RUN ln -s /app/server /usr/local/bin/binkflix
 # Vendored static files the server serves directly via ServeDir("assets/..."):
 # JASSUB worker/wasm and player.js, which need stable unhashed URLs so can't
 # go through Dioxus's asset pipeline. See src/server/mod.rs.
 COPY --from=builder /src/assets /app/assets
-# One-shot admin tools (e.g. `docker exec <container> import-jellyfin /data/jf.db`).
-COPY --from=builder /out/bin/ /usr/local/bin/
 
 ENV BINKFLIX_DB=/data/binkflix.db \
     BINKFLIX_BIND=0.0.0.0:9356 \
