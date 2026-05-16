@@ -18,6 +18,7 @@ pub mod syncplay;
 pub mod thumbnails;
 pub mod tmp;
 pub mod trickplay;
+pub mod users;
 pub mod watch;
 
 use crate::app::App;

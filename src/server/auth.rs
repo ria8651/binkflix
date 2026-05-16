@@ -193,6 +193,8 @@ async fn bastion_callback(
         );
     }
 
+    super::users::touch(&state.pool, &user_sub, &login_name).await;
+
     info!(%login_name, %user_sub, "bastion auth success");
 
     let cookie = Cookie::build((COOKIE_NAME, sid))
@@ -257,6 +259,7 @@ pub async fn require_session(
     }
 
     let Some(auth) = state.auth.as_ref() else {
+        super::users::touch(&state.pool, DEV_USER_SUB, DEV_LOGIN).await;
         let mut req = req;
         req.extensions_mut().insert(Session {
             user_sub: DEV_USER_SUB.into(),
@@ -267,6 +270,7 @@ pub async fn require_session(
     };
 
     if let Some(session) = auth.session_of(&jar).await {
+        super::users::touch(&state.pool, &session.user_sub, &session.login).await;
         let mut req = req;
         req.extensions_mut().insert(session);
         return next.run(req).await;
