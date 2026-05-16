@@ -1,2 +1,0 @@
-ALTER TABLE watch_progress
-    ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0;
