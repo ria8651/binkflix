@@ -1,0 +1,17 @@
+[package]
+name = "import-jellyfin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "import-jellyfin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dotenvy = "0.15"
+dialoguer = "0.11"

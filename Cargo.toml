@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "tools/import-jellyfin"]
+
 [package]
 name = "binkflix"
 version = "0.1.0"
