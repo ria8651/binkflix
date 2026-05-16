@@ -15,7 +15,7 @@ use app::App;
 fn main() {
     #[cfg(feature = "server")]
     {
-        server::run();
+        server::cli::run();
         return;
     }
 

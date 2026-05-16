@@ -4,6 +4,7 @@
 pub mod analytics;
 pub mod api;
 pub mod auth;
+pub mod cli;
 pub mod db;
 pub mod error;
 pub mod filename;
@@ -284,13 +285,14 @@ async fn run_async() -> anyhow::Result<()> {
         scan_jobs.push((id, path.clone()));
     }
 
-    // Drop any library rows no longer in BINKFLIX_LIBRARY — changing the
-    // env var shouldn't leave orphan shows/media in the DB. Cascading FKs
-    // clean up the child rows (shows → media → subtitles/thumbnails).
+    // Soft-delete library rows no longer in BINKFLIX_LIBRARY. Watch history
+    // and other related rows are preserved; if a library path comes back
+    // (e.g. a misconfiguration is corrected), `ensure_library` resurrects
+    // the rows. `binkflix cleanup --apply` purges them for good.
     let active_ids: Vec<i64> = scan_jobs.iter().map(|(id, _)| *id).collect();
     let removed = scanner::prune_libraries(&pool, &active_ids).await?;
     if removed > 0 {
-        info!(removed, "pruned libraries no longer configured");
+        info!(removed, "soft-deleted libraries no longer configured");
     }
 
     let scan_progress: scanner::ProgressHandle = Arc::new(RwLock::new(ScanProgress::default()));

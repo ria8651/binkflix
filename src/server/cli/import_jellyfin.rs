@@ -1,8 +1,7 @@
 //! One-shot importer: copies Jellyfin watch history into binkflix's
-//! `watch_progress` table. See plan in /Users/brian/.claude/plans/ for the
-//! design rationale.
+//! `watch_progress` table. Invoked as `binkflix import-jellyfin <path>`.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{NaiveDateTime, Utc};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -47,29 +46,14 @@ struct BfMedia {
     show_title_lc: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Resolve the repo root so .env + relative BINKFLIX_DB work regardless of cwd.
-    let repo_root = repo_root()?;
-    let _ = dotenvy::from_path(repo_root.join(".env"));
-
-    let args: Vec<String> = std::env::args().collect();
-    let jf_path = match args.get(1) {
-        Some(p) => PathBuf::from(p),
-        None => {
-            eprintln!("Usage: import-jellyfin <path/to/jellyfin.db>");
-            std::process::exit(1);
-        }
-    };
+pub async fn run(jf_path: PathBuf) -> Result<()> {
     if !jf_path.exists() {
         bail!("Jellyfin DB not found at {}", jf_path.display());
     }
 
-    let bf_path_str = std::env::var("BINKFLIX_DB").unwrap_or_else(|_| "./data/binkflix.db".into());
-    let bf_path = {
-        let p = PathBuf::from(&bf_path_str);
-        if p.is_absolute() { p } else { repo_root.join(&p) }
-    };
+    let bf_path = PathBuf::from(
+        std::env::var("BINKFLIX_DB").unwrap_or_else(|_| "./data/binkflix.db".into()),
+    );
     if !bf_path.exists() {
         bail!("binkflix DB not found at {}", bf_path.display());
     }
@@ -131,7 +115,8 @@ async fn main() -> Result<()> {
 
     println!("Jellyfin rows to consider: {}", jf_rows.len());
 
-    // Build binkflix indexes.
+    // Build binkflix indexes. Soft-deleted rows are intentionally excluded —
+    // importing onto a soft-deleted media id would resurface obsolete state.
     let bf_media: Vec<BfMedia> = sqlx::query_as(
         r#"
         SELECT m.id                AS "id",
@@ -143,7 +128,8 @@ async fn main() -> Result<()> {
                m.episode_number    AS "episode_number",
                lower(s.title)      AS "show_title_lc"
         FROM media m
-        LEFT JOIN shows s ON s.id = m.show_id
+        LEFT JOIN shows s ON s.id = m.show_id AND s.deleted_at IS NULL
+        WHERE m.deleted_at IS NULL
         "#,
     )
     .fetch_all(&bf)
@@ -455,18 +441,4 @@ fn parse_jf_date(s: Option<&str>) -> Option<i64> {
         }
     }
     None
-}
-
-fn repo_root() -> Result<PathBuf> {
-    // The crate sits at <repo>/tools/import-jellyfin, so two parents up from
-    // CARGO_MANIFEST_DIR is the repo root. Falls back to current_dir for the
-    // rare case CARGO_MANIFEST_DIR isn't set.
-    let here = std::env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::current_dir().map_err(|e| anyhow!(e)))?;
-    Ok(here
-        .parent()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from)
-        .unwrap_or(here))
 }

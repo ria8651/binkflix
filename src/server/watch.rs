@@ -211,8 +211,8 @@ pub async fn continue_watching(
                 wp.completed    AS completed,
                 wp.dismissed   AS dismissed
          FROM watch_progress wp
-         JOIN media m ON m.id = wp.media_id
-         LEFT JOIN shows s ON s.id = m.show_id
+         JOIN media m ON m.id = wp.media_id AND m.deleted_at IS NULL
+         LEFT JOIN shows s ON s.id = m.show_id AND s.deleted_at IS NULL
          WHERE wp.user_sub = ? AND wp.updated_at > ?
          ORDER BY wp.updated_at DESC",
     )
@@ -308,7 +308,7 @@ async fn next_episode(
     let row: Option<NextEp> = sqlx::query_as(
         "SELECT id, title, season_number, episode_number
          FROM media
-         WHERE kind = 'episode' AND show_id = ?
+         WHERE kind = 'episode' AND show_id = ? AND deleted_at IS NULL
            AND ( (season_number = ? AND episode_number > ?)
               OR (season_number > ?) )
          ORDER BY season_number ASC, episode_number ASC

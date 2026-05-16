@@ -233,11 +233,32 @@ pub struct ScanStats {
 pub async fn ensure_library(pool: &SqlitePool, name: &str, path: &Path) -> anyhow::Result<i64> {
     let path_str = path.canonicalize()?.to_string_lossy().into_owned();
 
-    if let Some((id,)) = sqlx::query_as::<_, (i64,)>("SELECT id FROM libraries WHERE path = ?")
+    if let Some((id, deleted_at)) =
+        sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT id, deleted_at FROM libraries WHERE path = ?",
+        )
         .bind(&path_str)
         .fetch_optional(pool)
         .await?
     {
+        // Resurrect a previously-soft-deleted library and any of its
+        // shows/media that were soft-deleted by the same library-prune.
+        // Per-file prunes are re-applied later in prune_missing.
+        if deleted_at.is_some() {
+            sqlx::query("UPDATE libraries SET deleted_at = NULL WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            sqlx::query("UPDATE shows SET deleted_at = NULL WHERE library_id = ?")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            sqlx::query("UPDATE media SET deleted_at = NULL WHERE library_id = ?")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            info!(library_id = id, %path_str, "restored soft-deleted library");
+        }
         return Ok(id);
     }
 
@@ -794,9 +815,11 @@ pub async fn scan_library_with_progress(
 
 // --- prune ---
 
-/// Delete `libraries` rows (and via FK cascade their shows + media +
-/// subtitles + thumbnails) whose id isn't in `active_ids`. Called at
-/// startup after registering the currently-configured library paths.
+/// Soft-delete `libraries` rows (and propagate to their shows + media)
+/// whose id isn't in `active_ids`. Called at startup after registering
+/// the currently-configured library paths. Rows are kept on disk so
+/// watch history survives an accidental config change; `binkflix cleanup
+/// --apply` can purge them later.
 pub async fn prune_libraries(pool: &SqlitePool, active_ids: &[i64]) -> anyhow::Result<u64> {
     // Refuse to wipe everything if the env var is empty — callers already
     // bail before reaching here, but belt-and-braces.
@@ -805,37 +828,59 @@ pub async fn prune_libraries(pool: &SqlitePool, active_ids: &[i64]) -> anyhow::R
     }
     // Fetch + filter in Rust rather than building a dynamic `NOT IN (?, ?, …)`
     // binding list. N is tiny (one per configured library path).
-    let all: Vec<(i64,)> = sqlx::query_as("SELECT id FROM libraries")
-        .fetch_all(pool)
-        .await?;
+    let all: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM libraries WHERE deleted_at IS NULL")
+            .fetch_all(pool)
+            .await?;
     let mut removed: u64 = 0;
     for (id,) in all {
         if active_ids.contains(&id) {
             continue;
         }
-        let res = sqlx::query("DELETE FROM libraries WHERE id = ?")
-            .bind(id)
-            .execute(pool)
-            .await?;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let res = sqlx::query(
+            "UPDATE libraries SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
         removed += res.rows_affected();
-        debug!(library_id = id, "pruned library");
+        // Propagate so a single per-table `deleted_at IS NULL` filter on
+        // reads covers everything — no joins back to libraries needed.
+        sqlx::query(
+            "UPDATE shows SET deleted_at = ? WHERE library_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE media SET deleted_at = ? WHERE library_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+        debug!(library_id = id, "soft-deleted library");
     }
     Ok(removed)
 }
 
 
-/// Delete media rows in this library whose path wasn't seen during the walk,
-/// then drop any show whose entire episode set has vanished.
+/// Soft-delete media rows in this library whose path wasn't seen during the
+/// walk, then soft-delete any show whose entire episode set has vanished.
 ///
-/// Returns the total number of rows removed (media + shows). FK cascades
-/// clean up subtitles, thumbnails, and media_genres automatically.
+/// Returns the total number of rows soft-deleted. Watch history and other
+/// related rows are preserved; rows can be resurrected by the upsert path
+/// if the file reappears, and purged for real via `binkflix cleanup --apply`.
 async fn prune_missing(
     pool: &SqlitePool,
     library_id: i64,
     seen: &HashSet<String>,
 ) -> anyhow::Result<u64> {
     let existing: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, path FROM media WHERE library_id = ?",
+        "SELECT id, path FROM media WHERE library_id = ? AND deleted_at IS NULL",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -847,35 +892,46 @@ async fn prune_missing(
         .map(|(id, _)| id)
         .collect();
 
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut removed: u64 = 0;
     for id in &to_delete {
-        let res = sqlx::query("DELETE FROM media WHERE id = ?")
-            .bind(id)
-            .execute(pool)
-            .await?;
+        let res = sqlx::query(
+            "UPDATE media SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
         removed += res.rows_affected();
-        debug!(media_id = %id, "pruned media");
+        debug!(media_id = %id, "soft-deleted media");
     }
 
-    // Shows whose every episode is gone. We don't track seen show dirs
-    // separately because a show can legitimately have zero rows if its
-    // episodes were all just deleted — that's the case we want to act on.
+    // Shows whose every non-soft-deleted episode is gone. A show with zero
+    // live episodes is the case we want to act on; previously-soft-deleted
+    // episodes don't count toward "still alive".
     let orphan_shows: Vec<(String,)> = sqlx::query_as(
         "SELECT id FROM shows
          WHERE library_id = ?
-           AND NOT EXISTS (SELECT 1 FROM media WHERE media.show_id = shows.id)",
+           AND deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM media
+                WHERE media.show_id = shows.id AND media.deleted_at IS NULL
+           )",
     )
     .bind(library_id)
     .fetch_all(pool)
     .await?;
 
     for (id,) in &orphan_shows {
-        let res = sqlx::query("DELETE FROM shows WHERE id = ?")
-            .bind(id)
-            .execute(pool)
-            .await?;
+        let res = sqlx::query(
+            "UPDATE shows SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
         removed += res.rows_affected();
-        debug!(show_id = %id, "pruned empty show");
+        debug!(show_id = %id, "soft-deleted empty show");
     }
 
     Ok(removed)
@@ -891,25 +947,29 @@ async fn upsert_show(
     let path_str = show_dir.to_string_lossy().into_owned();
     let nfo_path = show_dir.join("tvshow.nfo");
 
-    let existing: Option<(String, String, i64)> =
-        sqlx::query_as("SELECT id, scanned_at, scan_version FROM shows WHERE path = ?")
-            .bind(&path_str)
-            .fetch_optional(pool)
-            .await?;
+    let existing: Option<(String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, scanned_at, scan_version, deleted_at FROM shows WHERE path = ?",
+    )
+    .bind(&path_str)
+    .fetch_optional(pool)
+    .await?;
 
-    if let Some((id, scanned_at, scan_version)) = &existing {
+    if let Some((id, scanned_at, scan_version, deleted_at)) = &existing {
         // Track the show dir's mtime alongside the NFO so adding/removing
         // poster.jpg or fanart.jpg also triggers a re-upsert. The
         // scan_version check forces a re-upsert when the scanner code has
         // started persisting new fields since this row was last written.
-        if *scan_version == SHOW_SCAN_VERSION && !any_newer_than(&[&nfo_path, show_dir], scanned_at)
+        // A soft-deleted row always re-upserts so `deleted_at` gets cleared.
+        if deleted_at.is_none()
+            && *scan_version == SHOW_SCAN_VERSION
+            && !any_newer_than(&[&nfo_path, show_dir], scanned_at)
         {
             return Ok((id.clone(), false));
         }
     }
 
     let id = existing
-        .map(|(id, _, _)| id)
+        .map(|(id, _, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let nfo = nfo::parse_tvshow_nfo(&nfo_path).unwrap_or_default();
@@ -955,6 +1015,7 @@ async fn upsert_show(
             clearlogo_path = excluded.clearlogo_path,
             banner_path = excluded.banner_path,
             scan_version = excluded.scan_version,
+            deleted_at = NULL,
             scanned_at = datetime('now')
         "#,
     )
@@ -1066,14 +1127,14 @@ async fn upsert_episode(
     let nfo_opt = nfo_path.is_file().then_some(nfo_path);
 
     // Skip if unchanged.
-    let existing: Option<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, scanned_at, file_size, scan_version FROM media WHERE path = ?",
+    let existing: Option<(String, String, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, scanned_at, file_size, scan_version, deleted_at FROM media WHERE path = ?",
     )
     .bind(&path_str)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, scanned_at, existing_size, scan_version)) = &existing {
+    if let Some((id, scanned_at, existing_size, scan_version, deleted_at)) = &existing {
         let mut sources: Vec<&Path> = vec![video];
         if let Some(n) = nfo_opt.as_ref() {
             sources.push(n);
@@ -1082,7 +1143,9 @@ async fn upsert_episode(
         if let Some(parent) = video.parent() {
             sources.push(parent);
         }
-        if *scan_version == MEDIA_SCAN_VERSION
+        // A soft-deleted row always re-upserts so `deleted_at` gets cleared.
+        if deleted_at.is_none()
+            && *scan_version == MEDIA_SCAN_VERSION
             && *existing_size == file_size
             && !any_newer_than(&sources, scanned_at)
         {
@@ -1122,7 +1185,7 @@ async fn upsert_episode(
     let thumb = find_episode_thumb(video).map(|p| p.to_string_lossy().into_owned());
 
     let id = existing
-        .map(|(id, _, _, _)| id)
+        .map(|(id, _, _, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let added_at = file_added_at(video);
@@ -1146,6 +1209,7 @@ async fn upsert_episode(
             episode_number  = excluded.episode_number,
             file_size       = excluded.file_size,
             scan_version    = excluded.scan_version,
+            deleted_at      = NULL,
             -- clear movie-only fields in case this row was previously a movie
             original_title  = NULL,
             year            = NULL,
@@ -1196,14 +1260,14 @@ async fn upsert_movie(
     let base = video.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
     let nfo_path = matching_nfo(video);
 
-    let existing: Option<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, scanned_at, file_size, scan_version FROM media WHERE path = ?",
+    let existing: Option<(String, String, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, scanned_at, file_size, scan_version, deleted_at FROM media WHERE path = ?",
     )
     .bind(&path_str)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, scanned_at, existing_size, scan_version)) = &existing {
+    if let Some((id, scanned_at, existing_size, scan_version, deleted_at)) = &existing {
         // The video, the NFO, and any sidecar (poster / fanart / thumb) all
         // affect what we'd write to the DB. Tracking the parent directory's
         // mtime in addition to the video covers sidecar add/remove/replace —
@@ -1217,7 +1281,9 @@ async fn upsert_movie(
         if let Some(parent) = video.parent() {
             sources.push(parent);
         }
-        if *scan_version == MEDIA_SCAN_VERSION
+        // A soft-deleted row always re-upserts so `deleted_at` gets cleared.
+        if deleted_at.is_none()
+            && *scan_version == MEDIA_SCAN_VERSION
             && *existing_size == file_size
             && !any_newer_than(&sources, scanned_at)
         {
@@ -1244,7 +1310,7 @@ async fn upsert_movie(
     let fanart = find_movie_fanart(video).map(|p| p.to_string_lossy().into_owned());
 
     let id = existing
-        .map(|(id, _, _, _)| id)
+        .map(|(id, _, _, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let added_at = file_added_at(video);
@@ -1270,6 +1336,7 @@ async fn upsert_movie(
             fanart_path     = excluded.fanart_path,
             file_size       = excluded.file_size,
             scan_version    = excluded.scan_version,
+            deleted_at      = NULL,
             -- clear episode-only fields in case this was previously an episode
             show_id         = NULL,
             season_number   = NULL,

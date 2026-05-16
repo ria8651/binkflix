@@ -129,7 +129,7 @@ async fn list_rooms(
         let (current_media_id, current_media_title) = match room_state {
             Some(s) => {
                 let title: Option<(String,)> = sqlx::query_as(
-                    "SELECT title FROM media WHERE id = ?",
+                    "SELECT title FROM media WHERE id = ? AND deleted_at IS NULL",
                 )
                 .bind(&s.media_id)
                 .fetch_optional(&state.pool)
@@ -205,16 +205,20 @@ const RECENTLY_ADDED_MAX_AGE_DAYS: i64 = 30;
 
 async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>> {
     let movies = sqlx::query_as::<_, MovieSummary>(
-        "SELECT id, title, year FROM media WHERE kind = 'movie' ORDER BY sort_title",
+        "SELECT id, title, year FROM media \
+         WHERE kind = 'movie' AND deleted_at IS NULL \
+         ORDER BY sort_title",
     )
     .fetch_all(&state.pool)
     .await?;
 
     let shows = sqlx::query_as::<_, ShowSummary>(
         "SELECT s.id, s.title, s.year,
-                (SELECT COUNT(*) FROM media m WHERE m.show_id = s.id) AS episode_count,
+                (SELECT COUNT(*) FROM media m
+                   WHERE m.show_id = s.id AND m.deleted_at IS NULL) AS episode_count,
                 (s.banner_path IS NOT NULL) AS has_banner
          FROM shows s
+         WHERE s.deleted_at IS NULL
          ORDER BY s.sort_title",
     )
     .fetch_all(&state.pool)
@@ -234,6 +238,7 @@ async fn library(State(state): State<AppState>) -> Result<Json<LibraryResponse>>
                         ORDER BY COALESCE(m.added_at, m.scanned_at) DESC, m.id DESC
                     ) AS rn
              FROM media m
+             WHERE m.deleted_at IS NULL
          )
          SELECT r.id  AS media_id,
                 r.kind,
@@ -281,7 +286,7 @@ async fn media(State(state): State<AppState>, Path(id): Path<String>) -> Result<
     let row = sqlx::query_as::<_, Media>(
         "SELECT id, kind, title, original_title, year, plot, runtime_minutes,
                 imdb_id, tmdb_id, file_size, show_id, season_number, episode_number
-         FROM media WHERE id = ?",
+         FROM media WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -342,7 +347,7 @@ async fn show(
                 (clearlogo_path IS NOT NULL) AS has_clearlogo,
                 (fanart_path    IS NOT NULL) AS has_fanart,
                 (banner_path    IS NOT NULL) AS has_banner
-         FROM shows WHERE id = ?",
+         FROM shows WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&id)
     .fetch_optional(&state.pool)
@@ -360,7 +365,7 @@ async fn show(
          FROM media m
          LEFT JOIN watch_progress wp
            ON wp.media_id = m.id AND wp.user_sub = ?
-         WHERE m.show_id = ? AND m.kind = 'episode'
+         WHERE m.show_id = ? AND m.kind = 'episode' AND m.deleted_at IS NULL
          ORDER BY m.season_number, m.episode_number",
     )
     .bind(&session.user_sub)
@@ -438,7 +443,12 @@ async fn media_tech(
     if let Some(info) = media_info::load(&state.pool, &id).await.map_err(Error::Other)? {
         return Ok(Json(info));
     }
-    let path = lookup(&state, "SELECT path FROM media WHERE id = ?", &id).await?;
+    let path = lookup(
+        &state,
+        "SELECT path FROM media WHERE id = ? AND deleted_at IS NULL",
+        &id,
+    )
+    .await?;
     let info = media_info::probe(std::path::Path::new(&path))
         .await
         .map_err(Error::Other)?;
@@ -454,11 +464,12 @@ async fn media_image(
     // Prefer the sidecar image the library ships — it's authoritative
     // (posters, episode thumbnails). Fall back to the DB-cached generated
     // thumbnail so we don't hit the source drive on every grid render.
-    let sidecar: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT image_path FROM media WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&state.pool)
-            .await?;
+    let sidecar: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT image_path FROM media WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await?;
     if let Some((Some(path),)) = sidecar {
         return serve(path, req).await;
     }
@@ -535,14 +546,21 @@ async fn media_fanart(
     // so home-page tiles read as "the show" rather than a random frame. Falls
     // back to the regular media image (movie poster / episode thumb) when no
     // fanart exists at either level.
-    match lookup(&state, "SELECT fanart_path FROM media WHERE id = ?", &id).await {
+    match lookup(
+        &state,
+        "SELECT fanart_path FROM media WHERE id = ? AND deleted_at IS NULL",
+        &id,
+    )
+    .await
+    {
         Ok(path) => serve(path, req).await,
         Err(Error::NotFound) => {
             let show_fanart = lookup(
                 &state,
                 "SELECT s.fanart_path FROM media m \
                  JOIN shows s ON s.id = m.show_id \
-                 WHERE m.id = ? AND m.kind = 'episode'",
+                 WHERE m.id = ? AND m.kind = 'episode' \
+                   AND m.deleted_at IS NULL AND s.deleted_at IS NULL",
                 &id,
             )
             .await;
@@ -561,7 +579,12 @@ async fn show_poster(
     Path(id): Path<String>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    let path = lookup(&state, "SELECT poster_path FROM shows WHERE id = ?", &id).await?;
+    let path = lookup(
+        &state,
+        "SELECT poster_path FROM shows WHERE id = ? AND deleted_at IS NULL",
+        &id,
+    )
+    .await?;
     serve(path, req).await
 }
 
@@ -570,7 +593,12 @@ async fn show_fanart(
     Path(id): Path<String>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    let path = lookup(&state, "SELECT fanart_path FROM shows WHERE id = ?", &id).await?;
+    let path = lookup(
+        &state,
+        "SELECT fanart_path FROM shows WHERE id = ? AND deleted_at IS NULL",
+        &id,
+    )
+    .await?;
     serve(path, req).await
 }
 
@@ -579,7 +607,12 @@ async fn show_clearlogo(
     Path(id): Path<String>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    let path = lookup(&state, "SELECT clearlogo_path FROM shows WHERE id = ?", &id).await?;
+    let path = lookup(
+        &state,
+        "SELECT clearlogo_path FROM shows WHERE id = ? AND deleted_at IS NULL",
+        &id,
+    )
+    .await?;
     serve(path, req).await
 }
 
@@ -588,7 +621,12 @@ async fn show_banner(
     Path(id): Path<String>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    let path = lookup(&state, "SELECT banner_path FROM shows WHERE id = ?", &id).await?;
+    let path = lookup(
+        &state,
+        "SELECT banner_path FROM shows WHERE id = ? AND deleted_at IS NULL",
+        &id,
+    )
+    .await?;
     serve(path, req).await
 }
 
@@ -599,11 +637,13 @@ async fn season_poster(
     Path((id, n)): Path<(String, i64)>,
     req: Request,
 ) -> Result<axum::response::Response> {
-    let show_path: (String,) = sqlx::query_as("SELECT path FROM shows WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(Error::NotFound)?;
+    let show_path: (String,) = sqlx::query_as(
+        "SELECT path FROM shows WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(Error::NotFound)?;
 
     let dir = PathBuf::from(show_path.0);
     let stems: Vec<String> = if n == 0 {
@@ -791,7 +831,7 @@ fn build_movie_search_sql(
     watched: &str,
     sort: &str,
 ) -> (String, String) {
-    let mut wheres: Vec<String> = vec!["m.kind = 'movie'".into()];
+    let mut wheres: Vec<String> = vec!["m.kind = 'movie'".into(), "m.deleted_at IS NULL".into()];
     if like.is_some() {
         wheres.push("(m.sort_title LIKE ? ESCAPE '\\' OR m.title LIKE ? ESCAPE '\\')".into());
     }
@@ -886,7 +926,7 @@ fn build_show_search_sql(
     watched: &str,
     sort: &str,
 ) -> (String, String) {
-    let mut wheres: Vec<String> = Vec::new();
+    let mut wheres: Vec<String> = vec!["s.deleted_at IS NULL".into()];
     if like.is_some() {
         wheres.push("(s.sort_title LIKE ? ESCAPE '\\' OR s.title LIKE ? ESCAPE '\\')".into());
     }
@@ -909,11 +949,11 @@ fn build_show_search_sql(
     // - unwatched   = no progress at all
     match watched {
         "watched" => wheres.push(
-            "EXISTS (SELECT 1 FROM media m WHERE m.show_id = s.id) \
+            "EXISTS (SELECT 1 FROM media m WHERE m.show_id = s.id AND m.deleted_at IS NULL) \
              AND NOT EXISTS ( \
                SELECT 1 FROM media m \
                LEFT JOIN watch_progress wp ON wp.media_id = m.id AND wp.user_sub = ? \
-               WHERE m.show_id = s.id AND m.kind = 'episode' \
+               WHERE m.show_id = s.id AND m.kind = 'episode' AND m.deleted_at IS NULL \
                  AND COALESCE(wp.completed, 0) = 0)"
                 .into(),
         ),
@@ -921,7 +961,7 @@ fn build_show_search_sql(
             "NOT EXISTS ( \
                SELECT 1 FROM media m \
                JOIN watch_progress wp ON wp.media_id = m.id \
-               WHERE m.show_id = s.id AND wp.user_sub = ? \
+               WHERE m.show_id = s.id AND wp.user_sub = ? AND m.deleted_at IS NULL \
                  AND (wp.completed = 1 OR wp.position_secs > 0))"
                 .into(),
         ),
@@ -929,12 +969,12 @@ fn build_show_search_sql(
             "EXISTS ( \
                SELECT 1 FROM media m \
                JOIN watch_progress wp ON wp.media_id = m.id \
-               WHERE m.show_id = s.id AND wp.user_sub = ? \
+               WHERE m.show_id = s.id AND wp.user_sub = ? AND m.deleted_at IS NULL \
                  AND (wp.completed = 1 OR wp.position_secs > 0)) \
              AND EXISTS ( \
                SELECT 1 FROM media m \
                LEFT JOIN watch_progress wp ON wp.media_id = m.id AND wp.user_sub = ? \
-               WHERE m.show_id = s.id AND m.kind = 'episode' \
+               WHERE m.show_id = s.id AND m.kind = 'episode' AND m.deleted_at IS NULL \
                  AND COALESCE(wp.completed, 0) = 0)"
                 .into(),
         ),
@@ -954,7 +994,8 @@ fn build_show_search_sql(
     };
     let rows = format!(
         "SELECT s.id, s.title, s.year, \
-                (SELECT COUNT(*) FROM media m WHERE m.show_id = s.id) AS episode_count, \
+                (SELECT COUNT(*) FROM media m \
+                   WHERE m.show_id = s.id AND m.deleted_at IS NULL) AS episode_count, \
                 (s.banner_path IS NOT NULL) AS has_banner \
          FROM shows s {where_clause} ORDER BY {order_sql} LIMIT ? OFFSET ?"
     );

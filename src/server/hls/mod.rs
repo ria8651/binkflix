@@ -175,11 +175,13 @@ async fn resolve_plan(
     if !id_is_safe(id) {
         return Err(Error::BadRequest("invalid media id".into()));
     }
-    let row: (String,) = sqlx::query_as("SELECT path FROM media WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(Error::NotFound)?;
+    let row: (String,) = sqlx::query_as(
+        "SELECT path FROM media WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(Error::NotFound)?;
     let src = PathBuf::from(row.0);
 
     let info = match super::media_info::load(&state.pool, id)

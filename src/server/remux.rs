@@ -53,11 +53,13 @@ pub async fn media_stream(
     Query(q): Query<StreamQuery>,
     req: axum::extract::Request,
 ) -> Result<Response> {
-    let path: (String,) = sqlx::query_as("SELECT path FROM media WHERE id = ?")
-        .bind(&id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(Error::NotFound)?;
+    let path: (String,) = sqlx::query_as(
+        "SELECT path FROM media WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(Error::NotFound)?;
     let path = path.0;
 
     // Explicit override wins — useful for debugging or forcing remux on a
