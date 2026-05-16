@@ -33,6 +33,11 @@ pub fn App() -> Element {
     rsx! {
         document::Stylesheet { href: asset!("/assets/tokens.css") }
         document::Stylesheet { href: asset!("/assets/style.css") }
+        document::Link {
+            rel: "icon",
+            r#type: "image/svg+xml",
+            href: asset!("/assets/logo-icon.svg"),
+        }
         // Synchronous stub queues calls made before the async module below
         // finishes evaluating; the module replays the queue on load.
         // Served via axum's ServeDir (see server/mod.rs) rather than the
@@ -434,6 +439,7 @@ fn Home() -> Element {
     };
 
     rsx! {
+        document::Title { "Binkflix" }
         match &*lib.read_unchecked() {
             None => rsx! { p { class: "empty", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "empty", "Failed to load: {e}" } },
@@ -555,6 +561,7 @@ fn Search() -> Element {
     let no_input = q_for_empty.trim().is_empty() && active_filter_count == 0;
 
     rsx! {
+        document::Title { "Search — Binkflix" }
         section { class: "search-page",
             header { class: "search-header",
                 div { class: "search-input-wrap",
@@ -1092,6 +1099,7 @@ fn MediaDetail(id: String) -> Element {
             None => rsx! { p { class: "empty", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "empty", "Failed to load: {e}" } },
             Some(Ok(m)) => rsx! {
+                document::Title { "{m.title} — Binkflix" }
                 article { class: "detail",
                     div {
                         class: "poster",
@@ -1178,6 +1186,7 @@ fn ShowDetail(id: String) -> Element {
                 };
                 let active = d.seasons.iter().find(|s| s.number == current).cloned();
                 rsx! {
+                    document::Title { "{d.show.title} — Binkflix" }
                     if d.show.has_fanart {
                         div {
                             class: "show-backdrop",
@@ -1452,6 +1461,11 @@ fn MediaPlay(id: String) -> Element {
         _ => Route::MediaDetail { id: id.clone() },
     };
 
+    let page_title = match &*media.read_unchecked() {
+        Some(Ok(m)) => format!("{} — Binkflix", m.title),
+        _ => "Binkflix".to_string(),
+    };
+
     // The `for` + keyed wrapper `div` exists to force a full unmount +
     // remount of `VideoPlayer` and `SyncplayBridge` whenever `id` changes
     // (prev/next-episode soft-nav, or remote SetMedia from a watch party).
@@ -1464,6 +1478,7 @@ fn MediaPlay(id: String) -> Element {
     // and we don't have to add per-effect "did the id change?" gating.
     // `display: contents` on the wrapper keeps it from affecting layout.
     rsx! {
+        document::Title { "{page_title}" }
         div { class: "player-fullpage",
             for episode_id in [id.clone()] {
                 {
