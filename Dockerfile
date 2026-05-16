@@ -5,10 +5,18 @@
 
 FROM rust:1-trixie AS builder
 RUN rustup target add wasm32-unknown-unknown \
- && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
- && cargo binstall -y dioxus-cli
+ && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
 
 WORKDIR /src
+
+# Pin dioxus-cli to the exact `dioxus` version locked in Cargo.lock — dx
+# refuses to build when the CLI and library disagree (e.g. dx 0.7.9 against
+# dioxus 0.7.5). Copy lockfiles first so this layer caches until Cargo.lock
+# actually moves.
+COPY Cargo.toml Cargo.lock ./
+RUN DIOXUS_VER=$(awk '/^name = "dioxus"$/ { getline; gsub(/[" ]/, "", $3); print $3; exit }' Cargo.lock) \
+ && cargo binstall -y dioxus-cli@${DIOXUS_VER}
+
 COPY . .
 
 # Cache mounts: cargo registry/git indices, the target dir, and dx's tool cache
@@ -20,6 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=binkflix-target \
     --mount=type=cache,target=/root/.cache/dioxus \
     dx bundle --platform web --release \
+ && mkdir -p /out \
  && cp -r /src/target/dx/binkflix/release/web /out/web
 
 FROM debian:trixie-slim AS runtime
