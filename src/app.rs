@@ -7,6 +7,7 @@ const ICON_PALETTE: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fi
 const ICON_CHECK_SMALL: &str = r#"<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
 const ICON_PLAY_BTN: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>"#;
 const ICON_CHECK_BADGE: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
+const ICON_X_BADGE: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>"#;
 pub const ICON_GROUP: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
 const ICON_SEARCH: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>"#;
 const ICON_REFRESH: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15A9 9 0 0 1 5.64 18.36L1 14"/></svg>"#;
@@ -688,6 +689,15 @@ fn ContinueCard(
             on_change.call(());
         });
     };
+    let media_id_for_dismiss = item.media_id.clone();
+    let on_dismiss = move |evt: Event<MouseData>| {
+        evt.stop_propagation();
+        let id = media_id_for_dismiss.clone();
+        spawn(async move {
+            let _ = dismiss_continue_watching(&id).await;
+            on_change.call(());
+        });
+    };
     let poster_src = if is_episode && use_episode_thumb {
         media_image_url(&item.media_id)
     } else {
@@ -720,6 +730,13 @@ fn ContinueCard(
                 "aria-label": "Mark as watched",
                 onclick: on_mark,
                 dangerous_inner_html: ICON_CHECK_BADGE,
+            }
+            button {
+                class: "dismiss-cw",
+                title: "Remove from Continue Watching",
+                "aria-label": "Remove from Continue Watching",
+                onclick: on_dismiss,
+                dangerous_inner_html: ICON_X_BADGE,
             }
         }
     }

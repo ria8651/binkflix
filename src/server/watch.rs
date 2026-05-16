@@ -50,7 +50,8 @@ pub async fn report_progress(
              position_secs = excluded.position_secs,
              duration_secs = excluded.duration_secs,
              completed     = excluded.completed,
-             updated_at    = excluded.updated_at",
+             updated_at    = excluded.updated_at,
+             dismissed     = 0",
     )
     .bind(&session.user_sub)
     .bind(&id)
@@ -94,6 +95,27 @@ pub async fn mark_watched(
     .bind(duration)
     .bind(duration)
     .bind(now_secs())
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Hide a Continue Watching tile. Flips `dismissed = 1` on the single
+/// `watch_progress` row backing the tile; the CW loop dedupes by show, so
+/// suppressing the most-recent row hides the whole show. A future heartbeat
+/// upserts with `dismissed = 0` and the show reappears.
+pub async fn dismiss_cw(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    sqlx::query(
+        "UPDATE watch_progress SET dismissed = 1, updated_at = ?
+         WHERE user_sub = ? AND media_id = ?",
+    )
+    .bind(now_secs())
+    .bind(&session.user_sub)
+    .bind(&id)
     .execute(&state.pool)
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -158,6 +180,7 @@ struct CwRow {
     position_secs: f64,
     duration_secs: f64,
     completed: i64,
+    dismissed: i64,
 }
 
 #[derive(FromRow)]
@@ -185,7 +208,8 @@ pub async fn continue_watching(
                 m.episode_number AS episode_number,
                 wp.position_secs AS position_secs,
                 wp.duration_secs AS duration_secs,
-                wp.completed    AS completed
+                wp.completed    AS completed,
+                wp.dismissed   AS dismissed
          FROM watch_progress wp
          JOIN media m ON m.id = wp.media_id
          LEFT JOIN shows s ON s.id = m.show_id
@@ -206,7 +230,7 @@ pub async fn continue_watching(
         }
         match r.kind.as_str() {
             "movie" => {
-                if r.completed != 0 {
+                if r.completed != 0 || r.dismissed != 0 {
                     continue;
                 }
                 out.push(ContinueItem {
@@ -225,6 +249,9 @@ pub async fn continue_watching(
             "episode" => {
                 let Some(show_id) = r.show_id.clone() else { continue };
                 if !seen_shows.insert(show_id.clone()) {
+                    continue;
+                }
+                if r.dismissed != 0 {
                     continue;
                 }
                 if r.completed == 0 {

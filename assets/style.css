@@ -591,6 +591,36 @@ h2.section {
     background: rgb(0 0 0 / 0.92);
     transform: scale(1.05);
 }
+
+/* "Remove from Continue Watching" — mirrors .mark-watched but sits on the
+   opposite corner so both actions are reachable without overlap. */
+.dismiss-cw {
+    position: absolute;
+    top: var(--space-4, 8px);
+    left: var(--space-4, 8px);
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: rgb(0 0 0 / 0.7);
+    border: 1px solid rgb(255 255 255 / 0.3);
+    color: white;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease, transform 0.15s ease;
+    z-index: 2;
+}
+.card:hover .dismiss-cw,
+.dismiss-cw:focus-visible {
+    opacity: 1;
+}
+.dismiss-cw:hover {
+    background: rgb(0 0 0 / 0.92);
+    transform: scale(1.05);
+}
 /* Play overlay — sits over the poster, hidden until hover. The gradient
  * dims the bottom of the poster (which, combined with the white hover
  * ring, gives a subtle "lit-from-top" perception on the ring's bottom

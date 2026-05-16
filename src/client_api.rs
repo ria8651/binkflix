@@ -173,6 +173,25 @@ pub async fn mark_watched(_id: &str) -> Result<(), String> {
     Err("client fetcher invoked on non-wasm target".to_string())
 }
 
+#[cfg(feature = "web")]
+pub async fn dismiss_continue_watching(id: &str) -> Result<(), String> {
+    let url = format!("/api/continue-watching/dismiss/{id}");
+    let resp = gloo_net::http::Request::post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("network error hitting {url}: {e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("{url} returned HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+#[allow(dead_code)]
+pub async fn dismiss_continue_watching(_id: &str) -> Result<(), String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}
+
 // ---- Sticky playback preferences (audio/subtitle/quality) ----
 //
 // Scope is opaque to the server: the player builds `show:<id>` for

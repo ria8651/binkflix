@@ -40,6 +40,7 @@ pub fn router() -> Router<AppState> {
             get(super::watch::get_progress).post(super::watch::report_progress),
         )
         .route("/api/continue-watching", get(super::watch::continue_watching))
+        .route("/api/continue-watching/dismiss/{id}", post(super::watch::dismiss_cw))
         .route("/api/media/{id}/watched", post(super::watch::mark_watched).delete(super::watch::mark_unwatched))
         .route(
             "/api/preferences/{scope}",
