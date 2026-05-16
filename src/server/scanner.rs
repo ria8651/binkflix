@@ -17,6 +17,15 @@ use walkdir::WalkDir;
 
 pub type ProgressHandle = Arc<RwLock<ScanProgress>>;
 
+/// Bump these whenever the corresponding `upsert_*` function changes what it
+/// persists — e.g. starts writing a new column, populating a join table, or
+/// reading a previously-ignored NFO field. Existing rows have an older
+/// `scan_version` and the early-return guard treats them as stale, forcing a
+/// re-upsert at the next scan. The constants live next to the upserts they
+/// gate so the reason for a bump is visible in the diff.
+const SHOW_SCAN_VERSION: i64 = 1;
+const MEDIA_SCAN_VERSION: i64 = 1;
+
 async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)) {
     let mut p = handle.write().await;
     f(&mut p);
@@ -882,22 +891,25 @@ async fn upsert_show(
     let path_str = show_dir.to_string_lossy().into_owned();
     let nfo_path = show_dir.join("tvshow.nfo");
 
-    let existing: Option<(String, String)> =
-        sqlx::query_as("SELECT id, scanned_at FROM shows WHERE path = ?")
+    let existing: Option<(String, String, i64)> =
+        sqlx::query_as("SELECT id, scanned_at, scan_version FROM shows WHERE path = ?")
             .bind(&path_str)
             .fetch_optional(pool)
             .await?;
 
-    if let Some((id, scanned_at)) = &existing {
+    if let Some((id, scanned_at, scan_version)) = &existing {
         // Track the show dir's mtime alongside the NFO so adding/removing
-        // poster.jpg or fanart.jpg also triggers a re-upsert.
-        if !any_newer_than(&[&nfo_path, show_dir], scanned_at) {
+        // poster.jpg or fanart.jpg also triggers a re-upsert. The
+        // scan_version check forces a re-upsert when the scanner code has
+        // started persisting new fields since this row was last written.
+        if *scan_version == SHOW_SCAN_VERSION && !any_newer_than(&[&nfo_path, show_dir], scanned_at)
+        {
             return Ok((id.clone(), false));
         }
     }
 
     let id = existing
-        .map(|(id, _)| id)
+        .map(|(id, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let nfo = nfo::parse_tvshow_nfo(&nfo_path).unwrap_or_default();
@@ -926,9 +938,9 @@ async fn upsert_show(
         INSERT INTO shows (
             id, library_id, path, title, sort_title, original_title, year, plot,
             imdb_id, tmdb_id, tvdb_id, poster_path, fanart_path, clearlogo_path,
-            banner_path, added_at
+            banner_path, added_at, scan_version
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
             sort_title = excluded.sort_title,
@@ -942,6 +954,7 @@ async fn upsert_show(
             fanart_path = excluded.fanart_path,
             clearlogo_path = excluded.clearlogo_path,
             banner_path = excluded.banner_path,
+            scan_version = excluded.scan_version,
             scanned_at = datetime('now')
         "#,
     )
@@ -961,8 +974,21 @@ async fn upsert_show(
     .bind(&clearlogo)
     .bind(&banner)
     .bind(&added_at)
+    .bind(SHOW_SCAN_VERSION)
     .execute(pool)
     .await?;
+
+    sqlx::query("DELETE FROM show_genres WHERE show_id = ?")
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    for g in &nfo.genre {
+        sqlx::query("INSERT OR IGNORE INTO show_genres (show_id, genre) VALUES (?, ?)")
+            .bind(&id)
+            .bind(g)
+            .execute(pool)
+            .await?;
+    }
 
     debug!(title, "indexed show");
     Ok((id, true))
@@ -1040,13 +1066,14 @@ async fn upsert_episode(
     let nfo_opt = nfo_path.is_file().then_some(nfo_path);
 
     // Skip if unchanged.
-    let existing: Option<(String, String, i64)> =
-        sqlx::query_as("SELECT id, scanned_at, file_size FROM media WHERE path = ?")
-            .bind(&path_str)
-            .fetch_optional(pool)
-            .await?;
+    let existing: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, scanned_at, file_size, scan_version FROM media WHERE path = ?",
+    )
+    .bind(&path_str)
+    .fetch_optional(pool)
+    .await?;
 
-    if let Some((id, scanned_at, existing_size)) = &existing {
+    if let Some((id, scanned_at, existing_size, scan_version)) = &existing {
         let mut sources: Vec<&Path> = vec![video];
         if let Some(n) = nfo_opt.as_ref() {
             sources.push(n);
@@ -1055,7 +1082,10 @@ async fn upsert_episode(
         if let Some(parent) = video.parent() {
             sources.push(parent);
         }
-        if *existing_size == file_size && !any_newer_than(&sources, scanned_at) {
+        if *scan_version == MEDIA_SCAN_VERSION
+            && *existing_size == file_size
+            && !any_newer_than(&sources, scanned_at)
+        {
             // Unchanged — still report the id so the caller can decide.
             return Ok(Some(UpsertOutcome {
                 id: id.clone(),
@@ -1092,7 +1122,7 @@ async fn upsert_episode(
     let thumb = find_episode_thumb(video).map(|p| p.to_string_lossy().into_owned());
 
     let id = existing
-        .map(|(id, _, _)| id)
+        .map(|(id, _, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let added_at = file_added_at(video);
@@ -1101,9 +1131,9 @@ async fn upsert_episode(
         INSERT INTO media (
             id, library_id, kind, path, file_size,
             title, sort_title, plot, runtime_minutes, image_path,
-            show_id, season_number, episode_number, added_at
+            show_id, season_number, episode_number, added_at, scan_version
         )
-        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'episode',
             title           = excluded.title,
@@ -1115,6 +1145,7 @@ async fn upsert_episode(
             season_number   = excluded.season_number,
             episode_number  = excluded.episode_number,
             file_size       = excluded.file_size,
+            scan_version    = excluded.scan_version,
             -- clear movie-only fields in case this row was previously a movie
             original_title  = NULL,
             year            = NULL,
@@ -1137,6 +1168,7 @@ async fn upsert_episode(
     .bind(season)
     .bind(episode)
     .bind(&added_at)
+    .bind(MEDIA_SCAN_VERSION)
     .execute(pool)
     .await?;
 
@@ -1164,13 +1196,14 @@ async fn upsert_movie(
     let base = video.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
     let nfo_path = matching_nfo(video);
 
-    let existing: Option<(String, String, i64)> =
-        sqlx::query_as("SELECT id, scanned_at, file_size FROM media WHERE path = ?")
-            .bind(&path_str)
-            .fetch_optional(pool)
-            .await?;
+    let existing: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, scanned_at, file_size, scan_version FROM media WHERE path = ?",
+    )
+    .bind(&path_str)
+    .fetch_optional(pool)
+    .await?;
 
-    if let Some((id, scanned_at, existing_size)) = &existing {
+    if let Some((id, scanned_at, existing_size, scan_version)) = &existing {
         // The video, the NFO, and any sidecar (poster / fanart / thumb) all
         // affect what we'd write to the DB. Tracking the parent directory's
         // mtime in addition to the video covers sidecar add/remove/replace —
@@ -1184,7 +1217,10 @@ async fn upsert_movie(
         if let Some(parent) = video.parent() {
             sources.push(parent);
         }
-        if *existing_size == file_size && !any_newer_than(&sources, scanned_at) {
+        if *scan_version == MEDIA_SCAN_VERSION
+            && *existing_size == file_size
+            && !any_newer_than(&sources, scanned_at)
+        {
             return Ok(Some(UpsertOutcome {
                 id: id.clone(),
                 needs_assets: false,
@@ -1208,7 +1244,7 @@ async fn upsert_movie(
     let fanart = find_movie_fanart(video).map(|p| p.to_string_lossy().into_owned());
 
     let id = existing
-        .map(|(id, _, _)| id)
+        .map(|(id, _, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let added_at = file_added_at(video);
@@ -1217,9 +1253,9 @@ async fn upsert_movie(
         INSERT INTO media (
             id, library_id, kind, path, file_size,
             title, sort_title, original_title, year, plot, runtime_minutes,
-            imdb_id, tmdb_id, image_path, fanart_path, added_at
+            imdb_id, tmdb_id, image_path, fanart_path, added_at, scan_version
         )
-        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'movie',
             title           = excluded.title,
@@ -1233,6 +1269,7 @@ async fn upsert_movie(
             image_path      = excluded.image_path,
             fanart_path     = excluded.fanart_path,
             file_size       = excluded.file_size,
+            scan_version    = excluded.scan_version,
             -- clear episode-only fields in case this was previously an episode
             show_id         = NULL,
             season_number   = NULL,
@@ -1255,6 +1292,7 @@ async fn upsert_movie(
     .bind(&image)
     .bind(&fanart)
     .bind(&added_at)
+    .bind(MEDIA_SCAN_VERSION)
     .execute(pool)
     .await?;
 

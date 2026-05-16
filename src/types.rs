@@ -37,6 +37,14 @@ pub struct RecentItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchResponse {
+    pub movies: Vec<MovieSummary>,
+    pub shows: Vec<ShowSummary>,
+    pub total_movies: i64,
+    pub total_shows: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Library {
     pub movies: Vec<MovieSummary>,
     pub shows: Vec<ShowSummary>,

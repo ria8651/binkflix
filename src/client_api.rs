@@ -126,6 +126,72 @@ pub async fn get_continue_watching() -> Result<Vec<ContinueItem>, String> {
     fetch_json("/api/continue-watching").await
 }
 
+#[derive(Default, Clone, Debug)]
+pub struct SearchQuery {
+    pub q: String,
+    pub kind: String,        // "" (any) | "movie" | "show"
+    pub year_min: Option<i64>,
+    pub year_max: Option<i64>,
+    pub genres: Vec<String>,
+    pub watched: String,     // "any" | "watched" | "unwatched" | "in_progress"
+    pub sort: String,        // "title" | "year_desc" | "year_asc" | "recently_added"
+    pub limit: Option<i64>,
+}
+
+fn encode_query_component(s: &str) -> String {
+    // RFC 3986 unreserved + a handful that are safe in querystrings; everything
+    // else gets percent-encoded. Avoid pulling a URL-encoding crate just for
+    // this — the search box is the only caller.
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+pub async fn search_library(q: &SearchQuery) -> Result<SearchResponse, String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !q.q.is_empty() {
+        parts.push(format!("q={}", encode_query_component(&q.q)));
+    }
+    if !q.kind.is_empty() {
+        parts.push(format!("kind={}", encode_query_component(&q.kind)));
+    }
+    if let Some(y) = q.year_min {
+        parts.push(format!("year_min={y}"));
+    }
+    if let Some(y) = q.year_max {
+        parts.push(format!("year_max={y}"));
+    }
+    for g in &q.genres {
+        parts.push(format!("genres={}", encode_query_component(g)));
+    }
+    if !q.watched.is_empty() && q.watched != "any" {
+        parts.push(format!("watched={}", encode_query_component(&q.watched)));
+    }
+    if !q.sort.is_empty() {
+        parts.push(format!("sort={}", encode_query_component(&q.sort)));
+    }
+    if let Some(l) = q.limit {
+        parts.push(format!("limit={l}"));
+    }
+    let url = if parts.is_empty() {
+        "/api/search".to_string()
+    } else {
+        format!("/api/search?{}", parts.join("&"))
+    };
+    fetch_json(&url).await
+}
+
+pub async fn get_genres() -> Result<Vec<String>, String> {
+    fetch_json("/api/genres").await
+}
+
 #[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub async fn get_progress(id: &str) -> Result<Option<WatchProgress>, String> {
     fetch_json(&format!("/api/media/{id}/progress")).await

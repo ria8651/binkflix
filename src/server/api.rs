@@ -3,6 +3,7 @@ use super::error::{Error, Result};
 use super::{media_info, subtitles, thumbnails, trickplay};
 use super::AppState;
 use axum::extract::{Path, Request, State};
+use axum_extra::extract::Query;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -47,6 +48,8 @@ pub fn router() -> Router<AppState> {
             get(super::preferences::get_preferences).post(super::preferences::set_preferences),
         )
         .route("/api/playback/sample", post(playback_sample))
+        .route("/api/search", get(search))
+        .route("/api/genres", get(list_genres))
 }
 
 #[derive(Deserialize)]
@@ -621,4 +624,391 @@ async fn season_poster(
         }
     }
     Err(Error::NotFound)
+}
+
+// ---- Search ----
+
+/// Query string for `/api/search`. Repeated `genres=` params arrive as a Vec.
+/// `kind`/`watched`/`sort` are strings rather than enums so unknown values
+/// degrade gracefully (treated as "any" / default).
+#[derive(Debug, Deserialize)]
+struct SearchParams {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    year_min: Option<i64>,
+    #[serde(default)]
+    year_max: Option<i64>,
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    watched: Option<String>,
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+/// Cap a single page of results so a runaway request can't scan the whole
+/// library into memory. The UI requests fewer than this in practice.
+const SEARCH_MAX_LIMIT: i64 = 500;
+
+async fn search(
+    State(state): State<AppState>,
+    Extension(session): Extension<super::auth::Session>,
+    Query(p): Query<SearchParams>,
+) -> Result<Json<crate::types::SearchResponse>> {
+    let q = p.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let like = q.map(|s| format!("%{}%", escape_like(s)));
+    let want_movies = p.kind.as_deref() != Some("show");
+    let want_shows = p.kind.as_deref() != Some("movie");
+    let limit = p.limit.unwrap_or(60).clamp(1, SEARCH_MAX_LIMIT);
+    let offset = p.offset.unwrap_or(0).max(0);
+    let watched = p.watched.as_deref().unwrap_or("any");
+    let sort = p.sort.as_deref().unwrap_or(if q.is_some() { "relevance" } else { "title" });
+
+    let (movies, total_movies) = if want_movies {
+        let (sql_rows, sql_count) = build_movie_search_sql(
+            like.as_deref(),
+            p.year_min,
+            p.year_max,
+            &p.genres,
+            watched,
+            sort,
+        );
+        let rows = bind_movie_search(
+            sqlx::query_as::<_, MovieSummary>(&sql_rows),
+            like.as_deref(),
+            p.year_min,
+            p.year_max,
+            &p.genres,
+            watched,
+            &session.user_sub,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await?;
+        let total: (i64,) = bind_movie_search(
+            sqlx::query_as::<_, (i64,)>(&sql_count),
+            like.as_deref(),
+            p.year_min,
+            p.year_max,
+            &p.genres,
+            watched,
+            &session.user_sub,
+        )
+        .fetch_one(&state.pool)
+        .await?;
+        (rows, total.0)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    let (shows, total_shows) = if want_shows {
+        let (sql_rows, sql_count) = build_show_search_sql(
+            like.as_deref(),
+            p.year_min,
+            p.year_max,
+            &p.genres,
+            watched,
+            sort,
+        );
+        let rows = bind_show_search(
+            sqlx::query_as::<_, ShowSummary>(&sql_rows),
+            like.as_deref(),
+            p.year_min,
+            p.year_max,
+            &p.genres,
+            watched,
+            &session.user_sub,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await?;
+        let total: (i64,) = bind_show_search(
+            sqlx::query_as::<_, (i64,)>(&sql_count),
+            like.as_deref(),
+            p.year_min,
+            p.year_max,
+            &p.genres,
+            watched,
+            &session.user_sub,
+        )
+        .fetch_one(&state.pool)
+        .await?;
+        (rows, total.0)
+    } else {
+        (Vec::new(), 0)
+    };
+
+    let movies_out = movies
+        .into_iter()
+        .map(|m| crate::types::MovieSummary { id: m.id, title: m.title, year: m.year })
+        .collect();
+    let shows_out = shows
+        .into_iter()
+        .map(|s| crate::types::ShowSummary {
+            id: s.id,
+            title: s.title,
+            year: s.year,
+            episode_count: s.episode_count,
+            has_banner: s.has_banner,
+        })
+        .collect();
+
+    Ok(Json(crate::types::SearchResponse {
+        movies: movies_out,
+        shows: shows_out,
+        total_movies,
+        total_shows,
+    }))
+}
+
+/// Escape SQL LIKE wildcards in user input so a query like "10%" doesn't
+/// silently match everything. Paired with `ESCAPE '\\'` in the SQL.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '%' || c == '_' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn build_movie_search_sql(
+    like: Option<&str>,
+    year_min: Option<i64>,
+    year_max: Option<i64>,
+    genres: &[String],
+    watched: &str,
+    sort: &str,
+) -> (String, String) {
+    let mut wheres: Vec<String> = vec!["m.kind = 'movie'".into()];
+    if like.is_some() {
+        wheres.push("(m.sort_title LIKE ? ESCAPE '\\' OR m.title LIKE ? ESCAPE '\\')".into());
+    }
+    if year_min.is_some() {
+        wheres.push("m.year >= ?".into());
+    }
+    if year_max.is_some() {
+        wheres.push("m.year <= ?".into());
+    }
+    if !genres.is_empty() {
+        let placeholders = vec!["?"; genres.len()].join(", ");
+        wheres.push(format!(
+            "(SELECT COUNT(DISTINCT genre) FROM media_genres \
+              WHERE media_id = m.id AND genre IN ({placeholders})) = ?",
+        ));
+    }
+    match watched {
+        "watched" => wheres.push(
+            "EXISTS (SELECT 1 FROM watch_progress wp \
+              WHERE wp.media_id = m.id AND wp.user_sub = ? AND wp.completed = 1)"
+                .into(),
+        ),
+        "unwatched" => wheres.push(
+            "NOT EXISTS (SELECT 1 FROM watch_progress wp \
+              WHERE wp.media_id = m.id AND wp.user_sub = ? \
+                AND (wp.completed = 1 OR wp.position_secs > 0))"
+                .into(),
+        ),
+        "in_progress" => wheres.push(
+            "EXISTS (SELECT 1 FROM watch_progress wp \
+              WHERE wp.media_id = m.id AND wp.user_sub = ? \
+                AND wp.completed = 0 AND wp.position_secs > 0)"
+                .into(),
+        ),
+        _ => {}
+    }
+    let where_sql = wheres.join(" AND ");
+    let order_sql = match sort {
+        "title" => "m.sort_title ASC".to_string(),
+        "year_desc" => "m.year IS NULL, m.year DESC, m.sort_title".to_string(),
+        "year_asc" => "m.year IS NULL, m.year ASC, m.sort_title".to_string(),
+        "recently_added" => "COALESCE(m.added_at, m.scanned_at) DESC, m.id DESC".to_string(),
+        _ => "m.sort_title ASC".to_string(),
+    };
+    let rows = format!(
+        "SELECT m.id, m.title, m.year FROM media m \
+         WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?"
+    );
+    let count = format!("SELECT COUNT(*) FROM media m WHERE {where_sql}");
+    (rows, count)
+}
+
+fn bind_movie_search<'q, O>(
+    mut q: sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments<'q>>,
+    like: Option<&'q str>,
+    year_min: Option<i64>,
+    year_max: Option<i64>,
+    genres: &'q [String],
+    watched: &str,
+    user_sub: &'q str,
+) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments<'q>>
+where
+    O: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin,
+{
+    if let Some(l) = like {
+        q = q.bind(l).bind(l);
+    }
+    if let Some(y) = year_min {
+        q = q.bind(y);
+    }
+    if let Some(y) = year_max {
+        q = q.bind(y);
+    }
+    for g in genres {
+        q = q.bind(g);
+    }
+    if !genres.is_empty() {
+        q = q.bind(genres.len() as i64);
+    }
+    match watched {
+        "watched" | "unwatched" | "in_progress" => q = q.bind(user_sub),
+        _ => {}
+    }
+    q
+}
+
+fn build_show_search_sql(
+    like: Option<&str>,
+    year_min: Option<i64>,
+    year_max: Option<i64>,
+    genres: &[String],
+    watched: &str,
+    sort: &str,
+) -> (String, String) {
+    let mut wheres: Vec<String> = Vec::new();
+    if like.is_some() {
+        wheres.push("(s.sort_title LIKE ? ESCAPE '\\' OR s.title LIKE ? ESCAPE '\\')".into());
+    }
+    if year_min.is_some() {
+        wheres.push("s.year >= ?".into());
+    }
+    if year_max.is_some() {
+        wheres.push("s.year <= ?".into());
+    }
+    if !genres.is_empty() {
+        let placeholders = vec!["?"; genres.len()].join(", ");
+        wheres.push(format!(
+            "(SELECT COUNT(DISTINCT genre) FROM show_genres \
+              WHERE show_id = s.id AND genre IN ({placeholders})) = ?",
+        ));
+    }
+    // Show-level watched semantics:
+    // - watched     = at least one episode and every episode is completed
+    // - in_progress = some progress exists but not fully watched
+    // - unwatched   = no progress at all
+    match watched {
+        "watched" => wheres.push(
+            "EXISTS (SELECT 1 FROM media m WHERE m.show_id = s.id) \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM media m \
+               LEFT JOIN watch_progress wp ON wp.media_id = m.id AND wp.user_sub = ? \
+               WHERE m.show_id = s.id AND m.kind = 'episode' \
+                 AND COALESCE(wp.completed, 0) = 0)"
+                .into(),
+        ),
+        "unwatched" => wheres.push(
+            "NOT EXISTS ( \
+               SELECT 1 FROM media m \
+               JOIN watch_progress wp ON wp.media_id = m.id \
+               WHERE m.show_id = s.id AND wp.user_sub = ? \
+                 AND (wp.completed = 1 OR wp.position_secs > 0))"
+                .into(),
+        ),
+        "in_progress" => wheres.push(
+            "EXISTS ( \
+               SELECT 1 FROM media m \
+               JOIN watch_progress wp ON wp.media_id = m.id \
+               WHERE m.show_id = s.id AND wp.user_sub = ? \
+                 AND (wp.completed = 1 OR wp.position_secs > 0)) \
+             AND EXISTS ( \
+               SELECT 1 FROM media m \
+               LEFT JOIN watch_progress wp ON wp.media_id = m.id AND wp.user_sub = ? \
+               WHERE m.show_id = s.id AND m.kind = 'episode' \
+                 AND COALESCE(wp.completed, 0) = 0)"
+                .into(),
+        ),
+        _ => {}
+    }
+    let where_clause = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", wheres.join(" AND "))
+    };
+    let order_sql = match sort {
+        "title" => "s.sort_title ASC".to_string(),
+        "year_desc" => "s.year IS NULL, s.year DESC, s.sort_title".to_string(),
+        "year_asc" => "s.year IS NULL, s.year ASC, s.sort_title".to_string(),
+        "recently_added" => "COALESCE(s.added_at, s.scanned_at) DESC, s.id DESC".to_string(),
+        _ => "s.sort_title ASC".to_string(),
+    };
+    let rows = format!(
+        "SELECT s.id, s.title, s.year, \
+                (SELECT COUNT(*) FROM media m WHERE m.show_id = s.id) AS episode_count, \
+                (s.banner_path IS NOT NULL) AS has_banner \
+         FROM shows s {where_clause} ORDER BY {order_sql} LIMIT ? OFFSET ?"
+    );
+    let count = format!("SELECT COUNT(*) FROM shows s {where_clause}");
+    (rows, count)
+}
+
+fn bind_show_search<'q, O>(
+    mut q: sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments<'q>>,
+    like: Option<&'q str>,
+    year_min: Option<i64>,
+    year_max: Option<i64>,
+    genres: &'q [String],
+    watched: &str,
+    user_sub: &'q str,
+) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, O, sqlx::sqlite::SqliteArguments<'q>>
+where
+    O: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin,
+{
+    if let Some(l) = like {
+        q = q.bind(l).bind(l);
+    }
+    if let Some(y) = year_min {
+        q = q.bind(y);
+    }
+    if let Some(y) = year_max {
+        q = q.bind(y);
+    }
+    for g in genres {
+        q = q.bind(g);
+    }
+    if !genres.is_empty() {
+        q = q.bind(genres.len() as i64);
+    }
+    match watched {
+        "watched" => q = q.bind(user_sub),
+        "unwatched" => q = q.bind(user_sub),
+        "in_progress" => q = q.bind(user_sub).bind(user_sub),
+        _ => {}
+    }
+    q
+}
+
+async fn list_genres(State(state): State<AppState>) -> Result<Json<Vec<String>>> {
+    // Only media_genres is populated today (scanner writes per-movie and
+    // per-episode entries). show_genres is reserved for a future per-show
+    // override; UNION with it so adding rows there doesn't need a code change.
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT genre FROM media_genres \
+         UNION \
+         SELECT genre FROM show_genres \
+         ORDER BY 1",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(rows.into_iter().map(|(g,)| g).collect()))
 }
