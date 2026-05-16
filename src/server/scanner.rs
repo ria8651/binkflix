@@ -964,6 +964,18 @@ async fn upsert_show(
     .execute(pool)
     .await?;
 
+    sqlx::query("DELETE FROM show_genres WHERE show_id = ?")
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    for g in &nfo.genre {
+        sqlx::query("INSERT OR IGNORE INTO show_genres (show_id, genre) VALUES (?, ?)")
+            .bind(&id)
+            .bind(g)
+            .execute(pool)
+            .await?;
+    }
+
     debug!(title, "indexed show");
     Ok((id, true))
 }

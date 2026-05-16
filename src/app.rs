@@ -17,6 +17,8 @@ pub enum Route {
     #[layout(Shell)]
         #[route("/")]
         Home {},
+        #[route("/search")]
+        Search {},
         #[route("/media/:id")]
         MediaDetail { id: String },
         #[route("/media/:id/play")]
@@ -47,15 +49,10 @@ const LOGO_SVG: &str = include_str!("../assets/binkflix.svg");
 #[derive(Clone, Copy, Default)]
 pub struct OpenMenu(pub Signal<Option<&'static str>>);
 
-/// Library search query, read by Home to filter shows/movies.
-#[derive(Clone, Copy, Default)]
-pub struct SearchQuery(pub Signal<String>);
-
 #[component]
 fn Shell() -> Element {
     crate::syncplay_client::provide_room_context();
     use_context_provider(|| OpenMenu(Signal::new(None)));
-    use_context_provider(|| SearchQuery(Signal::new(String::new())));
 
     let mut open_menu = use_context::<OpenMenu>().0;
 
@@ -133,7 +130,12 @@ fn Shell() -> Element {
                 dangerous_inner_html: LOGO_SVG,
             }
             div { class: "top-right",
-                SearchDropdown {}
+                Link {
+                    to: Route::Search {},
+                    class: "btn-theme btn-icon",
+                    aria_label: "Search",
+                    span { class: "icon", dangerous_inner_html: ICON_SEARCH }
+                }
                 RescanButton {}
                 crate::syncplay_client::RoomsDropdown {}
                 ThemeSwitcher {}
@@ -225,74 +227,6 @@ pub fn ThemeSwitcher() -> Element {
                                     }
                                 }
                             }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn SearchDropdown() -> Element {
-    let mut open_menu = use_context::<OpenMenu>().0;
-    let mut query = use_context::<SearchQuery>().0;
-    let is_open = *open_menu.read() == Some("search");
-    let current = query.read().clone();
-
-    // Clear the query whenever the popover is not open. Covers every close
-    // path (toolbar button toggle, outside-click from OpenMenu, navigation)
-    // without threading a clear call through each of them.
-    use_effect(move || {
-        if *open_menu.read() != Some("search") && !query.read().is_empty() {
-            query.set(String::new());
-        }
-    });
-
-    rsx! {
-        div { class: "search-dd", "data-popover": "search",
-            button {
-                class: "btn-theme btn-icon",
-                r#type: "button",
-                aria_label: "Search",
-                onclick: move |_| {
-                    open_menu.set(if is_open { None } else { Some("search") });
-                },
-                span { class: "icon", dangerous_inner_html: ICON_SEARCH }
-            }
-            if is_open {
-                div { class: "search-panel",
-                    input {
-                        id: "search-input",
-                        r#type: "search",
-                        placeholder: "Search shows and movies…",
-                        value: "{current}",
-                        // Dioxus' `autofocus` attribute only works on initial page
-                        // load; this panel mounts dynamically, so explicitly
-                        // focus via JS once the input is in the DOM.
-                        onmounted: move |_| {
-                            spawn(async move {
-                                let _ = document::eval(
-                                    "document.getElementById('search-input')?.focus();",
-                                ).await;
-                            });
-                        },
-                        oninput: move |e| query.set(e.value()),
-                    }
-                    if !current.is_empty() {
-                        button {
-                            class: "search-clear",
-                            r#type: "button",
-                            aria_label: "Clear search",
-                            onclick: move |_| {
-                                query.set(String::new());
-                                spawn(async move {
-                                    let _ = document::eval(
-                                        "document.getElementById('search-input')?.focus();",
-                                    ).await;
-                                });
-                            },
-                            "×"
                         }
                     }
                 }
@@ -492,20 +426,10 @@ fn format_elapsed(ms: u64) -> String {
 fn Home() -> Element {
     let lib = use_resource(get_library);
     let mut cont = use_resource(get_continue_watching);
-    let query = use_context::<SearchQuery>().0;
-    let q = query.read().to_lowercase();
-    let q = q.trim().to_string();
 
-    // Continue Watching is hidden while a search is active — the row is
-    // already short and this avoids confusion when the user is filtering
-    // the library proper.
-    let cont_items: Vec<ContinueItem> = if q.is_empty() {
-        match &*cont.read_unchecked() {
-            Some(Ok(items)) => items.clone(),
-            _ => Vec::new(),
-        }
-    } else {
-        Vec::new()
+    let cont_items: Vec<ContinueItem> = match &*cont.read_unchecked() {
+        Some(Ok(items)) => items.clone(),
+        _ => Vec::new(),
     };
 
     rsx! {
@@ -519,16 +443,7 @@ fn Home() -> Element {
                 }
             },
             Some(Ok(lib)) => {
-                let shows: Vec<_> = lib.shows.iter().cloned()
-                    .filter(|s| q.is_empty() || s.title.to_lowercase().contains(&q))
-                    .collect();
-                let movies: Vec<_> = lib.movies.iter().cloned()
-                    .filter(|m| q.is_empty() || m.title.to_lowercase().contains(&q))
-                    .collect();
                 rsx! {
-                    if shows.is_empty() && movies.is_empty() {
-                        p { class: "empty", "No matches for “{q}”." }
-                    }
                     if !cont_items.is_empty() {
                         section {
                             h2 { class: "section", "Continue Watching" }
@@ -543,39 +458,331 @@ fn Home() -> Element {
                             }
                         }
                     }
-                    {
-                        let recent: Vec<RecentItem> = if q.is_empty() {
-                            lib.recently_added.clone()
-                        } else {
-                            Vec::new()
-                        };
-                        (!recent.is_empty()).then(|| rsx! {
-                            section {
-                                h2 { class: "section", "Recently Added" }
-                                div { class: "grid grid-wide",
-                                    for item in recent {
-                                        RecentCard { key: "{item.media_id}", item }
-                                    }
+                    if !lib.recently_added.is_empty() {
+                        section {
+                            h2 { class: "section", "Recently Added" }
+                            div { class: "grid grid-wide",
+                                for item in lib.recently_added.iter().cloned() {
+                                    RecentCard { key: "{item.media_id}", item }
                                 }
                             }
-                        })
+                        }
                     }
-                    if !shows.is_empty() {
+                    if !lib.shows.is_empty() {
                         section {
                             h2 { class: "section", "Shows" }
                             div { class: "grid",
-                                for s in shows {
+                                for s in lib.shows.iter().cloned() {
                                     ShowCard { key: "{s.id}", show: s }
                                 }
                             }
                         }
                     }
-                    if !movies.is_empty() {
+                    if !lib.movies.is_empty() {
                         section {
                             h2 { class: "section", "Movies" }
                             div { class: "grid",
-                                for m in movies {
+                                for m in lib.movies.iter().cloned() {
                                     MovieCard { key: "{m.id}", movie: m }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn Search() -> Element {
+    let mut query = use_signal(String::new);
+    let mut kind = use_signal(|| String::new()); // "" any, "movie", "show"
+    let mut year_min = use_signal::<Option<i64>>(|| None);
+    let mut year_max = use_signal::<Option<i64>>(|| None);
+    let mut selected_genres = use_signal::<Vec<String>>(Vec::new);
+    let mut watched = use_signal(|| "any".to_string());
+    let mut sort = use_signal(|| "title".to_string());
+    let mut show_filters = use_signal(|| false);
+
+    // Debounce tick — bump after each input change; the resource only
+    // re-fetches once it has been stable for the timeout.
+    let mut tick = use_signal(|| 0u64);
+
+    let genres_resource = use_resource(get_genres);
+
+    let results = use_resource(move || {
+        let q = query.read().clone();
+        let k = kind.read().clone();
+        let ymin = *year_min.read();
+        let ymax = *year_max.read();
+        let g = selected_genres.read().clone();
+        let w = watched.read().clone();
+        let s = sort.read().clone();
+        let _ = *tick.read();
+        async move {
+            // 250ms debounce: any further input bumps `tick`, restarting
+            // this future before the timeout fires.
+            #[cfg(feature = "web")]
+            gloo_timers::future::TimeoutFuture::new(250).await;
+            let sq = SearchQuery {
+                q,
+                kind: k,
+                year_min: ymin,
+                year_max: ymax,
+                genres: g,
+                watched: w,
+                sort: s,
+                limit: Some(120),
+            };
+            search_library(&sq).await
+        }
+    });
+
+    let active_filter_count = {
+        let mut n = 0;
+        if !kind.read().is_empty() { n += 1; }
+        if year_min.read().is_some() { n += 1; }
+        if year_max.read().is_some() { n += 1; }
+        if !selected_genres.read().is_empty() { n += 1; }
+        if watched.read().as_str() != "any" { n += 1; }
+        if sort.read().as_str() != "title" { n += 1; }
+        n
+    };
+
+    let q_for_empty = query.read().clone();
+    let no_input = q_for_empty.trim().is_empty() && active_filter_count == 0;
+
+    rsx! {
+        section { class: "search-page",
+            header { class: "search-header",
+                div { class: "search-input-wrap",
+                    span { class: "search-input-icon", dangerous_inner_html: ICON_SEARCH }
+                    input {
+                        class: "search-input",
+                        id: "search-page-input",
+                        r#type: "search",
+                        placeholder: "Search shows and movies…",
+                        autofocus: "true",
+                        value: "{query.read()}",
+                        oninput: move |e| {
+                            query.set(e.value());
+                            tick.with_mut(|t| *t = t.wrapping_add(1));
+                        },
+                    }
+                    if !query.read().is_empty() {
+                        button {
+                            class: "search-clear",
+                            r#type: "button",
+                            aria_label: "Clear search",
+                            onclick: move |_| {
+                                query.set(String::new());
+                                tick.with_mut(|t| *t = t.wrapping_add(1));
+                            },
+                            "×"
+                        }
+                    }
+                }
+                button {
+                    class: if *show_filters.read() { "filter-toggle is-open" } else { "filter-toggle" },
+                    r#type: "button",
+                    aria_expanded: if *show_filters.read() { "true" } else { "false" },
+                    onclick: move |_| show_filters.toggle(),
+                    "Filters"
+                    if active_filter_count > 0 {
+                        span { class: "filter-count", "{active_filter_count}" }
+                    }
+                }
+            }
+
+            if *show_filters.read() {
+                div { class: "search-filters",
+                    div { class: "filter-group",
+                        label { class: "filter-label", "Type" }
+                        div { class: "segmented",
+                            {
+                                let opts = [("", "All"), ("movie", "Movies"), ("show", "Shows")];
+                                rsx! {
+                                    for (val, label) in opts {
+                                        {
+                                            let v = val.to_string();
+                                            let active = *kind.read() == v;
+                                            rsx! {
+                                                button {
+                                                    key: "{val}",
+                                                    class: if active { "seg active" } else { "seg" },
+                                                    r#type: "button",
+                                                    onclick: move |_| { kind.set(v.clone()); tick.with_mut(|t| *t = t.wrapping_add(1)); },
+                                                    "{label}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "filter-group",
+                        label { class: "filter-label", "Year" }
+                        div { class: "year-range",
+                            input {
+                                class: "year-input",
+                                r#type: "number",
+                                placeholder: "From",
+                                value: (*year_min.read()).map(|y| y.to_string()).unwrap_or_default(),
+                                oninput: move |e| {
+                                    let v = e.value();
+                                    year_min.set(v.trim().parse::<i64>().ok());
+                                    tick.with_mut(|t| *t = t.wrapping_add(1));
+                                },
+                            }
+                            span { class: "year-sep", "–" }
+                            input {
+                                class: "year-input",
+                                r#type: "number",
+                                placeholder: "To",
+                                value: (*year_max.read()).map(|y| y.to_string()).unwrap_or_default(),
+                                oninput: move |e| {
+                                    let v = e.value();
+                                    year_max.set(v.trim().parse::<i64>().ok());
+                                    tick.with_mut(|t| *t = t.wrapping_add(1));
+                                },
+                            }
+                        }
+                    }
+
+                    div { class: "filter-group",
+                        label { class: "filter-label", "Watched" }
+                        div { class: "segmented",
+                            {
+                                let opts = [
+                                    ("any", "Any"),
+                                    ("unwatched", "Unwatched"),
+                                    ("in_progress", "In progress"),
+                                    ("watched", "Watched"),
+                                ];
+                                rsx! {
+                                    for (val, label) in opts {
+                                        {
+                                            let v = val.to_string();
+                                            let active = *watched.read() == v;
+                                            rsx! {
+                                                button {
+                                                    key: "{val}",
+                                                    class: if active { "seg active" } else { "seg" },
+                                                    r#type: "button",
+                                                    onclick: move |_| { watched.set(v.clone()); tick.with_mut(|t| *t = t.wrapping_add(1)); },
+                                                    "{label}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    div { class: "filter-group",
+                        label { class: "filter-label", "Sort" }
+                        select {
+                            class: "sort-select",
+                            value: "{sort.read()}",
+                            onchange: move |e| { sort.set(e.value()); tick.with_mut(|t| *t = t.wrapping_add(1)); },
+                            option { value: "title", "Title (A–Z)" }
+                            option { value: "year_desc", "Year (newest)" }
+                            option { value: "year_asc", "Year (oldest)" }
+                            option { value: "recently_added", "Recently added" }
+                        }
+                    }
+
+                    {
+                        let genres = match &*genres_resource.read_unchecked() {
+                            Some(Ok(g)) => g.clone(),
+                            _ => Vec::new(),
+                        };
+                        (!genres.is_empty()).then(|| rsx! {
+                            div { class: "filter-group filter-group-wide",
+                                label { class: "filter-label", "Genre" }
+                                div { class: "chip-row",
+                                    for g in genres {
+                                        {
+                                            let value = g.clone();
+                                            let label = g.clone();
+                                            let active = selected_genres.read().iter().any(|x| x == &value);
+                                            rsx! {
+                                                button {
+                                                    key: "{value}",
+                                                    class: if active { "filter-chip is-active" } else { "filter-chip" },
+                                                    r#type: "button",
+                                                    onclick: move |_| {
+                                                        selected_genres.with_mut(|gs| {
+                                                            if let Some(idx) = gs.iter().position(|x| x == &value) {
+                                                                gs.remove(idx);
+                                                            } else {
+                                                                gs.push(value.clone());
+                                                            }
+                                                        });
+                                                        tick.with_mut(|t| *t = t.wrapping_add(1));
+                                                    },
+                                                    "{label}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                    }
+
+                    div { class: "filter-actions",
+                        button {
+                            class: "btn ghost",
+                            r#type: "button",
+                            onclick: move |_| {
+                                kind.set(String::new());
+                                year_min.set(None);
+                                year_max.set(None);
+                                selected_genres.set(Vec::new());
+                                watched.set("any".into());
+                                sort.set("title".into());
+                                tick.with_mut(|t| *t = t.wrapping_add(1));
+                            },
+                            "Clear filters"
+                        }
+                    }
+                }
+            }
+
+            div { class: "search-results",
+                match &*results.read_unchecked() {
+                    None => rsx! { p { class: "empty muted", "Searching…" } },
+                    Some(Err(e)) => rsx! { p { class: "empty", "Search failed: {e}" } },
+                    Some(Ok(r)) if r.movies.is_empty() && r.shows.is_empty() => {
+                        if no_input {
+                            rsx! { p { class: "empty muted", "Start typing or open Filters to browse the library." } }
+                        } else {
+                            rsx! { p { class: "empty", "No matches." } }
+                        }
+                    }
+                    Some(Ok(r)) => rsx! {
+                        if !r.shows.is_empty() {
+                            section {
+                                h2 { class: "section", "Shows ({r.total_shows})" }
+                                div { class: "grid",
+                                    for s in r.shows.iter().cloned() {
+                                        ShowCard { key: "{s.id}", show: s }
+                                    }
+                                }
+                            }
+                        }
+                        if !r.movies.is_empty() {
+                            section {
+                                h2 { class: "section", "Movies ({r.total_movies})" }
+                                div { class: "grid",
+                                    for m in r.movies.iter().cloned() {
+                                        MovieCard { key: "{m.id}", movie: m }
+                                    }
                                 }
                             }
                         }

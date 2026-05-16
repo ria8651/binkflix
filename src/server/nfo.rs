@@ -34,6 +34,8 @@ pub struct TvShowNfo {
     #[serde(default)]
     pub plot: Option<String>,
     #[serde(default)]
+    pub genre: Vec<String>,
+    #[serde(default)]
     pub uniqueid: Vec<UniqueId>,
 }
 

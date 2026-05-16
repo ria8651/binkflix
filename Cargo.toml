@@ -53,7 +53,7 @@ tempfile = { version = "3", optional = true }
 # bastion auth
 jsonwebtoken = { version = "9", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
-axum-extra = { version = "0.10", features = ["cookie"], optional = true }
+axum-extra = { version = "0.10", features = ["cookie", "query"], optional = true }
 
 [features]
 default = []
