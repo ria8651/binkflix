@@ -67,6 +67,8 @@ pub struct Media {
     pub show_id: Option<String>,
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
+    #[serde(default)]
+    pub has_fanart: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

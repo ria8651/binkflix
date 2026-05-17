@@ -280,13 +280,21 @@ pub struct Media {
     pub show_id: Option<String>,
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
+    pub has_fanart: bool,
 }
 
 async fn media(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Media>> {
+    // `has_fanart` mirrors the `/fanart` endpoint's fallback: movies use their
+    // own fanart_path; episodes inherit the parent show's. That way one client
+    // check (`m.has_fanart`) governs whether to paint the hero backdrop for
+    // *any* detail view, matching how `ShowDetail` works.
     let row = sqlx::query_as::<_, Media>(
-        "SELECT id, kind, title, original_title, year, plot, runtime_minutes,
-                imdb_id, tmdb_id, file_size, show_id, season_number, episode_number
-         FROM media WHERE id = ? AND deleted_at IS NULL",
+        "SELECT m.id, m.kind, m.title, m.original_title, m.year, m.plot, m.runtime_minutes,
+                m.imdb_id, m.tmdb_id, m.file_size, m.show_id, m.season_number, m.episode_number,
+                (m.fanart_path IS NOT NULL OR s.fanart_path IS NOT NULL) AS has_fanart
+         FROM media m
+         LEFT JOIN shows s ON s.id = m.show_id AND s.deleted_at IS NULL
+         WHERE m.id = ? AND m.deleted_at IS NULL",
     )
     .bind(&id)
     .fetch_optional(&state.pool)

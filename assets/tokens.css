@@ -222,6 +222,7 @@
   --show-backdrop-mask-image: none;
   --show-detail-poster-display: block;
   --show-detail-grid: 280px 1fr;
+  --show-detail-areas: "poster info";
 
   /* Clearlogo title — themes can swap the show <h1> for a clearlogo image. */
   --show-clearlogo-max-width: 380px;
@@ -658,12 +659,10 @@
    * middle that absorbs slack so the fanart shows through, and the
    * season poster anchored to track 3 on the right. */
   --show-detail-grid: minmax(0, 400px) 1fr minmax(220px, 400px);
-  /* DOM is poster-first, info-second (matching default themes). For
-   * elegantfin's three-track layout, pin info to track 1 and poster
-   * to track 3 — the middle 1fr track absorbs the slack so the
-   * poster anchors against the right edge. */
-  --show-detail-info-col: 1;
-  --show-detail-poster-col: 3;
+  /* Info on the left, fanart-revealing slack in the middle, poster on
+   * the right. The named `.` cell is the spacer track that lets the
+   * fanart show through. */
+  --show-detail-areas: "info . poster";
   --show-clearlogo-margin-bottom: var(--space-5);
   --show-clearlogo-filter: drop-shadow(0 2px 8px rgb(0 0 0 / 0.6));
 
@@ -707,16 +706,6 @@
       rgb(8 10 16 / 0.08) 75%,
       rgb(8 10 16 / 0) 80%
     );
-  /* Feathers the wash's top and bottom so the dark band dissolves into
-   * the fanart smoothly instead of cutting at the bleed edges. The
-   * solid middle band roughly spans the article's natural height; the
-   * 180px ramps line up with the bleed values in style.css. */
-  --show-detail-fade-mask: linear-gradient(
-    to bottom,
-    black 240px,
-    black calc(100% - 340px),
-    transparent 100%
-  );
 
   /* Episode rows lose their card chrome: thumbnail is the only tile,
    * title + plot sit on the page background. Hover treatment lives on

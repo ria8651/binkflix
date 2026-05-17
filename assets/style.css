@@ -361,8 +361,10 @@ main {
     padding: var(--space-9);
     max-width: 1400px;
     margin: 0 auto;
-    /* Positioned so absolute children (the show-detail backdrop mask)
-     * size against main's actual height rather than the viewport. */
+    /* Positioned so `.show-backdrop-mask` (absolute) sizes against
+     * `main` and scrolls with it, and so route content can be
+     * z-index'd above the backdrop layers (see `main > .detail` z-index
+     * rule below). */
     position: relative;
 }
 
@@ -678,25 +680,24 @@ h2.section {
 
 /* ── Detail page ───────────────────────────────────────────── */
 
+/* Layout is driven by `--show-detail-areas` — each theme owns the area
+ * map, and the mobile breakpoint rewrites it to stack. Children declare
+ * which named slot they live in (`grid-area: poster | info`), so DOM
+ * order never controls placement. */
 .detail {
     display: grid;
     grid-template-columns: var(--show-detail-grid);
+    grid-template-areas: var(--show-detail-areas);
     gap: var(--space-10);
     align-items: start;
 }
 @media (max-width: 800px) {
     .detail {
-        grid-template-columns: 1fr;
+        --show-detail-grid: 1fr;
+        --show-detail-areas: "poster" "info";
     }
     .detail > .poster {
         max-width: 280px;
-    }
-    /* Single-column layout can't honour explicit track placement; reset
-     * to auto so both items stack in source order. */
-    .detail > .poster,
-    .detail > .detail-info {
-        grid-column: auto;
-        grid-row: auto;
     }
 }
 /* Direct-child selector so this only styles the show-detail page's own
@@ -705,8 +706,7 @@ h2.section {
  * info column) and clobber their `aspect-ratio`. */
 .detail > .poster {
     display: var(--show-detail-poster-display);
-    grid-column: var(--show-detail-poster-col, auto);
-    grid-row: 1;
+    grid-area: poster;
     width: 100%;
     aspect-ratio: 2 / 3;
     background: var(--bg-surface-hover) center/cover no-repeat;
@@ -715,43 +715,32 @@ h2.section {
     box-shadow: var(--show-detail-poster-shadow, var(--shadow-tile));
 }
 .detail > .detail-info {
-    grid-column: var(--show-detail-info-col, auto);
-    grid-row: 1;
+    grid-area: info;
 }
-/* Soft left-edge gradient behind the title/plot — gives the text contrast
- * without boxing it in. Sits inside .detail (which is `position: relative`
- * via the main > .detail rule) and stretches under the info column. Hidden
- * by default — themes that want it set `--show-detail-fade-display`.
- *
- * Vertical bleed extends the fade up under the topbar (so its frosted
- * blur picks up the wash, no harsh top edge against the fanart) and down
- * past the article (so the page-bg gradient mask takes over before the
- * fade ends). Horizontal bleed (`left: 50% - 50vw`) escapes main's
- * max-width cap so the dark wash starts at the viewport edge. */
+/* Side-wash for the title/plot column over the fanart hero. Pinned to
+ * the viewport like `.show-backdrop` — the gradient is purely
+ * horizontal, so there's nothing to scroll. `.show-backdrop-mask`
+ * (which scrolls with content and fades into --bg-page from 40vh to
+ * 75vh) sits on top of this in DOM order, so as the user scrolls past
+ * the hero, the mask's opaque page-bg covers the fade exactly where
+ * the backdrop is also being hidden. Hidden by default — themes that
+ * want the wash set `--show-detail-fade-display`. */
 .detail-fade {
     display: var(--show-detail-fade-display, none);
-    position: absolute;
-    /* Bleed up under the topbar and down past the article. The mask
-     * (below) softens those edges so the wash dissolves into the
-     * fanart instead of cutting hard. */
-    top: var(--show-detail-fade-bleed-top, -240px);
-    bottom: var(--show-detail-fade-bleed-bottom, -240px);
-    /* Bleed past `.detail`'s box on both sides to escape main's 1400px
-     * max-width cap and reach the actual viewport edges. */
-    left: calc(50% - 50vw);
-    right: calc(50% - 50vw);
-    z-index: -1;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 90vh;
+    /* Above .show-backdrop (z:0), below .show-backdrop-mask (also z:1
+     * but later in DOM order, so it wins for the same z-index). */
+    z-index: 1;
     pointer-events: none;
     background-image: var(--show-detail-fade-image, none);
-    /* Feather top/bottom edges so the dark wash fades into the fanart
-     * rather than cutting hard against it. */
-    -webkit-mask-image: var(--show-detail-fade-mask, none);
-    mask-image: var(--show-detail-fade-mask, none);
 }
 /* Mobile: the layout stacks (poster on top, text below) so the
  * desktop's left-to-right vignette would dim the middle of the text.
- * Swap to a flat dark wash that still feathers at top/bottom via the
- * existing mask. */
+ * Swap to a flat dark wash that still feathers via the existing mask. */
 @media (max-width: 800px) {
     .detail-fade {
         background-image: linear-gradient(rgb(8 10 16 / 0.6), rgb(8 10 16 / 0.6));
@@ -786,20 +775,25 @@ h2.section {
     filter: var(--show-backdrop-filter);
     pointer-events: none;
 }
+/* Absolute inside `main` so it scrolls with content — as the page
+ * scrolls past the hero, the mask moves up and the page-bg underneath
+ * takes over. Spans `main` top-to-bottom (`top: 0; bottom: 0`) so the
+ * mask always reaches the bottom of the page, with `min-height: 100vh`
+ * as the floor for short detail pages where `main` is shorter than
+ * the viewport — that way the mask still covers the fixed 90vh
+ * fanart's bottom edge. The gradient's stops are in `vh`, so the
+ * transparent→opaque ramp renders correctly as long as the element
+ * is at least one viewport tall, which `min-height` guarantees. */
 .show-backdrop-mask {
     display: var(--show-backdrop-mask-display);
     position: absolute;
     top: 0;
-    left: 0;
-    right: 0;
     bottom: 0;
+    left: calc(50% - 50vw);
+    width: 100vw;
+    min-height: 100vh;
     z-index: 1;
     pointer-events: none;
-    /* `main` is capped at 1400px; escape it so the mask spans the full
-     * viewport width on ultrawide displays. */
-    margin-left: calc(50% - 50vw);
-    margin-right: calc(50% - 50vw);
-    width: 100vw;
     background-image: var(--show-backdrop-mask-image);
 }
 .show-clearlogo {
@@ -2230,73 +2224,4 @@ main > .detail-footer-banners {
     inset: 0;
     background: transparent;
     z-index: 9;
-}
-
-/* ── Sky theme: decorative chrome ───────────────────────────────
- * Sky-blue gradient page, a sun in the top-right, a soft gray cloud
- * band along the top, and fluffy white halos around cards (driven by
- * the theme's --shadow-tile token, with an extra ::before for fluff). */
-
-[data-theme="sky"] body {
-    background:
-        linear-gradient(to bottom, #7ec5e8 0%, #b7e0f4 55%, #d6ecf7 100%);
-    background-attachment: fixed;
-    min-height: 100vh;
-}
-
-[data-theme="sky"] body::before {
-    content: "";
-    position: fixed;
-    top: -80px;
-    right: -80px;
-    width: 280px;
-    height: 280px;
-    border-radius: 50%;
-    background: radial-gradient(circle at 35% 35%, #fff4b0 0%, #ffd86b 45%, #f5a623 100%);
-    box-shadow: 0 0 80px 30px rgb(255 220 120 / 0.55);
-    pointer-events: none;
-    z-index: 0;
-}
-
-[data-theme="sky"] body::after {
-    content: "";
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 120px;
-    background:
-        radial-gradient(60px 36px at 8%  60%, rgb(150 155 165 / 0.65) 60%, transparent 62%),
-        radial-gradient(80px 44px at 22% 50%, rgb(160 165 175 / 0.7)  60%, transparent 62%),
-        radial-gradient(70px 40px at 38% 65%, rgb(150 155 165 / 0.65) 60%, transparent 62%),
-        radial-gradient(90px 50px at 55% 45%, rgb(165 170 180 / 0.7)  60%, transparent 62%),
-        radial-gradient(70px 38px at 72% 60%, rgb(150 155 165 / 0.65) 60%, transparent 62%),
-        radial-gradient(85px 46px at 88% 50%, rgb(160 165 175 / 0.7)  60%, transparent 62%),
-        linear-gradient(to bottom, rgb(170 175 185 / 0.55) 0%, rgb(170 175 185 / 0.25) 60%, transparent 100%);
-    pointer-events: none;
-    z-index: 0;
-}
-
-/* Page chrome should sit above the sun + cloud-band decorations. */
-[data-theme="sky"] body > * {
-    position: relative;
-    z-index: 1;
-}
-
-/* Extra fluffy halo around cards — a blurred white puff sized larger
- * than the tile, behind it. The token --shadow-tile gives the inner
- * white ring; this gives the soft outer cloud edge. */
-[data-theme="sky"] .card {
-    position: relative;
-    isolation: isolate;
-}
-[data-theme="sky"] .card::before {
-    content: "";
-    position: absolute;
-    inset: -22px -28px;
-    background: radial-gradient(ellipse at center, rgb(255 255 255 / 0.95) 35%, rgb(255 255 255 / 0.55) 60%, transparent 75%);
-    filter: blur(10px);
-    z-index: -1;
-    pointer-events: none;
-    border-radius: 50%;
 }

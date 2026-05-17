@@ -1086,13 +1086,32 @@ fn ShowCard(show: ShowSummary) -> Element {
     }
 }
 
+/// Fanart hero behind a detail page: the fixed fullscreen image, the
+/// purely-horizontal side-wash for text contrast, and the vh-anchored
+/// mask that fades the whole hero into `--bg-page` as the user scrolls.
+/// Order matters: the mask renders last so it covers the fade (same
+/// z-index) when scrolled past the hero.
+#[component]
+fn DetailBackdrop(fanart_url: String) -> Element {
+    rsx! {
+        div {
+            class: "show-backdrop",
+            style: "background-image: url('{fanart_url}')",
+        }
+        div { class: "detail-fade" }
+        div { class: "show-backdrop-mask" }
+    }
+}
+
 #[component]
 fn MediaDetail(id: String) -> Element {
-    let id_clone = id.clone();
-    let media = use_resource(move || {
-        let id = id_clone.clone();
-        async move { get_media(&id).await }
-    });
+    // `use_reactive` makes `id` a tracked dependency so navigating between
+    // two movies (Dioxus reuses the route component when the path matches)
+    // restarts the fetch with the new id rather than serving the one
+    // captured at first render.
+    let media = use_resource(use_reactive!(|id| async move {
+        get_media(&id).await
+    }));
 
     rsx! {
         match &*media.read_unchecked() {
@@ -1100,6 +1119,9 @@ fn MediaDetail(id: String) -> Element {
             Some(Err(e)) => rsx! { p { class: "empty", "Failed to load: {e}" } },
             Some(Ok(m)) => rsx! {
                 document::Title { "{m.title} — Binkflix" }
+                if m.has_fanart {
+                    DetailBackdrop { fanart_url: media_fanart_url(&m.id) }
+                }
                 article { class: "detail",
                     div {
                         class: "poster",
@@ -1188,14 +1210,9 @@ fn ShowDetail(id: String) -> Element {
                 rsx! {
                     document::Title { "{d.show.title} — Binkflix" }
                     if d.show.has_fanart {
-                        div {
-                            class: "show-backdrop",
-                            style: "background-image: url('{show_fanart_url(&d.show.id)}')",
-                        }
-                        div { class: "show-backdrop-mask" }
+                        DetailBackdrop { fanart_url: show_fanart_url(&d.show.id) }
                     }
                     article { class: "detail",
-                        div { class: "detail-fade" }
                         div {
                             class: "poster",
                             style: "background-image: url('{show_poster_url(&d.show.id)}')",
