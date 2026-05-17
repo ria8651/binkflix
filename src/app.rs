@@ -428,6 +428,84 @@ fn format_elapsed(ms: u64) -> String {
     }
 }
 
+/// `"2019-01-04"` → `"Jan 4, 2019"`. Returns the input unchanged if it
+/// doesn't parse as YYYY-MM-DD (defensive — NFOs occasionally carry an
+/// already-formatted string or just a year).
+fn format_long_date(raw: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = raw.splitn(3, '-');
+    let (y, m, d) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(y), Some(m), Some(d)) => (y, m, d),
+        _ => return raw.to_string(),
+    };
+    let m_idx: usize = match m.parse() {
+        Ok(n) if (1..=12).contains(&n) => n,
+        _ => return raw.to_string(),
+    };
+    let day: u32 = match d.parse() {
+        Ok(n) => n,
+        _ => return raw.to_string(),
+    };
+    if y.parse::<i32>().is_err() {
+        return raw.to_string();
+    }
+    format!("{} {}, {}", MONTHS[m_idx - 1], day, y)
+}
+
+/// Pull the four-digit year out of a YYYY-MM-DD prefix. None if the
+/// first four bytes don't parse.
+fn year_from_date(raw: &str) -> Option<i32> {
+    raw.get(..4).and_then(|s| s.parse().ok())
+}
+
+fn format_votes(n: i64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        let k = n as f64 / 1000.0;
+        if k >= 10.0 { format!("{k:.0}k") } else { format!("{k:.1}k") }
+    } else {
+        let m = n as f64 / 1_000_000.0;
+        format!("{m:.1}M")
+    }
+}
+
+fn format_bytes(n: i64) -> String {
+    if n < 0 {
+        return "0 B".into();
+    }
+    let n = n as f64;
+    if n < 1024.0 {
+        return format!("{n:.0} B");
+    }
+    let k = n / 1024.0;
+    if k < 1024.0 {
+        return format!("{k:.1} KB");
+    }
+    let mb = k / 1024.0;
+    if mb < 1024.0 {
+        return format!("{mb:.1} MB");
+    }
+    let gb = mb / 1024.0;
+    format!("{gb:.2} GB")
+}
+
+fn imdb_url(id: &str) -> String {
+    format!("https://www.imdb.com/title/{id}/")
+}
+fn tmdb_movie_url(id: &str) -> String {
+    format!("https://www.themoviedb.org/movie/{id}")
+}
+fn tmdb_tv_url(id: &str) -> String {
+    format!("https://www.themoviedb.org/tv/{id}")
+}
+fn tvdb_url(id: &str) -> String {
+    format!("https://thetvdb.com/?id={id}&tab=series")
+}
+
 #[component]
 fn Home() -> Element {
     let lib = use_resource(get_library);
@@ -927,7 +1005,7 @@ fn ContinueCard(
                         shape,
                     }
                     div { class: "play-overlay",
-                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
+                        span { class: "icon-btn overlay lg", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                     if pct > 0.0 {
                         div { class: "progress",
@@ -939,14 +1017,14 @@ fn ContinueCard(
                 SubtitleLine { show_link, ep_se, year }
             }
             button {
-                class: "mark-watched",
+                class: "icon-btn overlay mark-watched",
                 title: "Mark as watched",
                 "aria-label": "Mark as watched",
                 onclick: on_mark,
                 dangerous_inner_html: ICON_CHECK_BADGE,
             }
             button {
-                class: "dismiss-cw",
+                class: "icon-btn overlay dismiss-cw",
                 title: "Remove from Continue Watching",
                 "aria-label": "Remove from Continue Watching",
                 onclick: on_dismiss,
@@ -990,7 +1068,7 @@ fn RecentCard(item: RecentItem) -> Element {
                         shape,
                     }
                     div { class: "play-overlay",
-                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
+                        span { class: "icon-btn overlay lg", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                 }
                 h3 { class: "title", "{item.title}" }
@@ -1047,7 +1125,7 @@ fn MovieCard(movie: MovieSummary) -> Element {
                         shape: PosterShape::Plain,
                     }
                     div { class: "play-overlay",
-                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
+                        span { class: "icon-btn overlay lg", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                 }
                 h3 { class: "title", "{movie.title}" }
@@ -1072,7 +1150,7 @@ fn ShowCard(show: ShowSummary) -> Element {
                         shape: PosterShape::Plain,
                     }
                     div { class: "play-overlay",
-                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
+                        span { class: "icon-btn overlay lg", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                 }
                 h3 { class: "title", "{show.title}" }
@@ -1137,20 +1215,119 @@ fn MediaDetail(id: String) -> Element {
                     }
                     header { class: "detail-info",
                         h1 { "{m.title}" }
-                        p { class: "meta-row",
+                        {
+                            // Original title only if it differs from the displayed
+                            // title (NFOs sometimes echo the same string into both).
+                            let alt = m.original_title.as_deref().filter(|s| *s != m.title);
+                            alt.map(|s| rsx! { p { class: "original-title", "{s}" } })
+                        }
+                        if let Some(tagline) = m.tagline.as_deref() {
+                            p { class: "tagline", "{tagline}" }
+                        }
+                        {
+                            // Flow numeric/date facts as a single text line; chips
+                            // for MPAA / status sit in their own row below so
+                            // categorical labels don't get lost in the run-on.
+                            let mut bits: Vec<String> = Vec::new();
                             if m.kind == "episode" {
                                 if let (Some(s), Some(e)) = (m.season_number, m.episode_number) {
-                                    "S{s:02}E{e:02}"
+                                    bits.push(format!("S{s:02}E{e:02}"));
                                 }
+                                if let Some(d) = m.release_date.as_deref() {
+                                    bits.push(format_long_date(d));
+                                }
+                            } else if let Some(d) = m.release_date.as_deref() {
+                                bits.push(format_long_date(d));
                             } else if let Some(y) = m.year {
-                                "{y}"
+                                bits.push(format!("{y}"));
                             }
                             if let Some(r) = m.runtime_minutes {
-                                " · {r} min"
+                                bits.push(format!("{r} min"));
                             }
+                            let meta_text = bits.join(" · ");
+                            let rating = m.rating;
+                            let votes = m.rating_votes.map(format_votes);
+                            let has_meta_text = !meta_text.is_empty();
+                            (has_meta_text || rating.is_some()).then(|| rsx! {
+                                p { class: "meta-row",
+                                    if has_meta_text { "{meta_text}" }
+                                    if let Some(rv) = rating {
+                                        if has_meta_text { " · " }
+                                        span { class: "rating-star", "★" }
+                                        " {rv:.1}"
+                                        if let Some(v) = votes.as_deref() {
+                                            span { class: "rating-votes", " ({v})" }
+                                        }
+                                    }
+                                }
+                            })
+                        }
+                        {
+                            let has_mpaa = m.mpaa.is_some();
+                            has_mpaa.then(|| rsx! {
+                                div { class: "meta-chips",
+                                    if let Some(mpaa) = m.mpaa.as_deref() {
+                                        span { class: "meta-chip mpaa", "{mpaa}" }
+                                    }
+                                }
+                            })
+                        }
+                        if let Some(studio) = m.studio.as_deref() {
+                            p { class: "studio-line", "{studio}" }
                         }
                         if let Some(plot) = m.plot.as_deref() {
                             p { class: "plot", "{plot}" }
+                        }
+                        {
+                            // Movie-only credits line. Episodes don't carry
+                            // director/writers in our NFOs, and the column is
+                            // NULL there.
+                            let dir = m.director.as_deref();
+                            let wri = m.writers.as_deref();
+                            (dir.is_some() || wri.is_some()).then(|| rsx! {
+                                p { class: "credits-line",
+                                    if let Some(d) = dir {
+                                        "Directed by {d}"
+                                    }
+                                    if dir.is_some() && wri.is_some() { " · " }
+                                    if let Some(w) = wri {
+                                        "Written by {w}"
+                                    }
+                                }
+                            })
+                        }
+                        if !m.genres.is_empty() {
+                            div { class: "genre-chips",
+                                for g in m.genres.iter() {
+                                    span { key: "{g}", class: "meta-chip genre", "{g}" }
+                                }
+                            }
+                        }
+                        {
+                            // External link footer. IMDb/TMDb only on movies and
+                            // episodes; episodes inherit the show via show_id but
+                            // not the show's IDs, so links only render when the
+                            // media row itself has them.
+                            let imdb = m.imdb_id.as_deref();
+                            let tmdb = m.tmdb_id.as_deref();
+                            (imdb.is_some() || tmdb.is_some()).then(|| rsx! {
+                                p { class: "ext-links",
+                                    if let Some(id) = imdb {
+                                        a { href: imdb_url(id), target: "_blank", rel: "noopener", "IMDb" }
+                                    }
+                                    if imdb.is_some() && tmdb.is_some() { " · " }
+                                    if let Some(id) = tmdb {
+                                        {
+                                            let url = if m.kind == "episode" {
+                                                tmdb_tv_url(id)
+                                            } else {
+                                                tmdb_movie_url(id)
+                                            };
+                                            rsx! { a { href: "{url}", target: "_blank", rel: "noopener", "TMDb" } }
+                                        }
+                                    }
+                                }
+                            })
                         }
                         nav { class: "detail-actions",
                             Link { to: Route::MediaPlay { id: m.id.clone() }, class: "btn",
@@ -1163,6 +1340,7 @@ fn MediaDetail(id: String) -> Element {
                                 }
                             }
                         }
+                        p { class: "file-footnote", "{format_bytes(m.file_size)}" }
                     }
                 }
             }
@@ -1233,11 +1411,95 @@ fn ShowDetail(id: String) -> Element {
                             } else {
                                 h1 { "{d.show.title}" }
                             }
-                            if let Some(y) = d.show.year {
-                                p { class: "meta-row", "{y}" }
+                            {
+                                let alt = d.show.original_title.as_deref().filter(|s| *s != d.show.title);
+                                alt.map(|s| rsx! { p { class: "original-title", "{s}" } })
+                            }
+                            {
+                                // Year (or year-range) + rating in a single flowing
+                                // line, matching MediaDetail. End-year is preferred
+                                // from `end_date`; fall back to bare `year` when the
+                                // show is ongoing or pre-Tier-B data.
+                                let start_year = d
+                                    .show
+                                    .premiered_date
+                                    .as_deref()
+                                    .and_then(year_from_date)
+                                    .map(|y| y as i64)
+                                    .or(d.show.year);
+                                let end_year = d
+                                    .show
+                                    .end_date
+                                    .as_deref()
+                                    .and_then(year_from_date);
+                                let year_text = match (start_year, end_year) {
+                                    (Some(s), Some(e)) if (e as i64) > s => format!("{s} – {e}"),
+                                    (Some(s), _) => format!("{s}"),
+                                    _ => String::new(),
+                                };
+                                let has_year = !year_text.is_empty();
+                                let rating = d.show.rating;
+                                let votes = d.show.rating_votes.map(format_votes);
+                                (has_year || rating.is_some()).then(|| rsx! {
+                                    p { class: "meta-row",
+                                        if has_year { "{year_text}" }
+                                        if let Some(rv) = rating {
+                                            if has_year { " · " }
+                                            span { class: "rating-star", "★" }
+                                            " {rv:.1}"
+                                            if let Some(v) = votes.as_deref() {
+                                                span { class: "rating-votes", " ({v})" }
+                                            }
+                                        }
+                                    }
+                                })
+                            }
+                            {
+                                let has_mpaa = d.show.mpaa.is_some();
+                                let has_status = d.show.status.is_some();
+                                (has_mpaa || has_status).then(|| rsx! {
+                                    div { class: "meta-chips",
+                                        if let Some(mpaa) = d.show.mpaa.as_deref() {
+                                            span { class: "meta-chip mpaa", "{mpaa}" }
+                                        }
+                                        if let Some(status) = d.show.status.as_deref() {
+                                            span { class: "meta-chip status", "{status}" }
+                                        }
+                                    }
+                                })
+                            }
+                            if let Some(studio) = d.show.studio.as_deref() {
+                                p { class: "studio-line", "{studio}" }
                             }
                             if let Some(plot) = d.show.plot.as_deref() {
                                 p { class: "plot", "{plot}" }
+                            }
+                            if !d.show.genres.is_empty() {
+                                div { class: "genre-chips",
+                                    for g in d.show.genres.iter() {
+                                        span { key: "{g}", class: "meta-chip genre", "{g}" }
+                                    }
+                                }
+                            }
+                            {
+                                let imdb = d.show.imdb_id.as_deref();
+                                let tmdb = d.show.tmdb_id.as_deref();
+                                let tvdb = d.show.tvdb_id.as_deref();
+                                (imdb.is_some() || tmdb.is_some() || tvdb.is_some()).then(|| rsx! {
+                                    p { class: "ext-links",
+                                        if let Some(id) = imdb {
+                                            a { href: imdb_url(id), target: "_blank", rel: "noopener", "IMDb" }
+                                        }
+                                        if imdb.is_some() && (tmdb.is_some() || tvdb.is_some()) { " · " }
+                                        if let Some(id) = tmdb {
+                                            a { href: tmdb_tv_url(id), target: "_blank", rel: "noopener", "TMDb" }
+                                        }
+                                        if tmdb.is_some() && tvdb.is_some() { " · " }
+                                        if let Some(id) = tvdb {
+                                            a { href: tvdb_url(id), target: "_blank", rel: "noopener", "TVDB" }
+                                        }
+                                    }
+                                })
                             }
                             {
                                 // The single most-recent in-progress
@@ -1429,7 +1691,7 @@ fn EpisodeRow(episode: EpisodeSummary, on_change: EventHandler<()>) -> Element {
                         alt: "",
                     }
                     div { class: "play-overlay",
-                        span { class: "pico", dangerous_inner_html: ICON_PLAY_BTN }
+                        span { class: "icon-btn overlay lg", dangerous_inner_html: ICON_PLAY_BTN }
                     }
                     if pct > 0.0 {
                         div { class: "progress",
@@ -1438,7 +1700,7 @@ fn EpisodeRow(episode: EpisodeSummary, on_change: EventHandler<()>) -> Element {
                     }
                     if !completed {
                         button {
-                            class: "mark-watched",
+                            class: "icon-btn overlay mark-watched",
                             title: "Mark as watched",
                             "aria-label": "Mark as watched",
                             onclick: on_mark,
@@ -1451,6 +1713,19 @@ fn EpisodeRow(episode: EpisodeSummary, on_change: EventHandler<()>) -> Element {
                         span { class: "ep-num", "S{episode.season_number:02}E{episode.episode_number:02}" }
                         " · "
                         "{episode.title}"
+                    }
+                    {
+                        let mut bits: Vec<String> = Vec::new();
+                        if let Some(r) = episode.runtime_minutes {
+                            bits.push(format!("{r} min"));
+                        }
+                        if let Some(d) = episode.release_date.as_deref() {
+                            bits.push(format_long_date(d));
+                        }
+                        (!bits.is_empty()).then(|| {
+                            let text = bits.join(" · ");
+                            rsx! { p { class: "ep-meta", "{text}" } }
+                        })
                     }
                     if let Some(plot) = episode.plot.as_deref() {
                         p { class: "ep-plot", "{plot}" }

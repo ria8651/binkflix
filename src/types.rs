@@ -69,6 +69,26 @@ pub struct Media {
     pub episode_number: Option<i64>,
     #[serde(default)]
     pub has_fanart: bool,
+    #[serde(default)]
+    pub rating: Option<f64>,
+    #[serde(default)]
+    pub rating_votes: Option<i64>,
+    #[serde(default)]
+    pub rating_source: Option<String>,
+    #[serde(default)]
+    pub mpaa: Option<String>,
+    #[serde(default)]
+    pub studio: Option<String>,
+    #[serde(default)]
+    pub tagline: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub director: Option<String>,
+    #[serde(default)]
+    pub writers: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,6 +107,24 @@ pub struct Show {
     pub has_fanart: bool,
     #[serde(default)]
     pub has_banner: bool,
+    #[serde(default)]
+    pub rating: Option<f64>,
+    #[serde(default)]
+    pub rating_votes: Option<i64>,
+    #[serde(default)]
+    pub rating_source: Option<String>,
+    #[serde(default)]
+    pub mpaa: Option<String>,
+    #[serde(default)]
+    pub studio: Option<String>,
+    #[serde(default)]
+    pub premiered_date: Option<String>,
+    #[serde(default)]
+    pub end_date: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,6 +135,8 @@ pub struct EpisodeSummary {
     pub title: String,
     pub plot: Option<String>,
     pub runtime_minutes: Option<i64>,
+    #[serde(default)]
+    pub release_date: Option<String>,
     #[serde(default)]
     pub position_secs: f64,
     #[serde(default)]

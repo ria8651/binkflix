@@ -281,6 +281,17 @@ pub struct Media {
     pub season_number: Option<i64>,
     pub episode_number: Option<i64>,
     pub has_fanart: bool,
+    pub rating: Option<f64>,
+    pub rating_votes: Option<i64>,
+    pub rating_source: Option<String>,
+    pub mpaa: Option<String>,
+    pub studio: Option<String>,
+    pub tagline: Option<String>,
+    pub release_date: Option<String>,
+    pub director: Option<String>,
+    pub writers: Option<String>,
+    #[sqlx(skip)]
+    pub genres: Vec<String>,
 }
 
 async fn media(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Media>> {
@@ -288,10 +299,12 @@ async fn media(State(state): State<AppState>, Path(id): Path<String>) -> Result<
     // own fanart_path; episodes inherit the parent show's. That way one client
     // check (`m.has_fanart`) governs whether to paint the hero backdrop for
     // *any* detail view, matching how `ShowDetail` works.
-    let row = sqlx::query_as::<_, Media>(
+    let mut row = sqlx::query_as::<_, Media>(
         "SELECT m.id, m.kind, m.title, m.original_title, m.year, m.plot, m.runtime_minutes,
                 m.imdb_id, m.tmdb_id, m.file_size, m.show_id, m.season_number, m.episode_number,
-                (m.fanart_path IS NOT NULL OR s.fanart_path IS NOT NULL) AS has_fanart
+                (m.fanart_path IS NOT NULL OR s.fanart_path IS NOT NULL) AS has_fanart,
+                m.rating, m.rating_votes, m.rating_source, m.mpaa, m.studio,
+                m.tagline, m.release_date, m.director, m.writers
          FROM media m
          LEFT JOIN shows s ON s.id = m.show_id AND s.deleted_at IS NULL
          WHERE m.id = ? AND m.deleted_at IS NULL",
@@ -300,6 +313,26 @@ async fn media(State(state): State<AppState>, Path(id): Path<String>) -> Result<
     .fetch_optional(&state.pool)
     .await?
     .ok_or(Error::NotFound)?;
+
+    // Genres live in media_genres for movies and per-episode rows; episodes
+    // typically inherit by falling back to show_genres.
+    let mut genres: Vec<String> = sqlx::query_scalar(
+        "SELECT genre FROM media_genres WHERE media_id = ? ORDER BY genre",
+    )
+    .bind(&row.id)
+    .fetch_all(&state.pool)
+    .await?;
+    if genres.is_empty() {
+        if let Some(sid) = row.show_id.as_deref() {
+            genres = sqlx::query_scalar(
+                "SELECT genre FROM show_genres WHERE show_id = ? ORDER BY genre",
+            )
+            .bind(sid)
+            .fetch_all(&state.pool)
+            .await?;
+        }
+    }
+    row.genres = genres;
     Ok(Json(row))
 }
 
@@ -318,6 +351,16 @@ pub struct Show {
     pub has_clearlogo: bool,
     pub has_fanart: bool,
     pub has_banner: bool,
+    pub rating: Option<f64>,
+    pub rating_votes: Option<i64>,
+    pub rating_source: Option<String>,
+    pub mpaa: Option<String>,
+    pub studio: Option<String>,
+    pub premiered_date: Option<String>,
+    pub end_date: Option<String>,
+    pub status: Option<String>,
+    #[sqlx(skip)]
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -328,6 +371,7 @@ pub struct EpisodeSummary {
     pub title: String,
     pub plot: Option<String>,
     pub runtime_minutes: Option<i64>,
+    pub release_date: Option<String>,
     pub position_secs: f64,
     pub duration_secs: f64,
     pub completed: i64,
@@ -350,11 +394,13 @@ async fn show(
     Extension(session): Extension<super::auth::Session>,
     Path(id): Path<String>,
 ) -> Result<Json<ShowResponse>> {
-    let show = sqlx::query_as::<_, Show>(
+    let mut show = sqlx::query_as::<_, Show>(
         "SELECT id, title, original_title, year, plot, imdb_id, tmdb_id, tvdb_id,
                 (clearlogo_path IS NOT NULL) AS has_clearlogo,
                 (fanart_path    IS NOT NULL) AS has_fanart,
-                (banner_path    IS NOT NULL) AS has_banner
+                (banner_path    IS NOT NULL) AS has_banner,
+                rating, rating_votes, rating_source, mpaa, studio,
+                premiered_date, end_date, status
          FROM shows WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&id)
@@ -362,11 +408,18 @@ async fn show(
     .await?
     .ok_or(Error::NotFound)?;
 
+    show.genres = sqlx::query_scalar(
+        "SELECT genre FROM show_genres WHERE show_id = ? ORDER BY genre",
+    )
+    .bind(&show.id)
+    .fetch_all(&state.pool)
+    .await?;
+
     let eps = sqlx::query_as::<_, EpisodeSummary>(
         "SELECT m.id,
                 COALESCE(m.season_number, 0)  AS season_number,
                 COALESCE(m.episode_number, 0) AS episode_number,
-                m.title, m.plot, m.runtime_minutes,
+                m.title, m.plot, m.runtime_minutes, m.release_date,
                 COALESCE(wp.position_secs, 0.0) AS position_secs,
                 COALESCE(wp.duration_secs, 0.0) AS duration_secs,
                 COALESCE(wp.completed, 0)       AS completed

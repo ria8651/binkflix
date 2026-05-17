@@ -23,8 +23,8 @@ pub type ProgressHandle = Arc<RwLock<ScanProgress>>;
 /// `scan_version` and the early-return guard treats them as stale, forcing a
 /// re-upsert at the next scan. The constants live next to the upserts they
 /// gate so the reason for a bump is visible in the diff.
-const SHOW_SCAN_VERSION: i64 = 1;
-const MEDIA_SCAN_VERSION: i64 = 1;
+const SHOW_SCAN_VERSION: i64 = 3;
+const MEDIA_SCAN_VERSION: i64 = 3;
 
 async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)) {
     let mut p = handle.write().await;
@@ -992,15 +992,23 @@ async fn upsert_show(
         .find(|u| u.kind.eq_ignore_ascii_case("tvdb"))
         .map(|u| u.value.clone());
 
+    let (rating, rating_votes, rating_source) = match nfo.primary_rating() {
+        Some((v, votes, src)) => (Some(v), votes, Some(src)),
+        None => (None, None, None),
+    };
+    let studio = if nfo.studio.is_empty() { None } else { Some(nfo.studio.join(", ")) };
+
     let added_at = file_added_at(show_dir);
     sqlx::query(
         r#"
         INSERT INTO shows (
             id, library_id, path, title, sort_title, original_title, year, plot,
             imdb_id, tmdb_id, tvdb_id, poster_path, fanart_path, clearlogo_path,
-            banner_path, added_at, scan_version
+            banner_path, added_at, scan_version,
+            rating, rating_votes, rating_source, mpaa, studio,
+            premiered_date, end_date, status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
             sort_title = excluded.sort_title,
@@ -1015,6 +1023,14 @@ async fn upsert_show(
             clearlogo_path = excluded.clearlogo_path,
             banner_path = excluded.banner_path,
             scan_version = excluded.scan_version,
+            rating         = excluded.rating,
+            rating_votes   = excluded.rating_votes,
+            rating_source  = excluded.rating_source,
+            mpaa           = excluded.mpaa,
+            studio         = excluded.studio,
+            premiered_date = excluded.premiered_date,
+            end_date       = excluded.end_date,
+            status         = excluded.status,
             deleted_at = NULL,
             scanned_at = datetime('now')
         "#,
@@ -1036,6 +1052,14 @@ async fn upsert_show(
     .bind(&banner)
     .bind(&added_at)
     .bind(SHOW_SCAN_VERSION)
+    .bind(rating)
+    .bind(rating_votes)
+    .bind(&rating_source)
+    .bind(&nfo.mpaa)
+    .bind(&studio)
+    .bind(&nfo.premiered)
+    .bind(&nfo.enddate)
+    .bind(&nfo.status)
     .execute(pool)
     .await?;
 
@@ -1194,9 +1218,10 @@ async fn upsert_episode(
         INSERT INTO media (
             id, library_id, kind, path, file_size,
             title, sort_title, plot, runtime_minutes, image_path,
-            show_id, season_number, episode_number, added_at, scan_version
+            show_id, season_number, episode_number, added_at, scan_version,
+            release_date
         )
-        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'episode',
             title           = excluded.title,
@@ -1209,6 +1234,7 @@ async fn upsert_episode(
             episode_number  = excluded.episode_number,
             file_size       = excluded.file_size,
             scan_version    = excluded.scan_version,
+            release_date    = excluded.release_date,
             deleted_at      = NULL,
             -- clear movie-only fields in case this row was previously a movie
             original_title  = NULL,
@@ -1216,6 +1242,14 @@ async fn upsert_episode(
             imdb_id         = NULL,
             tmdb_id         = NULL,
             fanart_path     = NULL,
+            rating          = NULL,
+            rating_votes    = NULL,
+            rating_source   = NULL,
+            mpaa            = NULL,
+            studio          = NULL,
+            tagline         = NULL,
+            director        = NULL,
+            writers         = NULL,
             scanned_at      = datetime('now')
         "#,
     )
@@ -1233,6 +1267,7 @@ async fn upsert_episode(
     .bind(episode)
     .bind(&added_at)
     .bind(MEDIA_SCAN_VERSION)
+    .bind(&nfo.aired)
     .execute(pool)
     .await?;
 
@@ -1313,15 +1348,25 @@ async fn upsert_movie(
         .map(|(id, _, _, _, _)| id)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    let (rating, rating_votes, rating_source) = match nfo.primary_rating() {
+        Some((v, votes, src)) => (Some(v), votes, Some(src)),
+        None => (None, None, None),
+    };
+    let studio = if nfo.studio.is_empty() { None } else { Some(nfo.studio.join(", ")) };
+    let director = if nfo.director.is_empty() { None } else { Some(nfo.director.join(", ")) };
+    let writers = if nfo.credits.is_empty() { None } else { Some(nfo.credits.join(", ")) };
+
     let added_at = file_added_at(video);
     sqlx::query(
         r#"
         INSERT INTO media (
             id, library_id, kind, path, file_size,
             title, sort_title, original_title, year, plot, runtime_minutes,
-            imdb_id, tmdb_id, image_path, fanart_path, added_at, scan_version
+            imdb_id, tmdb_id, image_path, fanart_path, added_at, scan_version,
+            rating, rating_votes, rating_source, mpaa, studio,
+            tagline, release_date, director, writers
         )
-        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             kind            = 'movie',
             title           = excluded.title,
@@ -1336,6 +1381,15 @@ async fn upsert_movie(
             fanart_path     = excluded.fanart_path,
             file_size       = excluded.file_size,
             scan_version    = excluded.scan_version,
+            rating          = excluded.rating,
+            rating_votes    = excluded.rating_votes,
+            rating_source   = excluded.rating_source,
+            mpaa            = excluded.mpaa,
+            studio          = excluded.studio,
+            tagline         = excluded.tagline,
+            release_date    = excluded.release_date,
+            director        = excluded.director,
+            writers         = excluded.writers,
             deleted_at      = NULL,
             -- clear episode-only fields in case this was previously an episode
             show_id         = NULL,
@@ -1360,6 +1414,15 @@ async fn upsert_movie(
     .bind(&fanart)
     .bind(&added_at)
     .bind(MEDIA_SCAN_VERSION)
+    .bind(rating)
+    .bind(rating_votes)
+    .bind(&rating_source)
+    .bind(&nfo.mpaa)
+    .bind(&studio)
+    .bind(&nfo.tagline)
+    .bind(&nfo.premiered)
+    .bind(&director)
+    .bind(&writers)
     .execute(pool)
     .await?;
 

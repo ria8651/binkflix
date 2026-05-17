@@ -18,6 +18,16 @@
   --bg-button-hover: rgb(55 55 62);
   --bg-button-secondary: rgb(50 50 56);
   --bg-button-secondary-hover: rgb(65 65 72);
+  /* Overlay-button chrome — for icon buttons that float over media
+   * (posters, fanart) rather than the page background. Each theme
+   * retints these to fit its palette; the only universal contract is
+   * "must read against an arbitrary poster color." */
+  --bg-overlay: rgb(20 20 22 / 0.85);
+  --bg-overlay-hover: rgb(40 40 46 / 0.95);
+  --border-overlay: rgb(255 255 255 / 0.18);
+  --text-on-overlay: #fff;
+  --overlay-blur: blur(8px);
+  --radius-icon-btn: 50%;
   --bg-tile: rgb(28 28 32);
   --bg-hover-subtle: rgb(255 255 255 / 0.06);
   --bg-row: rgb(255 255 255 / 0.03);
@@ -58,6 +68,17 @@
   --accent-hover: #ff1624;
   --danger: #d32f2f;
   --accent-rgb: 229 9 20;
+
+  /* Rating star — warm gold on most themes; Terminal overrides to its
+   * green-on-black to keep the TUI aesthetic. */
+  --color-rating: #f5a524;
+
+  /* Detail-page meta chip elevation. Default themes define a chip via
+   * background + border; Material zeroes the border and opts in to a
+   * subtle shadow here so the chip reads against the near-white page bg.
+   * Every other theme leaves this as `none` — re-using `--shadow-tile`
+   * would bleed ElegantFin's card-sized drop shadow onto an inline pill. */
+  --shadow-chip: none;
 
   /* Typography */
   --font-body: "Open Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -243,6 +264,31 @@
   --scrub-track-played: var(--accent);
   --scrub-track-buffered: rgb(255 255 255 / 0.38);
   --scrub-track-rest: rgb(255 255 255 / 0.18);
+
+  /* Video player — overlays paint over arbitrary video frames, so the
+   * defaults are the conventional dark cinema treatment (white-on-black
+   * scrim) rather than the page's --bg-surface / --text-primary tokens.
+   * Themes can override any of these to retint the player chrome. */
+  --player-bg-letterbox: #000;
+  --player-bg-menu: rgb(20 20 20 / 0.95);
+  --player-bg-error: rgb(0 0 0 / 0.82);
+  --player-bg-glass: rgb(0 0 0 / 0.45);
+  --player-bg-glass-hover: rgb(0 0 0 / 0.7);
+  --player-bg-button-hover: rgb(255 255 255 / 0.15);
+  --player-bg-button-active: rgb(255 255 255 / 0.18);
+  --player-bg-error-btn: rgb(255 255 255 / 0.14);
+  --player-bg-error-btn-hover: rgb(255 255 255 / 0.22);
+  --player-text: #fff;
+  --player-text-muted: rgb(255 255 255 / 0.85);
+  --player-text-dim: rgb(255 255 255 / 0.72);
+  --player-text-dimmer: rgb(255 255 255 / 0.55);
+  --player-border: rgb(255 255 255 / 0.12);
+  --player-border-strong: rgb(255 255 255 / 0.28);
+  --player-scrim-top: linear-gradient(to bottom, rgb(0 0 0 / 0.75) 0%, rgb(0 0 0 / 0.3) 60%, transparent 100%);
+  --player-scrim-bottom: linear-gradient(to top, rgb(0 0 0 / 0.85) 0%, rgb(0 0 0 / 0.4) 60%, transparent 100%);
+  --player-volume-track: #fff;
+  --player-volume-track-rest: rgb(255 255 255 / 0.25);
+  --player-volume-thumb: #fff;
 }
 
 /* ── Classic light theme ─────────────────────────────────────── */
@@ -288,6 +334,13 @@
   --border-error: #d32f2f;
 
   --shadow-dialog: 0 10px 24px rgb(0 0 0 / 0.18);
+
+  /* Light scrim with a dark icon — fits the Netflix-light aesthetic
+   * rather than dropping a black blob onto the page's white surfaces. */
+  --bg-overlay: rgb(255 255 255 / 0.92);
+  --bg-overlay-hover: #fff;
+  --border-overlay: rgb(0 0 0 / 0.12);
+  --text-on-overlay: rgb(20 20 20);
 }
 
 /* ── Terminal theme ──────────────────────────────────────────── */
@@ -357,6 +410,37 @@
   --motion-focus-appear: 0ms;
 
   --shadow-dialog: none;
+
+  /* Keep the rating star inside the green-on-black palette — gold would
+   * fight the whole theme. */
+  --color-rating: var(--text-primary);
+
+  /* Player chrome — keep the black letterbox/scrim defaults but retint
+   * the text, borders, and volume slider to the green palette. */
+  --player-bg-menu: rgb(0 20 0 / 0.95);
+  --player-text: #00ff00;
+  --player-text-muted: rgb(0 255 0 / 0.85);
+  --player-text-dim: rgb(0 255 0 / 0.72);
+  --player-text-dimmer: rgb(0 255 0 / 0.55);
+  --player-border: rgb(0 255 0 / 0.25);
+  --player-border-strong: rgb(0 255 0 / 0.5);
+  --player-bg-button-hover: rgb(0 255 0 / 0.15);
+  --player-bg-button-active: rgb(0 255 0 / 0.18);
+  --player-bg-error-btn: rgb(0 255 0 / 0.14);
+  --player-bg-error-btn-hover: rgb(0 255 0 / 0.22);
+  --player-volume-track: #00ff00;
+  --player-volume-track-rest: rgb(0 255 0 / 0.25);
+  --player-volume-thumb: #00ff00;
+
+  /* Solid black + green chrome — backdrop blur and round corners are
+   * anachronistic for the CRT aesthetic; everything else in the theme
+   * is square and unfiltered. */
+  --bg-overlay: #000;
+  --bg-overlay-hover: #001a00;
+  --border-overlay: #00ff00;
+  --text-on-overlay: #00ff00;
+  --overlay-blur: none;
+  --radius-icon-btn: 0;
 }
 
 /* ── Material theme ──────────────────────────────────────────── */
@@ -444,6 +528,19 @@
     0 6px 12px -4px rgb(0 0 0 / 0.1),
     0 12px 24px 0 rgb(0 0 0 / 0.06),
     0 4px 24px 0 rgb(0 0 0 / 0.04);
+
+  /* Material is the only theme without a chip border, and its page bg
+   * (#fafafa) sits a hair below the chip surface (#fff). Give chips a
+   * touch of elevation so they read as filled pills. */
+  --shadow-chip: 0 1px 2px 0 rgb(0 0 0 / 0.1);
+
+  /* Tonal-style overlay: light scrim, dark icon, no border. Elevation
+   * comes from --shadow-button (already defined above) via .icon-btn —
+   * which is more on-brand for Material than a dark scrim. */
+  --bg-overlay: rgb(255 255 255 / 0.95);
+  --bg-overlay-hover: #fff;
+  --border-overlay: transparent;
+  --text-on-overlay: rgb(0 0 0 / 0.87);
 }
 
 /* ── ElegantFin theme ────────────────────────────────────────── */
@@ -726,4 +823,17 @@
   --outline-ep-thumb-hover: var(--outline-tile-poster-hover);
   --ep-thumb-sheen: var(--tile-poster-sheen);
   --ep-thumb-hover-transform: var(--tile-poster-hover-transform);
+
+  /* Player chrome — slate-tinted glass matches the page palette instead
+   * of the pure-black cinema scrim. Text stays white for legibility. */
+  --player-bg-menu: rgba(29, 38, 53, 0.92);
+  --player-bg-glass: rgba(29, 38, 53, 0.6);
+  --player-bg-glass-hover: rgba(29, 38, 53, 0.85);
+
+  /* Slate-tinted glass overlay — matches the page palette rather than
+   * pure black. Heavier blur reinforces the frosted aesthetic. */
+  --bg-overlay: rgba(29, 38, 53, 0.72);
+  --bg-overlay-hover: rgba(40, 50, 68, 0.92);
+  --border-overlay: rgb(255 255 255 / 0.14);
+  --overlay-blur: blur(12px);
 }
