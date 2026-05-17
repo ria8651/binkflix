@@ -17,14 +17,23 @@ use walkdir::WalkDir;
 
 pub type ProgressHandle = Arc<RwLock<ScanProgress>>;
 
-/// Bump these whenever the corresponding `upsert_*` function changes what it
-/// persists — e.g. starts writing a new column, populating a join table, or
-/// reading a previously-ignored NFO field. Existing rows have an older
-/// `scan_version` and the early-return guard treats them as stale, forcing a
-/// re-upsert at the next scan. The constants live next to the upserts they
-/// gate so the reason for a bump is visible in the diff.
+/// Bump `SHOW_SCAN_VERSION` / `MEDIA_SCAN_VERSION` whenever the corresponding
+/// `upsert_*` function changes what it persists — e.g. starts writing a new
+/// column, populating a join table, or reading a previously-ignored NFO
+/// field. Existing rows have an older `scan_version` and the early-return
+/// guard treats them as stale, forcing a re-upsert at the next scan.
+///
+/// The `*_VERSION` constants below are independent: each gates exactly one
+/// extractor pass. Bumping `MEDIA_SCAN_VERSION` only re-runs the metadata
+/// upsert — assets are untouched. Bumping `SUBTITLES_VERSION` only re-runs
+/// the subtitle pass. This split exists because a metadata-column addition
+/// shouldn't trigger an hour-long re-extract of trickplay sprites. See
+/// migration 0017 for the per-asset columns.
 const SHOW_SCAN_VERSION: i64 = 3;
 const MEDIA_SCAN_VERSION: i64 = 3;
+const SUBTITLES_VERSION: i64 = 1;
+const THUMBNAILS_VERSION: i64 = 1;
+const TRICKPLAY_VERSION: i64 = 1;
 
 async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)) {
     let mut p = handle.write().await;
@@ -273,12 +282,17 @@ pub async fn ensure_library(pool: &SqlitePool, name: &str, path: &Path) -> anyho
     Ok(id)
 }
 
-/// Work item carried from the index pass into the asset pass.
+/// Work item carried from the index pass into the asset pass. Each
+/// `needs_*` flag gates its own pass — a job can need just one asset
+/// re-extracted, not all three.
 struct AssetJob {
     media_id: String,
     video: PathBuf,
     title: String,
     has_sidecar_image: bool,
+    needs_subtitles: bool,
+    needs_thumbnails: bool,
+    needs_trickplay: bool,
 }
 
 /// Populate `added_at` on rows that pre-date the column (NULL). Uses the
@@ -428,7 +442,7 @@ pub async fn scan_library_with_progress(
                 };
                 match upsert_episode(pool, library_id, &show_id, &show_dir, &abs, file_size).await {
                     Ok(Some(out)) => {
-                        if out.needs_assets { stats.episodes_indexed += 1; } else { stats.episodes_skipped += 1; }
+                        if out.re_indexed { stats.episodes_indexed += 1; } else { stats.episodes_skipped += 1; }
                         Some(out)
                     }
                     Ok(None) => { stats.episodes_skipped += 1; None }
@@ -438,7 +452,7 @@ pub async fn scan_library_with_progress(
             Classification::Movie => {
                 match upsert_movie(pool, library_id, &abs, file_size).await {
                     Ok(Some(out)) => {
-                        if out.needs_assets { stats.movies_indexed += 1; } else { stats.movies_skipped += 1; }
+                        if out.re_indexed { stats.movies_indexed += 1; } else { stats.movies_skipped += 1; }
                         Some(out)
                     }
                     Ok(None) => { stats.movies_skipped += 1; None }
@@ -448,7 +462,7 @@ pub async fn scan_library_with_progress(
         };
 
         if let Some(out) = outcome {
-            if out.needs_assets {
+            if out.needs_subtitles || out.needs_thumbnails || out.needs_trickplay {
                 let title = abs
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -459,6 +473,9 @@ pub async fn scan_library_with_progress(
                     video: abs,
                     title,
                     has_sidecar_image: out.has_sidecar_image,
+                    needs_subtitles: out.needs_subtitles,
+                    needs_thumbnails: out.needs_thumbnails,
+                    needs_trickplay: out.needs_trickplay,
                 });
             }
         }
@@ -520,11 +537,12 @@ pub async fn scan_library_with_progress(
         }
 
         // -- Pass 1: probe + subtitles -----------------------------------
+        let subtitles_total = asset_jobs.iter().filter(|j| j.needs_subtitles).count();
         if let Some(p) = &progress {
             set_progress(p, |s| {
                 s.phase = "subtitles".into();
                 s.done = 0;
-                s.total = total;
+                s.total = subtitles_total;
                 s.current = None;
                 s.active.clear();
             })
@@ -538,6 +556,19 @@ pub async fn scan_library_with_progress(
                 let done = done_p1.clone();
                 async move {
                     let started = std::time::Instant::now();
+                    if !job.needs_subtitles {
+                        return PerFile {
+                            job,
+                            tech_info: None,
+                            sub_tracks: 0,
+                            probe_ms: 0,
+                            subtitles_ms: 0,
+                            thumbnail_ms: 0,
+                            trickplay_ms: 0,
+                            keyframe_count: None,
+                            started,
+                        };
+                    }
                     if let Some(p) = &progress {
                         add_active(p, &job.media_id, &job.title, "subtitles").await;
                     }
@@ -561,6 +592,21 @@ pub async fn scan_library_with_progress(
                     };
                     let subtitles_ms = t.elapsed().as_millis() as u64;
 
+                    // Bump the per-row version unconditionally — matches today's
+                    // policy where `scan_version` was written at upsert time
+                    // regardless of whether asset extraction succeeded. Failures
+                    // don't auto-retry; the user re-triggers with a version bump.
+                    if let Err(e) = sqlx::query(
+                        "UPDATE media SET subtitles_version = ? WHERE id = ?",
+                    )
+                    .bind(SUBTITLES_VERSION)
+                    .bind(&job.media_id)
+                    .execute(&pool)
+                    .await
+                    {
+                        warn!(media_id = %job.media_id, %e, "failed to update subtitles_version");
+                    }
+
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = job.title.clone();
@@ -573,7 +619,7 @@ pub async fn scan_library_with_progress(
                         .await;
                     }
                     debug!(
-                        progress = format!("{n}/{total}"),
+                        progress = format!("{n}/{subtitles_total}"),
                         title = %job.title,
                         subs = sub_count,
                         elapsed_ms = subtitles_ms,
@@ -596,29 +642,35 @@ pub async fn scan_library_with_progress(
             .collect()
             .await;
         info!(
-            total = pass1.len(),
+            total = subtitles_total,
             elapsed_ms = assets_started.elapsed().as_millis() as u64,
             "subtitles pass complete",
         );
 
         // -- Pass 2: thumbnails ------------------------------------------
+        let thumbnails_total = pass1.iter().filter(|f| f.job.needs_thumbnails).count();
         if let Some(p) = &progress {
             set_progress(p, |s| {
                 s.phase = "thumbnails".into();
                 s.done = 0;
-                s.total = pass1.len();
+                s.total = thumbnails_total;
                 s.active.clear();
             })
             .await;
         }
         let done_p2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pass1_total = pass1.len();
         let pass2: Vec<PerFile> = stream::iter(pass1.into_iter())
             .map(|mut f| {
                 let pool = pool.clone();
                 let progress = progress.clone();
                 let done = done_p2.clone();
                 async move {
+                    if !f.job.needs_thumbnails {
+                        return f;
+                    }
+                    // Sidecar rows skip ffmpeg but still bump the version, so
+                    // a future THUMBNAILS_VERSION bump doesn't permanently
+                    // re-trip them. API endpoints prefer image_path anyway.
                     if !f.job.has_sidecar_image {
                         if let Some(p) = &progress {
                             add_active(p, &f.job.media_id, &f.job.title, "thumbnail").await;
@@ -626,6 +678,16 @@ pub async fn scan_library_with_progress(
                         let t = std::time::Instant::now();
                         thumbnails::scan_for_media(&pool, &f.job.media_id, &f.job.video).await;
                         f.thumbnail_ms = t.elapsed().as_millis() as u64;
+                    }
+                    if let Err(e) = sqlx::query(
+                        "UPDATE media SET thumbnails_version = ? WHERE id = ?",
+                    )
+                    .bind(THUMBNAILS_VERSION)
+                    .bind(&f.job.media_id)
+                    .execute(&pool)
+                    .await
+                    {
+                        warn!(media_id = %f.job.media_id, %e, "failed to update thumbnails_version");
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
@@ -645,17 +707,18 @@ pub async fn scan_library_with_progress(
             .collect()
             .await;
         info!(
-            total = pass1_total,
+            total = thumbnails_total,
             elapsed_ms = assets_started.elapsed().as_millis() as u64,
             "thumbnails pass complete",
         );
 
         // -- Pass 3: trickplay -------------------------------------------
+        let trickplay_total = pass2.iter().filter(|f| f.job.needs_trickplay).count();
         if let Some(p) = &progress {
             set_progress(p, |s| {
                 s.phase = "trickplay".into();
                 s.done = 0;
-                s.total = pass2.len();
+                s.total = trickplay_total;
                 s.active.clear();
             })
             .await;
@@ -667,18 +730,42 @@ pub async fn scan_library_with_progress(
                 let progress = progress.clone();
                 let done = done_p3.clone();
                 async move {
+                    if !f.job.needs_trickplay {
+                        return f;
+                    }
                     if let Some(p) = &progress {
                         add_active(p, &f.job.media_id, &f.job.title, "trickplay").await;
                     }
+                    // Duration normally comes from pass-1's probe. When only
+                    // trickplay is stale (pass 1 was skipped), fall back to
+                    // the cached tech_info — the file is unchanged by
+                    // definition, so the stored value is authoritative.
+                    let duration = match f.tech_info.as_ref().and_then(|i| i.duration_seconds) {
+                        Some(d) => Some(d),
+                        None => match super::media_info::load(&pool, &f.job.media_id).await {
+                            Ok(Some(info)) => info.duration_seconds,
+                            _ => None,
+                        },
+                    };
                     let t = std::time::Instant::now();
                     f.keyframe_count = trickplay::scan_for_media(
                         &pool,
                         &f.job.media_id,
                         &f.job.video,
-                        f.tech_info.as_ref().and_then(|i| i.duration_seconds),
+                        duration,
                     )
                     .await;
                     f.trickplay_ms = t.elapsed().as_millis() as u64;
+                    if let Err(e) = sqlx::query(
+                        "UPDATE media SET trickplay_version = ? WHERE id = ?",
+                    )
+                    .bind(TRICKPLAY_VERSION)
+                    .bind(&f.job.media_id)
+                    .execute(&pool)
+                    .await
+                    {
+                        warn!(media_id = %f.job.media_id, %e, "failed to update trickplay_version");
+                    }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = f.job.title.clone();
@@ -1081,14 +1168,20 @@ async fn upsert_show(
 
 /// Returned by `upsert_episode` / `upsert_movie`.
 ///
-/// `needs_assets = true` means we re-indexed the row (new or changed), so
-/// the caller should (re)extract subtitles + thumbnails for it.
-/// `has_sidecar_image` lets the caller skip thumbnail generation when the
-/// library already supplies one.
+/// `re_indexed` reflects whether the metadata row was re-upserted (drives
+/// the indexed/skipped stats). Each `needs_*` flag is independent and gates
+/// exactly one asset pass: true when the file changed OR the matching
+/// `*_VERSION` constant is newer than the row's stored version.
+/// `has_sidecar_image` lets pass 2 skip thumbnail generation when the
+/// library already supplies one (but the version is still bumped, so the
+/// row doesn't permanently re-trip).
 pub struct UpsertOutcome {
     pub id: String,
-    pub needs_assets: bool,
     pub has_sidecar_image: bool,
+    pub re_indexed: bool,
+    pub needs_subtitles: bool,
+    pub needs_thumbnails: bool,
+    pub needs_trickplay: bool,
 }
 
 /// First contiguous run of ASCII digits parsed as i64. Used by the
@@ -1150,36 +1243,55 @@ async fn upsert_episode(
     let nfo_path = video.with_extension("nfo");
     let nfo_opt = nfo_path.is_file().then_some(nfo_path);
 
-    // Skip if unchanged.
-    let existing: Option<(String, String, i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, scanned_at, file_size, scan_version, deleted_at FROM media WHERE path = ?",
+    type ExistingRow = (String, String, i64, i64, Option<String>, i64, i64, i64);
+    let existing: Option<ExistingRow> = sqlx::query_as(
+        "SELECT id, scanned_at, file_size, scan_version, deleted_at,
+                subtitles_version, thumbnails_version, trickplay_version
+         FROM media WHERE path = ?",
     )
     .bind(&path_str)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, scanned_at, existing_size, scan_version, deleted_at)) = &existing {
-        let mut sources: Vec<&Path> = vec![video];
-        if let Some(n) = nfo_opt.as_ref() {
-            sources.push(n);
-        }
-        // Parent dir mtime catches sidecar thumb add/remove.
-        if let Some(parent) = video.parent() {
-            sources.push(parent);
-        }
-        // A soft-deleted row always re-upserts so `deleted_at` gets cleared.
-        if deleted_at.is_none()
-            && *scan_version == MEDIA_SCAN_VERSION
-            && *existing_size == file_size
-            && !any_newer_than(&sources, scanned_at)
-        {
-            // Unchanged — still report the id so the caller can decide.
-            return Ok(Some(UpsertOutcome {
-                id: id.clone(),
-                needs_assets: false,
-                has_sidecar_image: find_episode_thumb(video).is_some(),
-            }));
-        }
+    // Compute staleness flags. file_changed invalidates all assets; per-asset
+    // version mismatches invalidate just that pass. metadata_stale forces a
+    // re-upsert without re-extracting anything.
+    let (file_changed, metadata_stale, needs_subtitles, needs_thumbnails, needs_trickplay) =
+        if let Some((_, scanned_at, existing_size, scan_version, deleted_at, sv, tv, pv)) = &existing {
+            let mut sources: Vec<&Path> = vec![video];
+            if let Some(n) = nfo_opt.as_ref() {
+                sources.push(n);
+            }
+            // Parent dir mtime catches sidecar thumb add/remove.
+            if let Some(parent) = video.parent() {
+                sources.push(parent);
+            }
+            let file_changed = deleted_at.is_some()
+                || *existing_size != file_size
+                || any_newer_than(&sources, scanned_at);
+            let metadata_stale = *scan_version != MEDIA_SCAN_VERSION;
+            (
+                file_changed,
+                metadata_stale,
+                file_changed || *sv < SUBTITLES_VERSION,
+                file_changed || *tv < THUMBNAILS_VERSION,
+                file_changed || *pv < TRICKPLAY_VERSION,
+            )
+        } else {
+            // New row — treat as fully stale so every pass runs.
+            (true, true, true, true, true)
+        };
+
+    if !file_changed && !metadata_stale && !needs_subtitles && !needs_thumbnails && !needs_trickplay {
+        let id = existing.as_ref().map(|r| r.0.clone()).unwrap_or_default();
+        return Ok(Some(UpsertOutcome {
+            id,
+            has_sidecar_image: find_episode_thumb(video).is_some(),
+            re_indexed: false,
+            needs_subtitles: false,
+            needs_thumbnails: false,
+            needs_trickplay: false,
+        }));
     }
 
     let nfo: EpisodeNfo = nfo_opt
@@ -1209,7 +1321,7 @@ async fn upsert_episode(
     let thumb = find_episode_thumb(video).map(|p| p.to_string_lossy().into_owned());
 
     let id = existing
-        .map(|(id, _, _, _, _)| id)
+        .map(|r| r.0)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let added_at = file_added_at(video);
@@ -1280,8 +1392,11 @@ async fn upsert_episode(
     debug!(title, season, episode, "indexed episode");
     Ok(Some(UpsertOutcome {
         id,
-        needs_assets: true,
         has_sidecar_image: thumb.is_some(),
+        re_indexed: true,
+        needs_subtitles,
+        needs_thumbnails,
+        needs_trickplay,
     }))
 }
 
@@ -1295,39 +1410,56 @@ async fn upsert_movie(
     let base = video.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
     let nfo_path = matching_nfo(video);
 
-    let existing: Option<(String, String, i64, i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, scanned_at, file_size, scan_version, deleted_at FROM media WHERE path = ?",
+    type ExistingRow = (String, String, i64, i64, Option<String>, i64, i64, i64);
+    let existing: Option<ExistingRow> = sqlx::query_as(
+        "SELECT id, scanned_at, file_size, scan_version, deleted_at,
+                subtitles_version, thumbnails_version, trickplay_version
+         FROM media WHERE path = ?",
     )
     .bind(&path_str)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, scanned_at, existing_size, scan_version, deleted_at)) = &existing {
-        // The video, the NFO, and any sidecar (poster / fanart / thumb) all
-        // affect what we'd write to the DB. Tracking the parent directory's
-        // mtime in addition to the video covers sidecar add/remove/replace —
-        // most filesystems bump the dir's mtime when a child is added or
-        // deleted, so we don't have to enumerate every possible sidecar
-        // candidate path.
-        let mut sources: Vec<&Path> = vec![video];
-        if let Some(n) = nfo_path.as_ref() {
-            sources.push(n);
-        }
-        if let Some(parent) = video.parent() {
-            sources.push(parent);
-        }
-        // A soft-deleted row always re-upserts so `deleted_at` gets cleared.
-        if deleted_at.is_none()
-            && *scan_version == MEDIA_SCAN_VERSION
-            && *existing_size == file_size
-            && !any_newer_than(&sources, scanned_at)
-        {
-            return Ok(Some(UpsertOutcome {
-                id: id.clone(),
-                needs_assets: false,
-                has_sidecar_image: find_movie_image(video).is_some(),
-            }));
-        }
+    // The video, the NFO, and any sidecar (poster / fanart / thumb) all
+    // affect what we'd write to the DB. Tracking the parent directory's
+    // mtime in addition to the video covers sidecar add/remove/replace —
+    // most filesystems bump the dir's mtime when a child is added or
+    // deleted, so we don't have to enumerate every possible sidecar
+    // candidate path.
+    let (file_changed, metadata_stale, needs_subtitles, needs_thumbnails, needs_trickplay) =
+        if let Some((_, scanned_at, existing_size, scan_version, deleted_at, sv, tv, pv)) = &existing {
+            let mut sources: Vec<&Path> = vec![video];
+            if let Some(n) = nfo_path.as_ref() {
+                sources.push(n);
+            }
+            if let Some(parent) = video.parent() {
+                sources.push(parent);
+            }
+            let file_changed = deleted_at.is_some()
+                || *existing_size != file_size
+                || any_newer_than(&sources, scanned_at);
+            let metadata_stale = *scan_version != MEDIA_SCAN_VERSION;
+            (
+                file_changed,
+                metadata_stale,
+                file_changed || *sv < SUBTITLES_VERSION,
+                file_changed || *tv < THUMBNAILS_VERSION,
+                file_changed || *pv < TRICKPLAY_VERSION,
+            )
+        } else {
+            (true, true, true, true, true)
+        };
+
+    if !file_changed && !metadata_stale && !needs_subtitles && !needs_thumbnails && !needs_trickplay {
+        let id = existing.as_ref().map(|r| r.0.clone()).unwrap_or_default();
+        return Ok(Some(UpsertOutcome {
+            id,
+            has_sidecar_image: find_movie_image(video).is_some(),
+            re_indexed: false,
+            needs_subtitles: false,
+            needs_thumbnails: false,
+            needs_trickplay: false,
+        }));
     }
 
     let nfo: MovieNfo = nfo_path
@@ -1345,7 +1477,7 @@ async fn upsert_movie(
     let fanart = find_movie_fanart(video).map(|p| p.to_string_lossy().into_owned());
 
     let id = existing
-        .map(|(id, _, _, _, _)| id)
+        .map(|r| r.0)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let (rating, rating_votes, rating_source) = match nfo.primary_rating() {
@@ -1441,7 +1573,10 @@ async fn upsert_movie(
     debug!(title, "indexed movie");
     Ok(Some(UpsertOutcome {
         id,
-        needs_assets: true,
         has_sidecar_image: image.is_some(),
+        re_indexed: true,
+        needs_subtitles,
+        needs_thumbnails,
+        needs_trickplay,
     }))
 }
