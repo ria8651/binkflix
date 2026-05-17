@@ -47,6 +47,11 @@ pub fn router() -> Router<AppState> {
             "/api/preferences/{scope}",
             get(super::preferences::get_preferences).post(super::preferences::set_preferences),
         )
+        .route(
+            "/api/user-settings",
+            get(super::user_settings::get_user_settings)
+                .post(super::user_settings::set_user_settings),
+        )
         .route("/api/playback/sample", post(playback_sample))
         .route("/api/search", get(search))
         .route("/api/genres", get(list_genres))

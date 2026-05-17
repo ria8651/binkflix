@@ -471,6 +471,17 @@ pub struct MediaPreferences {
     pub bitrate_kbps: Option<u32>,
 }
 
+/// Per-user app-level settings. Loaded once on app mount and saved whenever
+/// the user changes a setting in the UI. Distinct from `MediaPreferences`
+/// which is scoped to a specific show/movie.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UserSettings {
+    /// CSS theme id (e.g. "default", "terminal"). `None` means the user has
+    /// never picked one — the client falls back to the built-in default.
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
 pub fn show_poster_url(id: &str) -> String { format!("/api/shows/{id}/poster") }
 pub fn show_fanart_url(id: &str) -> String { format!("/api/shows/{id}/fanart") }
 pub fn show_clearlogo_url(id: &str) -> String { format!("/api/shows/{id}/clearlogo") }

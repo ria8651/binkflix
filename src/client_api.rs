@@ -304,3 +304,36 @@ pub async fn set_preferences(scope: &str, prefs: &MediaPreferences) -> Result<()
 pub async fn set_preferences(_scope: &str, _prefs: &MediaPreferences) -> Result<(), String> {
     Err("client fetcher invoked on non-wasm target".to_string())
 }
+
+#[cfg(feature = "web")]
+pub async fn get_user_settings() -> Result<UserSettings, String> {
+    fetch_json("/api/user-settings").await
+}
+
+#[cfg(not(feature = "web"))]
+#[allow(dead_code)]
+pub async fn get_user_settings() -> Result<UserSettings, String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}
+
+#[cfg(feature = "web")]
+pub async fn set_user_settings(settings: &UserSettings) -> Result<(), String> {
+    let url = "/api/user-settings";
+    let resp = gloo_net::http::Request::post(url)
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(settings).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| format!("network error hitting {url}: {e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("{url} returned HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+#[allow(dead_code)]
+pub async fn set_user_settings(_settings: &UserSettings) -> Result<(), String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}

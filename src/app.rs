@@ -163,13 +163,28 @@ const THEMES: &[(&str, &str)] = &[
     ("elegantfin", "ElegantFin"),
 ];
 
+/// True iff `id` matches one of the built-in theme ids. Used to guard against
+/// stale or malicious values arriving from localStorage / the server before
+/// they reach the DOM or another round-trip back to the server.
+fn is_known_theme(id: &str) -> bool {
+    THEMES.iter().any(|(known, _)| *known == id)
+}
+
 #[component]
 pub fn ThemeSwitcher() -> Element {
     let mut theme = use_signal(|| "default".to_string());
+    // Flips true once mount-time restore (localStorage + server reconcile) is
+    // done. The save effect only POSTs after that, so initial loads don't
+    // produce 1–2 redundant writes of the value we just read back.
+    let mut loaded = use_signal(|| false);
     let mut open_menu = use_context::<OpenMenu>().0;
     let is_open = *open_menu.read() == Some("theme");
 
-    // On mount: restore from localStorage, then apply current theme.
+    // On mount: paint immediately from localStorage so there's no flash, then
+    // reconcile with the server-stored value (source of truth — follows the
+    // user across devices). A first-time visit on a new device will briefly
+    // show the default then switch; subsequent loads on this device are
+    // instant because localStorage carries the server value.
     use_effect(move || {
         spawn(async move {
             let mut eval = document::eval(
@@ -181,22 +196,57 @@ pub fn ThemeSwitcher() -> Element {
             );
             if let Ok(val) = eval.recv::<serde_json::Value>().await {
                 if let Some(s) = val.as_str() {
-                    theme.set(s.to_string());
+                    if is_known_theme(s) {
+                        theme.set(s.to_string());
+                    }
                 }
             }
+            #[cfg(feature = "web")]
+            {
+                match get_user_settings().await {
+                    Ok(settings) => {
+                        if let Some(server_theme) = settings.theme {
+                            if is_known_theme(&server_theme)
+                                && server_theme != *theme.peek()
+                            {
+                                theme.set(server_theme);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(%e, "get_user_settings failed"),
+                }
+            }
+            loaded.set(true);
         });
     });
 
-    // Whenever the theme signal changes, apply + persist.
+    // Whenever the theme signal changes, apply locally and (after mount-time
+    // load completes) persist to the server. The save is best-effort: errors
+    // are logged and don't disturb the UI; the next change will retry.
     use_effect(move || {
         let t = theme.read().clone();
+        // JSON-encode for safe interpolation into JS even though `t` is
+        // validated against THEMES before it reaches the signal — belt and
+        // suspenders, since the value also flows through the server.
+        let lit = serde_json::to_string(&t).unwrap_or_else(|_| "\"default\"".to_string());
         let js = format!(
             r#"
-            document.documentElement.dataset.theme = '{t}';
-            localStorage.setItem('binkflix-theme', '{t}');
+            document.documentElement.dataset.theme = {lit};
+            localStorage.setItem('binkflix-theme', {lit});
             "#
         );
-        spawn(async move { let _ = document::eval(&js).await; });
+        spawn(async move {
+            let _ = document::eval(&js).await;
+        });
+        #[cfg(feature = "web")]
+        if *loaded.peek() {
+            let to_save = t;
+            spawn(async move {
+                if let Err(e) = set_user_settings(&UserSettings { theme: Some(to_save) }).await {
+                    tracing::warn!(%e, "set_user_settings failed");
+                }
+            });
+        }
     });
 
     let current_id = theme.read().clone();

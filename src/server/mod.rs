@@ -19,6 +19,7 @@ pub mod syncplay;
 pub mod thumbnails;
 pub mod tmp;
 pub mod trickplay;
+pub mod user_settings;
 pub mod users;
 pub mod watch;
 
