@@ -75,8 +75,30 @@ struct PlaybackSampleBody {
 
 async fn playback_sample(
     State(state): State<AppState>,
+    Extension(session): Extension<super::auth::Session>,
     Json(body): Json<PlaybackSampleBody>,
 ) -> StatusCode {
+    // Verify the caller actually owns this playback session. Without this,
+    // any authenticated peer can spray samples attributed to someone else's
+    // session_id (or to a fabricated one) and pollute analytics.
+    let row: Option<(Option<String>,)> = match sqlx::query_as(
+        "SELECT user_sub FROM playback_sessions WHERE id = ?",
+    )
+    .bind(&body.session_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => return StatusCode::NO_CONTENT,
+    };
+    let owner = row.and_then(|(s,)| s);
+    // Reject samples for unknown sessions, and for sessions whose recorded
+    // user_sub doesn't match the caller. Sessions whose owner column is
+    // NULL (legacy rows from before auth was wired in) are also rejected so
+    // we don't keep an unauthenticated escape hatch alive.
+    if owner.as_deref() != Some(session.user_sub.as_str()) {
+        return StatusCode::FORBIDDEN;
+    }
     analytics::record_playback_sample(
         &state.pool,
         PlaybackSample {

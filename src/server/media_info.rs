@@ -58,9 +58,14 @@ pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
 pub async fn probe_full(
     video: &Path,
 ) -> anyhow::Result<(MediaTechInfo, Vec<EmbeddedSubtitleStream>)> {
+    // `-protocol_whitelist file`: harden in case `video` is ever a DB-sourced
+    // path that's a URL ("http://…", "concat:…", "subfile:…"). Without it,
+    // ffprobe would happily open network or composite inputs derived from
+    // attacker-controlled rows.
     let output = Command::new("ffprobe")
         .args([
             "-v", "error",
+            "-protocol_whitelist", "file",
             "-print_format", "json",
             "-show_format",
             "-show_streams",

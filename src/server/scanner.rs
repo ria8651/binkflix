@@ -393,7 +393,12 @@ pub async fn scan_library_with_progress(
     // --- Phase 1: walk the library and upsert every media/show row. Fast;
     // finishes before the user has loaded the home page. Asset extraction
     // is deferred to phase 2 so the library becomes browseable immediately.
-    for entry in WalkDir::new(&root).follow_links(true).into_iter().flatten() {
+    //
+    // `follow_links(false)`: a symlink inside the library could otherwise
+    // point at anywhere on disk (`movie.mkv → /etc/passwd`), and the
+    // canonical resolution would land verbatim in `media.path` and be
+    // served back via `/api/media/{id}/stream`. Don't follow.
+    for entry in WalkDir::new(&root).follow_links(false).into_iter().flatten() {
         let path = entry.path();
         if !entry.file_type().is_file() || !is_video(path) {
             continue;

@@ -300,6 +300,8 @@ async fn extract_all_embedded(
     let dir = crate::server::tmp::tempdir("binkflix-subs-")?;
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-nostdin", "-y"])
+        // Restrict to local file inputs only.
+        .args(["-protocol_whitelist", "file"])
         // See `extract_per_track_fallback` for why these caps matter.
         .args(["-analyzeduration", "1000000"])
         .args(["-probesize", "1000000"])
@@ -394,6 +396,8 @@ async fn extract_embedded(
     let started = std::time::Instant::now();
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-y"])
+        // Restrict to local file inputs only.
+        .args(["-protocol_whitelist", "file"])
         // Cap probe scanning — defaults are 5MB/5s, which can be dozens of
         // seconds on slow random-access storage. We already know from ffprobe
         // which stream we want; libavformat just needs enough to recognise it.

@@ -592,6 +592,8 @@ fn spawn_ffmpeg(
         }
     }
     cmd
+        // Restrict to local file inputs only — see media_info.rs.
+        .arg("-protocol_whitelist").arg("file")
         // Generous probe defaults: matroska sources with many streams
         // (multi-audio, fonts, attachments) can need >5MB to resolve all
         // codec parameters. ffmpeg's default warning ("Consider

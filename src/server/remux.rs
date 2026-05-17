@@ -298,6 +298,9 @@ async fn remux_stream(
     cmd.arg("-hide_banner")
         .arg("-loglevel").arg("warning")
         .arg("-nostdin")
+        // Restrict to local file inputs only — see media_info.rs for the
+        // protocol_whitelist rationale.
+        .arg("-protocol_whitelist").arg("file")
         .arg("-i").arg(path);
     if let Some(d) = duration {
         cmd.arg("-t").arg(format!("{d:.3}"));

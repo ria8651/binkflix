@@ -32,7 +32,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
@@ -86,7 +85,7 @@ pub struct AppState {
 const CSP_POLICY: &str = "default-src 'self'; \
     script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; \
     style-src 'self' 'unsafe-inline'; \
-    img-src 'self' data: blob: https:; \
+    img-src 'self' data: blob:; \
     media-src 'self' blob:; \
     worker-src 'self' blob:; \
     connect-src 'self' ws: wss: https://cdn.jsdelivr.net; \
@@ -312,9 +311,26 @@ async fn run_async() -> anyhow::Result<()> {
     }
 
     let auth_state = auth::AuthConfig::from_env().map(auth::AuthState::new);
+    // In release builds (i.e. anything shipped via Docker), refuse to start
+    // without auth unless the operator has explicitly opted in. Dev builds
+    // keep the "hack on features without bastion" workflow.
+    if auth_state.is_none()
+        && !cfg!(debug_assertions)
+        && std::env::var("BINKFLIX_ALLOW_OPEN").ok().as_deref() != Some("1")
+    {
+        anyhow::bail!(
+            "BASTION_ORIGIN is unset and this is a release build. Refusing to start in \
+             open mode — every request would be served to a fixed 'dev' identity. \
+             Set BASTION_ORIGIN to enable bastion auth, or set BINKFLIX_ALLOW_OPEN=1 \
+             to acknowledge that you intend to run unauthenticated."
+        );
+    }
     match &auth_state {
         Some(a) => info!(cfg = ?a.cfg, "bastion auth enabled"),
-        None => info!("bastion auth disabled (set BASTION_ORIGIN to enable); using dev identity"),
+        None => tracing::warn!(
+            "bastion auth disabled (set BASTION_ORIGIN to enable); every request is \
+             served as the shared 'dev' identity"
+        ),
     }
 
     let state = AppState {
@@ -359,7 +375,6 @@ async fn run_async() -> anyhow::Result<()> {
             axum::http::header::CONTENT_SECURITY_POLICY,
             axum::http::HeaderValue::from_static(CSP_POLICY),
         ))
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
     info!(

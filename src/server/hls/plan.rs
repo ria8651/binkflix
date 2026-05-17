@@ -260,6 +260,8 @@ pub fn derive_audio_plan(info: &MediaTechInfo, audio_idx: u32) -> Option<AudioPl
 async fn probe_segments(src: &Path, duration: f64) -> anyhow::Result<Vec<Segment>> {
     let mut child = Command::new("ffprobe")
         .arg("-v").arg("error")
+        // Restrict to local file inputs only.
+        .arg("-protocol_whitelist").arg("file")
         .arg("-select_streams").arg("v:0")
         .arg("-show_entries").arg("packet=pts_time,flags")
         .arg("-of").arg("csv=print_section=0")

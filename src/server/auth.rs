@@ -197,9 +197,14 @@ async fn bastion_callback(
 
     info!(%login_name, %user_sub, "bastion auth success");
 
+    // Secure cookies require HTTPS. In release builds (Docker / production)
+    // we assume a TLS-terminating reverse proxy in front of us; in debug
+    // builds developers commonly run plain `dx serve` on http://localhost
+    // and a Secure cookie would silently disappear.
     let cookie = Cookie::build((COOKIE_NAME, sid))
         .path("/")
         .http_only(true)
+        .secure(!cfg!(debug_assertions))
         .same_site(SameSite::Lax)
         .build();
     let jar = jar.add(cookie);

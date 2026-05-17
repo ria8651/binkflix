@@ -64,6 +64,9 @@ async fn extract_frame(video: &Path) -> anyhow::Result<Vec<u8>> {
     let started = std::time::Instant::now();
     let output = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-y"])
+        // Restrict to local file inputs — never follow URL-style schemes
+        // that would otherwise pivot off a DB-poisoned path.
+        .args(["-protocol_whitelist", "file"])
         // `-ss` before `-i` is fast (imprecise) seek — we don't need
         // frame accuracy for a grid thumb.
         .args(["-ss", &SEEK_SECONDS.to_string()])

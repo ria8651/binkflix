@@ -210,6 +210,8 @@ async fn build_sprite(
     // useful for diagnosing.
     let output = Command::new("ffmpeg")
         .args(["-v", "info", "-nostdin", "-y"])
+        // Restrict to local file inputs only.
+        .args(["-protocol_whitelist", "file"])
         .args(["-analyzeduration", "1000000"])
         .args(["-probesize", "1000000"])
         .args(["-skip_frame", "nokey"])

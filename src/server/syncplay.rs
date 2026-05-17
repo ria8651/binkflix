@@ -175,6 +175,13 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     let hub = state.hub.clone();
     let pool = state.pool.clone();
+    // Cap message + frame size so a peer can't park 64 MiB of allocation per
+    // socket (axum/tungstenite defaults). Real ClientMsgs are tiny — a Seek
+    // is ~50 bytes — so 64 KiB is generous headroom for a future SetMedia
+    // payload while still bounding misbehaviour.
+    let ws = ws
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024);
     ws.on_upgrade(move |socket| handle_socket(socket, hub, pool, room, session))
 }
 
@@ -370,6 +377,23 @@ async fn handle_socket(
                     }
                 }
                 ClientMsg::SetMedia { media_id } => {
+                    // Verify the media exists and isn't soft-deleted before
+                    // broadcasting. Without this, a peer can SetMedia to any
+                    // arbitrary string and force every other client to fetch
+                    // a 404. Also stops the title-disclosure trick where a
+                    // peer could probe ids by setting them and then reading
+                    // back the joined title from `/api/rooms`.
+                    let exists: Option<(String,)> = sqlx::query_as(
+                        "SELECT id FROM media WHERE id = ? AND deleted_at IS NULL",
+                    )
+                    .bind(&media_id)
+                    .fetch_optional(&pool_in)
+                    .await
+                    .unwrap_or(None);
+                    if exists.is_none() {
+                        debug!(%media_id, "ignoring SetMedia for unknown/deleted id");
+                        continue;
+                    }
                     let version = {
                         let mut g = entry_in.state.lock().expect("state lock");
                         let next = g.as_ref().map(|s| s.version + 1).unwrap_or(1);

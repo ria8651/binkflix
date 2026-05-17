@@ -221,9 +221,14 @@ async fn resolve_plan(
             {
                 Some(loaded) => loaded,
                 None => {
+                    // ffprobe error messages can include the full source path;
+                    // log details server-side and return a generic public message.
                     let p = plan::build_remux_plan(&src, &info)
                         .await
-                        .map_err(|e| Error::NotImplemented(format!("hls plan: {e}")))?;
+                        .map_err(|e| {
+                            tracing::error!(media_id = %id, %e, "failed to build HLS plan");
+                            Error::NotImplemented("hls plan unavailable".into())
+                        })?;
                     plan::store(&state.pool, id, &p, mtime, size)
                         .await
                         .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;

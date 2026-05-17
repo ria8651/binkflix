@@ -1,5 +1,19 @@
 use serde::Deserialize;
+use std::io::Read;
 use std::path::Path;
+
+/// Real NFO files are a few KB. A malicious or pathological library entry
+/// (e.g. a symlink pointing at /dev/zero, or a huge embedded comment) would
+/// otherwise OOM the scanner. 4 MiB is two orders of magnitude over the
+/// largest real-world NFO seen.
+const MAX_NFO_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_nfo_capped(path: &Path) -> std::io::Result<String> {
+    let f = std::fs::File::open(path)?;
+    let mut buf = String::new();
+    f.take(MAX_NFO_BYTES).read_to_string(&mut buf)?;
+    Ok(buf)
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -191,7 +205,7 @@ fn clean_strings(v: &mut Vec<String>) {
 }
 
 pub fn parse_movie_nfo(path: &Path) -> anyhow::Result<MovieNfo> {
-    let xml = std::fs::read_to_string(path)?;
+    let xml = read_nfo_capped(path)?;
     let mut nfo: MovieNfo = quick_xml::de::from_str(&xml)?;
     nilify(&mut nfo.title);
     nilify(&mut nfo.original_title);
@@ -207,7 +221,7 @@ pub fn parse_movie_nfo(path: &Path) -> anyhow::Result<MovieNfo> {
 }
 
 pub fn parse_tvshow_nfo(path: &Path) -> anyhow::Result<TvShowNfo> {
-    let xml = std::fs::read_to_string(path)?;
+    let xml = read_nfo_capped(path)?;
     let mut nfo: TvShowNfo = quick_xml::de::from_str(&xml)?;
     nilify(&mut nfo.title);
     nilify(&mut nfo.original_title);
@@ -222,7 +236,7 @@ pub fn parse_tvshow_nfo(path: &Path) -> anyhow::Result<TvShowNfo> {
 }
 
 pub fn parse_episode_nfo(path: &Path) -> anyhow::Result<EpisodeNfo> {
-    let xml = std::fs::read_to_string(path)?;
+    let xml = read_nfo_capped(path)?;
     let mut nfo: EpisodeNfo = quick_xml::de::from_str(&xml)?;
     nilify(&mut nfo.title);
     nilify(&mut nfo.plot);
@@ -240,7 +254,7 @@ pub enum NfoKind {
 /// Peek at an NFO file's root element to decide what kind of metadata it holds.
 /// Skips XML declaration, comments, and whitespace. Returns None for unknown roots.
 pub fn detect_nfo_kind(path: &Path) -> Option<NfoKind> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = read_nfo_capped(path).ok()?;
     let bytes = text.as_bytes();
     let mut i = 0;
     loop {

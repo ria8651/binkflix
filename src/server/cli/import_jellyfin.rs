@@ -8,7 +8,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 const JF_EPISODE: &str = "MediaBrowser.Controller.Entities.TV.Episode";
 const JF_MOVIE: &str = "MediaBrowser.Controller.Entities.Movies.Movie";
@@ -352,8 +351,12 @@ pub async fn run(jf_path: PathBuf) -> Result<()> {
 }
 
 async fn connect_sqlite(path: &Path, read_only: bool) -> Result<SqlitePool> {
-    let url = format!("sqlite://{}", path.display());
-    let opts = SqliteConnectOptions::from_str(&url)?
+    // Build the connect options directly rather than via the `sqlite://…`
+    // URL form: the URL parser interprets `?` query parameters, so a path
+    // containing literal `?cache=shared&mode=rwc` could override settings
+    // we set later. `filename(path)` takes the path verbatim.
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
         .read_only(read_only)
         .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
