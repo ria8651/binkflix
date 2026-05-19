@@ -55,10 +55,26 @@ const LOGO_SVG: &str = include_str!("../assets/binkflix.svg");
 #[derive(Clone, Copy, Default)]
 pub struct OpenMenu(pub Signal<Option<&'static str>>);
 
+/// Current session info, fetched once from `/api/me` in Shell. Components
+/// read `me.perms` to gate UI on bastion-granted permissions.
+#[derive(Clone, Copy, Default)]
+pub struct MeCtx(pub Signal<Me>);
+
 #[component]
 fn Shell() -> Element {
     crate::syncplay_client::provide_room_context();
     use_context_provider(|| OpenMenu(Signal::new(None)));
+    use_context_provider(|| MeCtx(Signal::new(Me::default())));
+
+    #[cfg(feature = "web")]
+    {
+        let mut me = use_context::<MeCtx>().0;
+        use_future(move || async move {
+            if let Ok(m) = get_me().await {
+                me.set(m);
+            }
+        });
+    }
 
     let mut open_menu = use_context::<OpenMenu>().0;
 
@@ -296,6 +312,14 @@ fn RescanButton() -> Element {
     let mut status = use_signal(ScanProgress::default);
     let mut open_menu = use_context::<OpenMenu>().0;
     let is_open = *open_menu.read() == Some("rescan");
+    let me = use_context::<MeCtx>().0;
+    // Hide the rescan button entirely if bastion hasn't granted this user
+    // `library:write`. Backend already 403s, this just avoids a dead button.
+    // Empty perms = the /api/me fetch hasn't resolved yet OR the user really
+    // doesn't have any perms; in either case keep the button hidden.
+    if !me.read().has_perm("library:write") {
+        return rsx! {};
+    }
 
     // Fetch once on mount, then only poll while a scan is running OR while
     // the menu is open. Previously this polled forever every 3s on every

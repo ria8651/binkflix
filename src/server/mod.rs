@@ -4,6 +4,7 @@
 pub mod analytics;
 pub mod api;
 pub mod auth;
+pub mod bastion_registration;
 pub mod cli;
 pub mod db;
 pub mod error;
@@ -331,6 +332,49 @@ async fn run_async() -> anyhow::Result<()> {
             "bastion auth disabled (set BASTION_ORIGIN to enable); every request is \
              served as the shared 'dev' identity"
         ),
+    }
+
+    if let Some(a) = &auth_state {
+        let pool_for_register = pool.clone();
+        let bastion_origin = a.cfg.bastion_origin.clone();
+        let slug = a.cfg.service_slug.clone();
+        let display_name = "Bastion".to_string();
+        // Best guess: the address we're actually bound to. The browser may
+        // reach us via a different public URL (proxy, reverse proxy, dx
+        // serve's port shim), but this gives the admin a reachable starting
+        // point they can edit in the approval form.
+        let return_url_suggestion = Some(format!("http://{}/auth/bastion", bind));
+        // Don't block startup on bastion being reachable: spawn and let the
+        // poller persist the eventual approval. If the initial call fails the
+        // operator can restart binkflix once bastion is up.
+        tokio::spawn(async move {
+            match bastion_registration::register(
+                &pool_for_register,
+                &bastion_origin,
+                &slug,
+                &display_name,
+                return_url_suggestion.as_deref(),
+                bastion_registration::BINKFLIX_PERMS,
+            )
+            .await
+            {
+                Ok(bastion_registration::RegistrationStatus::Approved) => {}
+                Ok(bastion_registration::RegistrationStatus::Pending) => {
+                    bastion_registration::poll_until_approved(
+                        pool_for_register,
+                        bastion_origin,
+                        slug,
+                    )
+                    .await;
+                }
+                Ok(bastion_registration::RegistrationStatus::Denied) => {
+                    tracing::warn!("bastion: registration denied");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "bastion: registration failed; auth will still work for previously-approved sessions");
+                }
+            }
+        });
     }
 
     let state = AppState {

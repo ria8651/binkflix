@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Returned by `/api/me`. Lets the client gate UI on the same perms the
+/// server enforces.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Me {
+    pub login: String,
+    pub perms: Vec<String>,
+}
+
+impl Me {
+    pub fn has_perm(&self, perm: &str) -> bool {
+        self.perms.iter().any(|p| p == perm)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MovieSummary {
     pub id: String,

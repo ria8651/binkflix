@@ -17,6 +17,7 @@ use tower_http::services::ServeFile;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/me", get(me))
         .route("/api/library", get(library))
         .route("/api/media/{id}", get(media))
         .route("/api/media/{id}/stream", get(super::remux::media_stream))
@@ -119,10 +120,14 @@ async fn scan_status(State(state): State<AppState>) -> Json<crate::types::ScanPr
     Json(state.scan_progress.read().await.clone())
 }
 
-async fn start_scan(State(state): State<AppState>) -> Json<crate::types::ScanProgress> {
+async fn start_scan(
+    State(state): State<AppState>,
+    Extension(session): Extension<super::auth::Session>,
+) -> std::result::Result<Json<crate::types::ScanProgress>, StatusCode> {
+    super::auth::require_perm(&session, "library:write")?;
     // Already running? Just return current status.
     if state.scan_progress.read().await.running {
-        return Json(state.scan_progress.read().await.clone());
+        return Ok(Json(state.scan_progress.read().await.clone()));
     }
     let pool = state.pool.clone();
     let progress = state.scan_progress.clone();
@@ -142,7 +147,7 @@ async fn start_scan(State(state): State<AppState>) -> Json<crate::types::ScanPro
         let _guard = lock.lock().await;
         super::run_scans(&pool, &libs, progress).await;
     });
-    Json(state.scan_progress.read().await.clone())
+    Ok(Json(state.scan_progress.read().await.clone()))
 }
 
 // ---- Syncplay rooms ----
@@ -185,6 +190,13 @@ async fn create_room(
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn me(Extension(session): Extension<super::auth::Session>) -> Json<crate::types::Me> {
+    Json(crate::types::Me {
+        login: session.login.clone(),
+        perms: session.perms.clone(),
+    })
 }
 
 // ---- Library overview ----

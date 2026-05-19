@@ -52,8 +52,11 @@ tempfile = { version = "3", optional = true }
 
 # bastion auth
 jsonwebtoken = { version = "9", optional = true }
+josekit = { version = "0.10", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 axum-extra = { version = "0.10", features = ["cookie", "query"], optional = true }
+data-encoding = { version = "2", optional = true }
+rand = { version = "0.8", optional = true }
 
 # CLI: subcommand dispatch + interactive prompts for `import-jellyfin`.
 clap = { version = "4", features = ["derive"], optional = true }
@@ -75,7 +78,8 @@ server = [
     "dep:tracing", "dep:tracing-subscriber", "dep:tracing-appender",
     "dep:chrono", "dep:uuid", "dep:dashmap", "dep:dotenvy",
     "dep:bytes", "dep:libc", "dep:tempfile",
-    "dep:jsonwebtoken", "dep:reqwest", "dep:axum-extra",
+    "dep:jsonwebtoken", "dep:josekit", "dep:reqwest", "dep:axum-extra",
+    "dep:data-encoding", "dep:rand",
     "dep:clap", "dep:dialoguer",
 ]
 

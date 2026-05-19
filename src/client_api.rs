@@ -39,6 +39,11 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n]) }
 }
 
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub async fn get_me() -> Result<Me, String> {
+    fetch_json("/api/me").await
+}
+
 pub async fn get_library() -> Result<Library, String> {
     fetch_json("/api/library").await
 }

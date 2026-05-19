@@ -57,6 +57,25 @@ pub struct Session {
     pub user_sub: String,
     pub login: String,
     pub created_at: Instant,
+    /// Permissions bastion granted this user for binkflix, frozen at sign-in.
+    /// New perms an admin grants take effect on next login.
+    pub perms: Vec<String>,
+}
+
+impl Session {
+    pub fn has_perm(&self, perm: &str) -> bool {
+        self.perms.iter().any(|p| p == perm)
+    }
+}
+
+/// 403 unless the session carries `perm`. Use in API handlers like:
+///   `auth::require_perm(&session, "library:write")?;`
+pub fn require_perm(session: &Session, perm: &str) -> Result<(), StatusCode> {
+    if session.has_perm(perm) {
+        Ok(())
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 #[derive(Default)]
@@ -126,6 +145,10 @@ struct Claims {
     /// signup but may diverge later (user can rename themselves on bastion).
     username: Option<String>,
     svc: String,
+    /// Per-service permissions bastion has granted this user. Defaulted so
+    /// pre-perms tokens still deserialize.
+    #[serde(default)]
+    perms: Vec<String>,
 }
 
 pub fn router() -> Router<crate::server::AppState> {
@@ -179,6 +202,7 @@ async fn bastion_callback(
     let login_name = claims
         .username
         .unwrap_or_else(|| format!("user:{}", &user_sub[..8.min(user_sub.len())]));
+    let perms = claims.perms.clone();
     let sid = new_sid();
 
     {
@@ -189,6 +213,7 @@ async fn bastion_callback(
                 user_sub: user_sub.clone(),
                 login: login_name.clone(),
                 created_at: Instant::now(),
+                perms,
             },
         );
     }
@@ -266,10 +291,18 @@ pub async fn require_session(
     let Some(auth) = state.auth.as_ref() else {
         super::users::touch(&state.pool, DEV_USER_SUB, DEV_LOGIN).await;
         let mut req = req;
+        // Dev/open mode: full perms so local hacking isn't blocked by
+        // bastion-only authorization checks. Mirrors how `dev` is treated as
+        // an unconditional admin everywhere else.
+        let perms = super::bastion_registration::BINKFLIX_PERMS
+            .iter()
+            .map(|(k, _, _)| (*k).to_string())
+            .collect();
         req.extensions_mut().insert(Session {
             user_sub: DEV_USER_SUB.into(),
             login: DEV_LOGIN.into(),
             created_at: Instant::now(),
+            perms,
         });
         return next.run(req).await;
     };
