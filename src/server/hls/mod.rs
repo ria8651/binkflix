@@ -270,10 +270,14 @@ async fn resolve_plan(
     .ok_or(Error::NotFound)?;
     let src = PathBuf::from(row.0);
 
-    let info = match super::media_info::load(&state.pool, id)
+    // Validate-on-read: if the file changed since we last derived its
+    // probe_json, run the essential pass first so `derive_audio_plan`
+    // indexes the current track list (a stale 1-track list would map a
+    // chosen higher index to nothing → audio dropped).
+    let info = match super::media_info::load_fresh(state, id)
         .await
         .ok()
-        .flatten()
+        .and_then(|f| f.info)
     {
         Some(i) => i,
         None => {

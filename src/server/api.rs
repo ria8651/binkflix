@@ -136,21 +136,39 @@ async fn scan_status(State(state): State<AppState>) -> Json<crate::types::ScanPr
     Json(state.scan_progress.read().await.clone())
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct StartScanParams {
+    /// When `true` and a scan is already running, bump the cancellation
+    /// generation (signalling the active scan to bail at its next
+    /// checkpoint) and queue a fresh scan that will start as soon as the
+    /// old one unwinds + releases `scan_lock`. Plain calls keep today's
+    /// "already running → return status" behaviour.
+    #[serde(default)]
+    restart: bool,
+}
+
 async fn start_scan(
     State(state): State<AppState>,
     Extension(session): Extension<super::auth::Session>,
+    Query(params): Query<StartScanParams>,
 ) -> std::result::Result<Json<crate::types::ScanProgress>, StatusCode> {
     super::auth::require_perm(&session, "library:write")?;
-    // Already running? Just return current status.
-    if state.scan_progress.read().await.running {
+    let already_running = state.scan_progress.read().await.running;
+    if already_running && !params.restart {
         return Ok(Json(state.scan_progress.read().await.clone()));
     }
     let pool = state.pool.clone();
     let progress = state.scan_progress.clone();
     let lock = state.scan_lock.clone();
     let libs = state.libraries.clone();
-    // Mark running immediately so the client sees `running: true` on return.
-    {
+    let gen = state.scan_generation.clone();
+    if params.restart && already_running {
+        gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut p = progress.write().await;
+        p.phase = "restarting".into();
+        p.current = None;
+        p.active.clear();
+    } else {
         let mut p = progress.write().await;
         p.running = true;
         p.phase = "starting".into();
@@ -160,8 +178,13 @@ async fn start_scan(
         p.message = None;
     }
     tokio::spawn(async move {
+        // `lock.lock()` waits for the cancelled scan to release the
+        // mutex naturally — the cancellation checkpoint inside
+        // scan_library_with_progress returns Ok early, run_scans falls
+        // out of its loop, the guard drops, and we proceed.
         let _guard = lock.lock().await;
-        super::run_scans(&pool, &libs, progress).await;
+        let cancel = super::scanner::CancelToken::new(gen);
+        super::run_scans(&pool, &libs, progress, cancel).await;
     });
     Ok(Json(state.scan_progress.read().await.clone()))
 }
@@ -552,12 +575,27 @@ async fn media_subtitle(
 async fn media_tech(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<crate::types::MediaTechInfo>> {
-    // Hit the cached probe first (written at scan time). Fall back to a live
-    // ffprobe if the cache is empty — e.g. scan hasn't reached this row yet,
-    // or the probe failed the first time and we want to retry.
-    if let Some(info) = media_info::load(&state.pool, &id).await.map_err(Error::Other)? {
-        return Ok(Json(info));
+) -> Result<axum::response::Response> {
+    // Validate-on-read: when the file's `(mtime, size)` differs from the
+    // signature this row was last derived against, fire a single-file
+    // refresh before answering. Fixes the "Sonarr swapped the file under
+    // us" case where the audio button still reflects the *old* track list
+    // because `probe_json` was last written before the swap. Empty cache
+    // (scan hasn't reached this row yet, or first probe failed) falls
+    // through to a live probe — same shape as the validated path so the
+    // freshly-stored result also gets a signature stamp on the next scan.
+    let fresh = media_info::load_fresh(&state, &id).await.map_err(Error::Other)?;
+    if let Some(info) = fresh.info {
+        let mut resp = Json(info).into_response();
+        if fresh.refreshed {
+            // Lets the player toast "media file changed — metadata
+            // refreshed" and re-apply the audio/subtitle track lists.
+            resp.headers_mut().insert(
+                "x-binkflix-refreshed",
+                HeaderValue::from_static("1"),
+            );
+        }
+        return Ok(resp);
     }
     let path = lookup(
         &state,
@@ -569,7 +607,7 @@ async fn media_tech(
         .await
         .map_err(Error::Other)?;
     let _ = media_info::store(&state.pool, &id, &info).await;
-    Ok(Json(info))
+    Ok(Json(info).into_response())
 }
 
 async fn media_image(

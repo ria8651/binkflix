@@ -52,6 +52,10 @@ pub struct ScanTiming {
     /// Number of keyframes ffmpeg saw while building the trickplay sprite.
     /// Combined with `duration_ms` this gives an effective average GOP.
     pub keyframe_count: Option<u32>,
+    /// "scan" for a full library pass, "stale_read" for a refresh triggered
+    /// by a consumer noticing the file changed under it. Lets dashboards
+    /// distinguish bulk work from latency the user actually paid.
+    pub trigger: &'static str,
 }
 
 pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming) {
@@ -60,8 +64,8 @@ pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming
             (media_id, scanned_at, probe_ms, subtitles_ms, subtitle_tracks,
              thumbnail_ms, trickplay_ms, save_ms, total_ms,
              video_codec, audio_codec, container, width, height,
-             duration_ms, bitrate_kbps, pixel_format, keyframe_count)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             duration_ms, bitrate_kbps, pixel_format, keyframe_count, trigger)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(media_id)
     .bind(now_secs())
@@ -81,6 +85,7 @@ pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming
     .bind(t.bitrate_kbps.map(|n| n as i64))
     .bind(t.pixel_format)
     .bind(t.keyframe_count.map(|n| n as i64))
+    .bind(t.trigger)
     .execute(pool)
     .await;
     if let Err(e) = res {

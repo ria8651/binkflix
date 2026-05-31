@@ -29,8 +29,10 @@ use crate::types::ScanProgress;
 use axum::Router;
 use dioxus::prelude::{DioxusRouterExt, ServeConfig};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::services::ServeDir;
@@ -58,6 +60,18 @@ pub struct AppState {
     pub hwenc: hls::HwEncoder,
     /// `None` disables bastion auth entirely — set `BASTION_ORIGIN` to enable.
     pub auth: Option<auth::AuthState>,
+    /// Per-media-id reentrancy guard for single-file refreshes. A
+    /// validate-on-read consumer that sees a signature mismatch takes the
+    /// id here before launching `refresh_media_file`; a second concurrent
+    /// reader waits for the lock to drop rather than racing a duplicate
+    /// probe. See [`media_info::load_fresh`].
+    pub refresh_locks: Arc<Mutex<HashSet<String>>>,
+    /// Cooperative-cancellation generation for library scans. The active
+    /// scan captures the current value on start and treats any later
+    /// load() returning a different number as "stop and unwind so the
+    /// restart can take the scan_lock". `start_scan?restart=true` is the
+    /// only writer.
+    pub scan_generation: Arc<AtomicU64>,
 }
 
 /// Permissive CSP that explicitly allows the resources this app uses.
@@ -103,10 +117,13 @@ fn env_or(name: &str, default: &str) -> String {
 
 /// Runs each library scan serially, updating the shared progress handle so
 /// the UI's rescan button has live feedback. Clears `running` when done.
+/// `cancel` lets a restart abort the in-flight work; the scan loop also
+/// honours it between libraries.
 pub async fn run_scans(
     pool: &SqlitePool,
     jobs: &[(i64, PathBuf)],
     progress: scanner::ProgressHandle,
+    cancel: scanner::CancelToken,
 ) {
     let started = std::time::Instant::now();
     // Preserve last_* across runs so the UI can keep showing the previous
@@ -133,7 +150,19 @@ pub async fn run_scans(
     let mut agg = scanner::ScanStats::default();
     let mut err: Option<String> = None;
     for (id, root) in jobs {
-        match scanner::scan_library_with_progress(pool, *id, root, Some(progress.clone())).await {
+        if cancel.is_cancelled() {
+            tracing::info!("scan cancelled between libraries");
+            break;
+        }
+        match scanner::scan_library_with_progress(
+            pool,
+            *id,
+            root,
+            Some(progress.clone()),
+            Some(cancel.clone()),
+        )
+        .await
+        {
             Ok(s) => {
                 agg.movies_indexed += s.movies_indexed;
                 agg.movies_skipped += s.movies_skipped;
@@ -304,15 +333,19 @@ async fn run_async() -> anyhow::Result<()> {
     let scan_progress: scanner::ProgressHandle = Arc::new(RwLock::new(ScanProgress::default()));
     let scan_lock = Arc::new(Mutex::new(()));
     let libraries = Arc::new(scan_jobs.clone());
+    let refresh_locks: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let scan_generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     {
         let scan_pool = pool.clone();
         let progress = scan_progress.clone();
         let lock = scan_lock.clone();
         let jobs = scan_jobs;
+        let gen = scan_generation.clone();
         tokio::spawn(async move {
             let _guard = lock.lock().await;
-            run_scans(&scan_pool, &jobs, progress).await;
+            let cancel = scanner::CancelToken::new(gen);
+            run_scans(&scan_pool, &jobs, progress, cancel).await;
         });
     }
 
@@ -392,6 +425,8 @@ async fn run_async() -> anyhow::Result<()> {
         active_sessions: hls::SessionRegistry::new(),
         hwenc,
         auth: auth_state.clone(),
+        refresh_locks,
+        scan_generation,
     };
 
     // Close any HLS playback sessions left dangling by a previous process

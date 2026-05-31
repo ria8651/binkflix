@@ -370,29 +370,14 @@ fn RescanButton() -> Element {
             button {
                 class: if running { "btn-theme btn-icon scanning" } else { "btn-theme btn-icon" },
                 r#type: "button",
-                aria_label: "Rescan library",
+                aria_label: "Library scan status",
                 title: "{label}",
+                // Topbar icon is status-only: toggles the popover. The
+                // popover hosts the actual scan/restart action so an
+                // accidental click can't kick off a (re)scan.
                 onclick: move |_| {
                     let was_open = is_open;
                     open_menu.set(if was_open { None } else { Some("rescan") });
-                    if !running && !was_open {
-                        // Optimistic local state so the user sees feedback
-                        // even when the scan finishes before the next poll.
-                        let mut w = status.write();
-                        w.running = true;
-                        w.phase = "starting".into();
-                        w.done = 0;
-                        w.total = 0;
-                        w.current = None;
-                        w.message = None;
-                        drop(w);
-                        spawn(async move {
-                            let _ = start_scan().await;
-                            if let Ok(s) = get_scan_status().await {
-                                status.set(s);
-                            }
-                        });
-                    }
                 },
                 span { class: "icon", dangerous_inner_html: ICON_REFRESH }
             }
@@ -450,6 +435,29 @@ fn RescanButton() -> Element {
                             }
                         } else if let Some(cur) = s.current.as_deref() {
                             div { class: "rescan-row muted rescan-current", "{cur}" }
+                        }
+                        // Restart-from-phase-1: cancels the active scan at
+                        // its next checkpoint (between files / between asset
+                        // jobs) and queues a fresh run. Useful when files
+                        // have changed since the current pass started and
+                        // the user wants the new state to reflect everywhere.
+                        button {
+                            class: "rescan-start",
+                            r#type: "button",
+                            onclick: move |_| {
+                                let mut w = status.write();
+                                w.phase = "restarting".into();
+                                w.current = None;
+                                w.active.clear();
+                                drop(w);
+                                spawn(async move {
+                                    let _ = restart_scan().await;
+                                    if let Ok(s) = get_scan_status().await {
+                                        status.set(s);
+                                    }
+                                });
+                            },
+                            "Restart scan"
                         }
                     } else {
                         if let Some(summary) = s.last_summary.as_deref() {

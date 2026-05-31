@@ -127,6 +127,13 @@ pub async fn start_scan() -> Result<ScanProgress, String> {
     post_empty("/api/scan").await
 }
 
+/// Restart variant of [`start_scan`]: signals the in-flight scan to bail
+/// at its next checkpoint and queues a fresh run from phase 1. Plain calls
+/// still no-op when a scan is running.
+pub async fn restart_scan() -> Result<ScanProgress, String> {
+    post_empty("/api/scan?restart=true").await
+}
+
 pub async fn get_continue_watching() -> Result<Vec<ContinueItem>, String> {
     fetch_json("/api/continue-watching").await
 }

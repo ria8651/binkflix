@@ -9,6 +9,7 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -16,6 +17,30 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 pub type ProgressHandle = Arc<RwLock<ScanProgress>>;
+
+/// Cooperative cancellation handle for a library scan. Snapshots the
+/// shared generation counter at construction; `is_cancelled` returns true
+/// once the counter has been bumped (i.e. someone started a new scan).
+///
+/// The scan loop checks this between files and between asset jobs — far
+/// enough apart that the overhead is negligible, tight enough that a
+/// restart takes effect within one file (a fraction of a second on disk,
+/// the duration of the slowest essential-pass probe at the outer bound).
+#[derive(Clone)]
+pub struct CancelToken {
+    counter: Arc<AtomicU64>,
+    my_gen: u64,
+}
+
+impl CancelToken {
+    pub fn new(counter: Arc<AtomicU64>) -> Self {
+        let my_gen = counter.load(Ordering::Acquire);
+        Self { counter, my_gen }
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.counter.load(Ordering::Acquire) != self.my_gen
+    }
+}
 
 /// Bump `SHOW_SCAN_VERSION` / `MEDIA_SCAN_VERSION` whenever the corresponding
 /// `upsert_*` function changes what it persists — e.g. starts writing a new
@@ -284,13 +309,14 @@ pub async fn ensure_library(pool: &SqlitePool, name: &str, path: &Path) -> anyho
 
 /// Work item carried from the index pass into the asset pass. Each
 /// `needs_*` flag gates its own pass — a job can need just one asset
-/// re-extracted, not all three.
+/// re-extracted, not all three. `needs_essential` covers probe +
+/// probe_json + subtitles + content-signature stamp.
 struct AssetJob {
     media_id: String,
     video: PathBuf,
     title: String,
     has_sidecar_image: bool,
-    needs_subtitles: bool,
+    needs_essential: bool,
     needs_thumbnails: bool,
     needs_trickplay: bool,
 }
@@ -347,6 +373,7 @@ pub async fn scan_library_with_progress(
     library_id: i64,
     root: &Path,
     progress: Option<ProgressHandle>,
+    cancel: Option<CancelToken>,
 ) -> anyhow::Result<ScanStats> {
     let started = std::time::Instant::now();
     info!(path = %root.display(), "scanning library");
@@ -399,6 +426,13 @@ pub async fn scan_library_with_progress(
     // canonical resolution would land verbatim in `media.path` and be
     // served back via `/api/media/{id}/stream`. Don't follow.
     for entry in WalkDir::new(&root).follow_links(false).into_iter().flatten() {
+        if let Some(c) = &cancel {
+            if c.is_cancelled() {
+                info!("scan cancelled mid-walk");
+                walk_completed = false;
+                break;
+            }
+        }
         let path = entry.path();
         if !entry.file_type().is_file() || !is_video(path) {
             continue;
@@ -467,7 +501,7 @@ pub async fn scan_library_with_progress(
         };
 
         if let Some(out) = outcome {
-            if out.needs_subtitles || out.needs_thumbnails || out.needs_trickplay {
+            if out.needs_essential || out.needs_thumbnails || out.needs_trickplay {
                 let title = abs
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -478,7 +512,7 @@ pub async fn scan_library_with_progress(
                     video: abs,
                     title,
                     has_sidecar_image: out.has_sidecar_image,
-                    needs_subtitles: out.needs_subtitles,
+                    needs_essential: out.needs_essential,
                     needs_thumbnails: out.needs_thumbnails,
                     needs_trickplay: out.needs_trickplay,
                 });
@@ -524,30 +558,30 @@ pub async fn scan_library_with_progress(
         let pool = pool.clone();
         let progress = progress.clone();
 
-        // Per-file accumulator carried through the four passes. We capture
-        // each stage's elapsed_ms here and INSERT one `scan_timings` row at
-        // the end so the row is whole rather than written piecemeal.
-        // Per-file accumulator threaded through the four passes. `save_ms`
-        // is computed inline in pass 4 (no need to store).
+        // Per-file accumulator threaded between the three asset passes.
+        // `tech_info` is captured in pass 1 (essential) so pass 2/3 don't
+        // need to re-probe — they reuse codec/resolution/duration for
+        // analytics and for `trickplay::scan_for_media`'s duration hint.
+        // Each pass writes its own `scan_timings` row inline (tagged by
+        // `trigger`) so a mid-scan restart only loses the actively-running
+        // pass for in-flight files instead of every per-file row that
+        // hadn't yet reached a final "save" pass.
         struct PerFile {
             job: AssetJob,
             tech_info: Option<crate::types::MediaTechInfo>,
-            sub_tracks: u32,
-            probe_ms: u64,
-            subtitles_ms: u64,
-            thumbnail_ms: u64,
-            trickplay_ms: u64,
-            keyframe_count: Option<u32>,
-            started: std::time::Instant,
         }
 
-        // -- Pass 1: probe + subtitles -----------------------------------
-        let subtitles_total = asset_jobs.iter().filter(|j| j.needs_subtitles).count();
+        // -- Pass 1: probe + subtitles + content signature ----------------
+        // Calls the shared `run_essential` helper so the validate-on-read
+        // refresh path and the library scan stay aligned. The signature
+        // gets stamped inside that helper; pass-2/3 still consult the
+        // per-job needs flags.
+        let essential_total = asset_jobs.iter().filter(|j| j.needs_essential).count();
         if let Some(p) = &progress {
             set_progress(p, |s| {
                 s.phase = "subtitles".into();
                 s.done = 0;
-                s.total = subtitles_total;
+                s.total = essential_total;
                 s.current = None;
                 s.active.clear();
             })
@@ -559,58 +593,21 @@ pub async fn scan_library_with_progress(
                 let pool = pool.clone();
                 let progress = progress.clone();
                 let done = done_p1.clone();
+                let cancel = cancel.clone();
                 async move {
-                    let started = std::time::Instant::now();
-                    if !job.needs_subtitles {
-                        return PerFile {
-                            job,
-                            tech_info: None,
-                            sub_tracks: 0,
-                            probe_ms: 0,
-                            subtitles_ms: 0,
-                            thumbnail_ms: 0,
-                            trickplay_ms: 0,
-                            keyframe_count: None,
-                            started,
-                        };
+                    let skip = !job.needs_essential
+                        || cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false);
+                    if skip {
+                        return PerFile { job, tech_info: None };
                     }
                     if let Some(p) = &progress {
                         add_active(p, &job.media_id, &job.title, "subtitles").await;
                     }
-                    let t = std::time::Instant::now();
-                    let (tech_info, embedded_subs) = match super::media_info::probe_full(&job.video).await {
-                        Ok(pair) => (Some(pair.0), pair.1),
-                        Err(e) => {
-                            warn!(media_id = %job.media_id, %e, "ffprobe failed");
-                            (None, Vec::new())
-                        }
-                    };
-                    let probe_ms = t.elapsed().as_millis() as u64;
+                    let started = std::time::Instant::now();
+                    let outcome = run_essential(&pool, &job.media_id, &job.video).await;
+                    let total_ms = started.elapsed().as_millis() as u64;
 
-                    let t = std::time::Instant::now();
-                    let sub_count = match subtitles::scan_for_media(&pool, &job.media_id, &job.video, &embedded_subs).await {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!(media_id = %job.media_id, %e, "subtitle scan failed");
-                            0
-                        }
-                    };
-                    let subtitles_ms = t.elapsed().as_millis() as u64;
-
-                    // Bump the per-row version unconditionally — matches today's
-                    // policy where `scan_version` was written at upsert time
-                    // regardless of whether asset extraction succeeded. Failures
-                    // don't auto-retry; the user re-triggers with a version bump.
-                    if let Err(e) = sqlx::query(
-                        "UPDATE media SET subtitles_version = ? WHERE id = ?",
-                    )
-                    .bind(SUBTITLES_VERSION)
-                    .bind(&job.media_id)
-                    .execute(&pool)
-                    .await
-                    {
-                        warn!(media_id = %job.media_id, %e, "failed to update subtitles_version");
-                    }
+                    record_essential_timing(&pool, &job.media_id, &outcome, total_ms).await;
 
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
@@ -624,30 +621,20 @@ pub async fn scan_library_with_progress(
                         .await;
                     }
                     debug!(
-                        progress = format!("{n}/{subtitles_total}"),
+                        progress = format!("{n}/{essential_total}"),
                         title = %job.title,
-                        subs = sub_count,
-                        elapsed_ms = subtitles_ms,
+                        subs = outcome.sub_tracks,
+                        elapsed_ms = outcome.subtitles_ms,
                         "subtitles done",
                     );
-                    PerFile {
-                        job,
-                        tech_info,
-                        sub_tracks: embedded_subs.len() as u32,
-                        probe_ms,
-                        subtitles_ms,
-                        thumbnail_ms: 0,
-                        trickplay_ms: 0,
-                        keyframe_count: None,
-                        started,
-                    }
+                    PerFile { job, tech_info: outcome.tech_info }
                 }
             })
             .buffer_unordered(concurrency)
             .collect()
             .await;
         info!(
-            total = subtitles_total,
+            total = essential_total,
             elapsed_ms = assets_started.elapsed().as_millis() as u64,
             "subtitles pass complete",
         );
@@ -665,25 +652,30 @@ pub async fn scan_library_with_progress(
         }
         let done_p2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pass2: Vec<PerFile> = stream::iter(pass1.into_iter())
-            .map(|mut f| {
+            .map(|f| {
                 let pool = pool.clone();
                 let progress = progress.clone();
                 let done = done_p2.clone();
+                let cancel = cancel.clone();
                 async move {
-                    if !f.job.needs_thumbnails {
+                    if !f.job.needs_thumbnails
+                        || cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false)
+                    {
                         return f;
                     }
                     // Sidecar rows skip ffmpeg but still bump the version, so
                     // a future THUMBNAILS_VERSION bump doesn't permanently
                     // re-trip them. API endpoints prefer image_path anyway.
-                    if !f.job.has_sidecar_image {
+                    let thumbnail_ms = if f.job.has_sidecar_image {
+                        0
+                    } else {
                         if let Some(p) = &progress {
                             add_active(p, &f.job.media_id, &f.job.title, "thumbnail").await;
                         }
                         let t = std::time::Instant::now();
                         thumbnails::scan_for_media(&pool, &f.job.media_id, &f.job.video).await;
-                        f.thumbnail_ms = t.elapsed().as_millis() as u64;
-                    }
+                        t.elapsed().as_millis() as u64
+                    };
                     if let Err(e) = sqlx::query(
                         "UPDATE media SET thumbnails_version = ? WHERE id = ?",
                     )
@@ -694,6 +686,13 @@ pub async fn scan_library_with_progress(
                     {
                         warn!(media_id = %f.job.media_id, %e, "failed to update thumbnails_version");
                     }
+                    record_thumbnail_timing(
+                        &pool,
+                        &f.job.media_id,
+                        f.tech_info.as_ref(),
+                        thumbnail_ms,
+                    )
+                    .await;
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = f.job.title.clone();
@@ -729,21 +728,24 @@ pub async fn scan_library_with_progress(
             .await;
         }
         let done_p3 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pass3: Vec<PerFile> = stream::iter(pass2.into_iter())
-            .map(|mut f| {
+        stream::iter(pass2.into_iter())
+            .map(|f| {
                 let pool = pool.clone();
                 let progress = progress.clone();
                 let done = done_p3.clone();
+                let cancel = cancel.clone();
                 async move {
-                    if !f.job.needs_trickplay {
-                        return f;
+                    if !f.job.needs_trickplay
+                        || cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false)
+                    {
+                        return;
                     }
                     if let Some(p) = &progress {
                         add_active(p, &f.job.media_id, &f.job.title, "trickplay").await;
                     }
                     // Duration normally comes from pass-1's probe. When only
                     // trickplay is stale (pass 1 was skipped), fall back to
-                    // the cached tech_info — the file is unchanged by
+                    // the cached probe data — the file is unchanged by
                     // definition, so the stored value is authoritative.
                     let duration = match f.tech_info.as_ref().and_then(|i| i.duration_seconds) {
                         Some(d) => Some(d),
@@ -753,14 +755,14 @@ pub async fn scan_library_with_progress(
                         },
                     };
                     let t = std::time::Instant::now();
-                    f.keyframe_count = trickplay::scan_for_media(
+                    let keyframe_count = trickplay::scan_for_media(
                         &pool,
                         &f.job.media_id,
                         &f.job.video,
                         duration,
                     )
                     .await;
-                    f.trickplay_ms = t.elapsed().as_millis() as u64;
+                    let trickplay_ms = t.elapsed().as_millis() as u64;
                     if let Err(e) = sqlx::query(
                         "UPDATE media SET trickplay_version = ? WHERE id = ?",
                     )
@@ -771,102 +773,14 @@ pub async fn scan_library_with_progress(
                     {
                         warn!(media_id = %f.job.media_id, %e, "failed to update trickplay_version");
                     }
-                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if let Some(p) = &progress {
-                        let title = f.job.title.clone();
-                        let media_id = f.job.media_id.clone();
-                        set_progress(p, |s| {
-                            s.done = n;
-                            s.current = Some(title);
-                            s.active.retain(|j| j.media_id != media_id);
-                        })
-                        .await;
-                    }
-                    f
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
-
-        // -- Pass 4: save tech info + record scan_timings -----------------
-        if let Some(p) = &progress {
-            set_progress(p, |s| {
-                s.phase = "saving".into();
-                s.done = 0;
-                s.total = pass3.len();
-                s.active.clear();
-            })
-            .await;
-        }
-        let done_p4 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        stream::iter(pass3.into_iter())
-            .map(|mut f| {
-                let pool = pool.clone();
-                let progress = progress.clone();
-                let done = done_p4.clone();
-                async move {
-                    if let Some(p) = &progress {
-                        add_active(p, &f.job.media_id, &f.job.title, "saving").await;
-                    }
-                    // Pull source-side fields out before the `take()` below
-                    // hands ownership of `tech_info` to media_info::store.
-                    // Default audio = the track flagged `default`, else the
-                    // first one, mirroring how compute_compat picks it.
-                    let (
-                        video_codec, audio_codec, container,
-                        width, height, duration_ms, bitrate_kbps, pixel_format,
-                    ) = match f.tech_info.as_ref() {
-                        Some(info) => {
-                            let v = info.video.as_ref();
-                            let a = info.audio.iter().find(|a| a.default).or_else(|| info.audio.first());
-                            (
-                                v.map(|v| v.codec.clone()),
-                                a.map(|a| a.codec.clone()),
-                                info.container.clone(),
-                                v.and_then(|v| v.width),
-                                v.and_then(|v| v.height),
-                                info.duration_seconds.map(|s| (s * 1000.0) as u64),
-                                info.bitrate_kbps,
-                                v.and_then(|v| v.pix_fmt.clone()),
-                            )
-                        }
-                        None => (None, None, None, None, None, None, None, None),
-                    };
-
-                    let t = std::time::Instant::now();
-                    if let Some(info) = f.tech_info.take() {
-                        if let Err(e) = super::media_info::store(&pool, &f.job.media_id, &info).await {
-                            warn!(media_id = %f.job.media_id, %e, "failed to cache tech info");
-                        }
-                    }
-                    let save_ms = t.elapsed().as_millis() as u64;
-
-                    let total_ms = f.started.elapsed().as_millis() as u64;
-                    analytics::record_scan_timing(
+                    record_trickplay_timing(
                         &pool,
                         &f.job.media_id,
-                        ScanTiming {
-                            probe_ms: f.probe_ms,
-                            subtitles_ms: f.subtitles_ms,
-                            subtitle_tracks: f.sub_tracks,
-                            thumbnail_ms: f.thumbnail_ms,
-                            trickplay_ms: f.trickplay_ms,
-                            save_ms,
-                            total_ms,
-                            video_codec,
-                            audio_codec,
-                            container,
-                            width,
-                            height,
-                            duration_ms,
-                            bitrate_kbps,
-                            pixel_format,
-                            keyframe_count: f.keyframe_count,
-                        },
+                        f.tech_info.as_ref(),
+                        trickplay_ms,
+                        keyframe_count,
                     )
                     .await;
-
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = f.job.title.clone();
@@ -879,9 +793,9 @@ pub async fn scan_library_with_progress(
                         .await;
                     }
                     info!(
-                        progress = format!("{n}/{total}"),
+                        progress = format!("{n}/{trickplay_total}"),
                         title = %f.job.title,
-                        elapsed_ms = total_ms,
+                        elapsed_ms = trickplay_ms,
                         "assets extracted",
                     );
                 }
@@ -1027,6 +941,376 @@ async fn prune_missing(
     }
 
     Ok(removed)
+}
+
+// --- single-file essential + cosmetic refresh (shared by scan + validate-on-read) ---
+
+/// Result of a single-file essential-pass derivation — i.e. the things we
+/// need on disk *before* playback (probe_json, subtitles) plus the content
+/// signature. The library scan keeps these around to feed pass 4's
+/// analytics row; the single-file refresh logs them inline and drops them.
+pub struct EssentialOutcome {
+    pub tech_info: Option<crate::types::MediaTechInfo>,
+    pub sub_tracks: u32,
+    pub probe_ms: u64,
+    pub subtitles_ms: u64,
+    /// `(mtime, size)` captured at the start of the essential pass — what
+    /// we stamp on the row at the end, so any change *during* the probe
+    /// forces another refresh on the next read.
+    pub signature: (i64, i64),
+}
+
+/// Run the essential pass for one file: probe, persist `probe_json`,
+/// (re)extract subtitles, bump `subtitles_version`, stamp the content
+/// signature. The signature is captured *before* the probe so a file swap
+/// during the probe naturally re-triggers on the next read. Logs but
+/// doesn't return individual extractor errors — failure to extract
+/// subtitles still produces an outcome (the audio button will still work).
+async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> EssentialOutcome {
+    let signature = stat_signature(video);
+
+    let t = std::time::Instant::now();
+    let (tech_info, embedded_subs) = match super::media_info::probe_full(video).await {
+        Ok(pair) => (Some(pair.0), pair.1),
+        Err(e) => {
+            warn!(%media_id, %e, "ffprobe failed");
+            (None, Vec::new())
+        }
+    };
+    let probe_ms = t.elapsed().as_millis() as u64;
+
+    if let Some(info) = tech_info.as_ref() {
+        if let Err(e) = super::media_info::store(pool, media_id, info).await {
+            warn!(%media_id, %e, "failed to cache tech info");
+        }
+    }
+
+    let t = std::time::Instant::now();
+    if let Err(e) = subtitles::scan_for_media(pool, media_id, video, &embedded_subs).await {
+        warn!(%media_id, %e, "subtitle scan failed");
+    }
+    let subtitles_ms = t.elapsed().as_millis() as u64;
+
+    // Bump the per-row version unconditionally — matches today's policy where
+    // version was written at upsert time regardless of whether asset
+    // extraction succeeded. Failures don't auto-retry; the user re-triggers
+    // with a version bump.
+    if let Err(e) = sqlx::query(
+        "UPDATE media SET subtitles_version = ?,
+                          content_mtime    = ?,
+                          content_size     = ?
+         WHERE id = ?",
+    )
+    .bind(SUBTITLES_VERSION)
+    .bind(signature.0)
+    .bind(signature.1)
+    .bind(media_id)
+    .execute(pool)
+    .await
+    {
+        warn!(%media_id, %e, "failed to stamp content signature / subtitles_version");
+    }
+
+    EssentialOutcome {
+        tech_info,
+        sub_tracks: embedded_subs.len() as u32,
+        probe_ms,
+        subtitles_ms,
+        signature,
+    }
+}
+
+/// (mtime_secs, file_size) for `video`. Both zero if the file isn't
+/// readable — the caller still stamps that signature so a later read
+/// sees the mismatch and re-triggers.
+fn stat_signature(video: &Path) -> (i64, i64) {
+    match std::fs::metadata(video) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            (mtime, m.len() as i64)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+/// Pulled out so every `scan_timings` insert (essential, thumbnail,
+/// trickplay, stale_read) carries the same source-side columns and a
+/// later analyst can correlate per-stage timings against codec /
+/// resolution / bitrate without re-probing.
+struct SourceFields {
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    container: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_ms: Option<u64>,
+    bitrate_kbps: Option<u64>,
+    pixel_format: Option<String>,
+}
+
+fn source_fields(info: Option<&crate::types::MediaTechInfo>) -> SourceFields {
+    let Some(info) = info else {
+        return SourceFields {
+            video_codec: None,
+            audio_codec: None,
+            container: None,
+            width: None,
+            height: None,
+            duration_ms: None,
+            bitrate_kbps: None,
+            pixel_format: None,
+        };
+    };
+    let v = info.video.as_ref();
+    // Default audio = the track flagged `default`, else the first,
+    // matching how `compute_compat` picks one for the verdict.
+    let a = info
+        .audio
+        .iter()
+        .find(|a| a.default)
+        .or_else(|| info.audio.first());
+    SourceFields {
+        video_codec: v.map(|v| v.codec.clone()),
+        audio_codec: a.map(|a| a.codec.clone()),
+        container: info.container.clone(),
+        width: v.and_then(|v| v.width),
+        height: v.and_then(|v| v.height),
+        duration_ms: info.duration_seconds.map(|s| (s * 1000.0) as u64),
+        bitrate_kbps: info.bitrate_kbps,
+        pixel_format: v.and_then(|v| v.pix_fmt.clone()),
+    }
+}
+
+/// Per-pass `scan_timings` write — one row per pass per file, so a
+/// mid-scan restart only loses the actively-running pass for in-flight
+/// files instead of the whole per-file accumulator (the old pass-4 design
+/// dropped everything not yet "saved"). The `trigger` tag identifies the
+/// pass; non-applicable timing columns are 0.
+async fn record_essential_timing(
+    pool: &SqlitePool,
+    media_id: &str,
+    outcome: &EssentialOutcome,
+    total_ms: u64,
+) {
+    let s = source_fields(outcome.tech_info.as_ref());
+    analytics::record_scan_timing(
+        pool,
+        media_id,
+        ScanTiming {
+            probe_ms: outcome.probe_ms,
+            subtitles_ms: outcome.subtitles_ms,
+            subtitle_tracks: outcome.sub_tracks,
+            thumbnail_ms: 0,
+            trickplay_ms: 0,
+            save_ms: 0,
+            total_ms,
+            video_codec: s.video_codec,
+            audio_codec: s.audio_codec,
+            container: s.container,
+            width: s.width,
+            height: s.height,
+            duration_ms: s.duration_ms,
+            bitrate_kbps: s.bitrate_kbps,
+            pixel_format: s.pixel_format,
+            keyframe_count: None,
+            trigger: "scan_essential",
+        },
+    )
+    .await;
+}
+
+async fn record_thumbnail_timing(
+    pool: &SqlitePool,
+    media_id: &str,
+    info: Option<&crate::types::MediaTechInfo>,
+    thumbnail_ms: u64,
+) {
+    let s = source_fields(info);
+    analytics::record_scan_timing(
+        pool,
+        media_id,
+        ScanTiming {
+            probe_ms: 0,
+            subtitles_ms: 0,
+            subtitle_tracks: 0,
+            thumbnail_ms,
+            trickplay_ms: 0,
+            save_ms: 0,
+            total_ms: thumbnail_ms,
+            video_codec: s.video_codec,
+            audio_codec: s.audio_codec,
+            container: s.container,
+            width: s.width,
+            height: s.height,
+            duration_ms: s.duration_ms,
+            bitrate_kbps: s.bitrate_kbps,
+            pixel_format: s.pixel_format,
+            keyframe_count: None,
+            trigger: "scan_thumbnail",
+        },
+    )
+    .await;
+}
+
+async fn record_trickplay_timing(
+    pool: &SqlitePool,
+    media_id: &str,
+    info: Option<&crate::types::MediaTechInfo>,
+    trickplay_ms: u64,
+    keyframe_count: Option<u32>,
+) {
+    let s = source_fields(info);
+    analytics::record_scan_timing(
+        pool,
+        media_id,
+        ScanTiming {
+            probe_ms: 0,
+            subtitles_ms: 0,
+            subtitle_tracks: 0,
+            thumbnail_ms: 0,
+            trickplay_ms,
+            save_ms: 0,
+            total_ms: trickplay_ms,
+            video_codec: s.video_codec,
+            audio_codec: s.audio_codec,
+            container: s.container,
+            width: s.width,
+            height: s.height,
+            duration_ms: s.duration_ms,
+            bitrate_kbps: s.bitrate_kbps,
+            pixel_format: s.pixel_format,
+            keyframe_count,
+            trigger: "scan_trickplay",
+        },
+    )
+    .await;
+}
+
+/// Access-triggered single-file refresh: re-runs the essential pass on
+/// `media_id`'s current path, stamps the content signature, and records
+/// a `scan_timings` row with `trigger='stale_read'`. Updates the global
+/// scan-status channel briefly so the UI surfaces the refresh as a
+/// mini-scan.
+///
+/// Caller is responsible for de-duplicating concurrent refreshes for the
+/// same `media_id` (see `AppState::refresh_locks`). Returns `Ok(false)` if
+/// the media row is missing or soft-deleted.
+pub async fn refresh_media_file(
+    pool: &SqlitePool,
+    progress: Option<&ProgressHandle>,
+    media_id: &str,
+) -> anyhow::Result<bool> {
+    let row: Option<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT path, title, content_mtime, content_size
+         FROM media WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(media_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((path, title, old_m, old_s)) = row else {
+        return Ok(false);
+    };
+    let video = PathBuf::from(&path);
+
+    if let Some(p) = progress {
+        add_active(p, media_id, &title, "refreshing").await;
+    }
+
+    let started = std::time::Instant::now();
+    let outcome = run_essential(pool, media_id, &video).await;
+    let total_ms = started.elapsed().as_millis() as u64;
+
+    info!(
+        %media_id,
+        title,
+        old_mtime = ?old_m,
+        old_size = ?old_s,
+        new_mtime = outcome.signature.0,
+        new_size = outcome.signature.1,
+        trigger = "stale_read",
+        "single-file refresh complete",
+    );
+
+    let s = source_fields(outcome.tech_info.as_ref());
+    analytics::record_scan_timing(
+        pool,
+        media_id,
+        ScanTiming {
+            probe_ms: outcome.probe_ms,
+            subtitles_ms: outcome.subtitles_ms,
+            subtitle_tracks: outcome.sub_tracks,
+            thumbnail_ms: 0,
+            trickplay_ms: 0,
+            save_ms: 0,
+            total_ms,
+            video_codec: s.video_codec,
+            audio_codec: s.audio_codec,
+            container: s.container,
+            width: s.width,
+            height: s.height,
+            duration_ms: s.duration_ms,
+            bitrate_kbps: s.bitrate_kbps,
+            pixel_format: s.pixel_format,
+            keyframe_count: None,
+            trigger: "stale_read",
+        },
+    )
+    .await;
+
+    if let Some(p) = progress {
+        let mid = media_id.to_string();
+        set_progress(p, |s| {
+            s.active.retain(|j| j.media_id != mid);
+        })
+        .await;
+    }
+
+    Ok(true)
+}
+
+/// Background companion to [`refresh_media_file`]: regenerate the
+/// cosmetic assets (thumbnail + trickplay sprite) for a single media row.
+/// Run after a stale-read refresh has updated the essential data so the
+/// in-flight read could return immediately. Best-effort: failures are
+/// logged and swallowed.
+pub async fn refresh_media_assets(pool: &SqlitePool, media_id: &str) {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT path, image_path FROM media WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(media_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((path, image_path)) = row else {
+        return;
+    };
+    let video = PathBuf::from(&path);
+
+    if image_path.is_none() {
+        thumbnails::scan_for_media(pool, media_id, &video).await;
+    }
+    let _ = sqlx::query("UPDATE media SET thumbnails_version = ? WHERE id = ?")
+        .bind(THUMBNAILS_VERSION)
+        .bind(media_id)
+        .execute(pool)
+        .await;
+
+    let duration = match super::media_info::load(pool, media_id).await {
+        Ok(Some(info)) => info.duration_seconds,
+        _ => None,
+    };
+    trickplay::scan_for_media(pool, media_id, &video, duration).await;
+    let _ = sqlx::query("UPDATE media SET trickplay_version = ? WHERE id = ?")
+        .bind(TRICKPLAY_VERSION)
+        .bind(media_id)
+        .execute(pool)
+        .await;
 }
 
 // --- upserts ---
@@ -1175,8 +1459,14 @@ async fn upsert_show(
 ///
 /// `re_indexed` reflects whether the metadata row was re-upserted (drives
 /// the indexed/skipped stats). Each `needs_*` flag is independent and gates
-/// exactly one asset pass: true when the file changed OR the matching
-/// `*_VERSION` constant is newer than the row's stored version.
+/// exactly one asset pass: `needs_essential` covers probe+probe_json+subtitles
+/// (and stamps the content signature); the other two cover their named
+/// passes. A flag fires when the file content changed (signature mismatch
+/// or unknown) OR the matching `*_VERSION` constant is newer than the
+/// row's stored version — except thumbnails/trickplay don't fire on a
+/// content-signature *unknown* row (forward-only repair: pre-fix rows
+/// essential-refresh but don't trigger a library-wide trickplay storm).
+///
 /// `has_sidecar_image` lets pass 2 skip thumbnail generation when the
 /// library already supplies one (but the version is still bumped, so the
 /// row doesn't permanently re-trip).
@@ -1184,7 +1474,7 @@ pub struct UpsertOutcome {
     pub id: String,
     pub has_sidecar_image: bool,
     pub re_indexed: bool,
-    pub needs_subtitles: bool,
+    pub needs_essential: bool,
     pub needs_thumbnails: bool,
     pub needs_trickplay: bool,
 }
@@ -1248,52 +1538,81 @@ async fn upsert_episode(
     let nfo_path = video.with_extension("nfo");
     let nfo_opt = nfo_path.is_file().then_some(nfo_path);
 
-    type ExistingRow = (String, String, i64, i64, Option<String>, i64, i64, i64);
+    type ExistingRow = (
+        String,
+        String,
+        i64,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    );
     let existing: Option<ExistingRow> = sqlx::query_as(
         "SELECT id, scanned_at, file_size, scan_version, deleted_at,
-                subtitles_version, thumbnails_version, trickplay_version
+                subtitles_version, thumbnails_version, trickplay_version,
+                content_mtime, content_size
          FROM media WHERE path = ?",
     )
     .bind(&path_str)
     .fetch_optional(pool)
     .await?;
 
-    // Compute staleness flags. file_changed invalidates all assets; per-asset
-    // version mismatches invalidate just that pass. metadata_stale forces a
-    // re-upsert without re-extracting anything.
-    let (file_changed, metadata_stale, needs_subtitles, needs_thumbnails, needs_trickplay) =
-        if let Some((_, scanned_at, existing_size, scan_version, deleted_at, sv, tv, pv)) = &existing {
-            let mut sources: Vec<&Path> = vec![video];
+    // Compute staleness via the content signature (mtime,size) — bidirectional
+    // so an in-place file swap with a preserved/backdated mtime is detected.
+    // `content_unknown` covers pre-fix rows: the essential pass runs to backfill the
+    // signature, but the heavier cosmetic passes don't fire (forward-only
+    // repair — avoids a library-wide trickplay storm after the migration).
+    // Sidecar-only sources (NFO + parent dir mtime) still force a metadata
+    // re-upsert through the existing `any_newer_than` path; the video itself
+    // is covered by the signature.
+    let (file_changed, metadata_stale, needs_essential, needs_thumbnails, needs_trickplay) =
+        if let Some((_, scanned_at, _existing_size, scan_version, deleted_at, sv, tv, pv, cm, cs)) =
+            &existing
+        {
+            let mut sidecar_sources: Vec<&Path> = Vec::new();
             if let Some(n) = nfo_opt.as_ref() {
-                sources.push(n);
+                sidecar_sources.push(n);
             }
-            // Parent dir mtime catches sidecar thumb add/remove.
             if let Some(parent) = video.parent() {
-                sources.push(parent);
+                sidecar_sources.push(parent);
             }
-            let file_changed = deleted_at.is_some()
-                || *existing_size != file_size
-                || any_newer_than(&sources, scanned_at);
+            let stored_sig: Option<(i64, i64)> = match (cm, cs) {
+                (Some(m), Some(s)) => Some((*m, *s)),
+                _ => None,
+            };
+            let cur_sig = (mtime_secs(video), file_size);
+            let content_changed =
+                stored_sig.is_some() && stored_sig != Some(cur_sig);
+            let content_unknown = stored_sig.is_none();
+            let sidecars_changed = any_newer_than(&sidecar_sources, scanned_at);
+            let file_changed =
+                deleted_at.is_some() || content_changed || sidecars_changed;
             let metadata_stale = *scan_version != MEDIA_SCAN_VERSION;
             (
                 file_changed,
                 metadata_stale,
-                file_changed || *sv < SUBTITLES_VERSION,
-                file_changed || *tv < THUMBNAILS_VERSION,
-                file_changed || *pv < TRICKPLAY_VERSION,
+                deleted_at.is_some()
+                    || content_changed
+                    || content_unknown
+                    || *sv < SUBTITLES_VERSION,
+                deleted_at.is_some() || content_changed || *tv < THUMBNAILS_VERSION,
+                deleted_at.is_some() || content_changed || *pv < TRICKPLAY_VERSION,
             )
         } else {
             // New row — treat as fully stale so every pass runs.
             (true, true, true, true, true)
         };
 
-    if !file_changed && !metadata_stale && !needs_subtitles && !needs_thumbnails && !needs_trickplay {
+    if !file_changed && !metadata_stale && !needs_essential && !needs_thumbnails && !needs_trickplay {
         let id = existing.as_ref().map(|r| r.0.clone()).unwrap_or_default();
         return Ok(Some(UpsertOutcome {
             id,
             has_sidecar_image: find_episode_thumb(video).is_some(),
             re_indexed: false,
-            needs_subtitles: false,
+            needs_essential: false,
             needs_thumbnails: false,
             needs_trickplay: false,
         }));
@@ -1399,7 +1718,7 @@ async fn upsert_episode(
         id,
         has_sidecar_image: thumb.is_some(),
         re_indexed: true,
-        needs_subtitles,
+        needs_essential,
         needs_thumbnails,
         needs_trickplay,
     }))
@@ -1415,53 +1734,76 @@ async fn upsert_movie(
     let base = video.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
     let nfo_path = matching_nfo(video);
 
-    type ExistingRow = (String, String, i64, i64, Option<String>, i64, i64, i64);
+    type ExistingRow = (
+        String,
+        String,
+        i64,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    );
     let existing: Option<ExistingRow> = sqlx::query_as(
         "SELECT id, scanned_at, file_size, scan_version, deleted_at,
-                subtitles_version, thumbnails_version, trickplay_version
+                subtitles_version, thumbnails_version, trickplay_version,
+                content_mtime, content_size
          FROM media WHERE path = ?",
     )
     .bind(&path_str)
     .fetch_optional(pool)
     .await?;
 
-    // The video, the NFO, and any sidecar (poster / fanart / thumb) all
-    // affect what we'd write to the DB. Tracking the parent directory's
-    // mtime in addition to the video covers sidecar add/remove/replace —
-    // most filesystems bump the dir's mtime when a child is added or
-    // deleted, so we don't have to enumerate every possible sidecar
-    // candidate path.
-    let (file_changed, metadata_stale, needs_subtitles, needs_thumbnails, needs_trickplay) =
-        if let Some((_, scanned_at, existing_size, scan_version, deleted_at, sv, tv, pv)) = &existing {
-            let mut sources: Vec<&Path> = vec![video];
+    // Same logic as upsert_episode: bidirectional (mtime,size) signature for
+    // the video, sidecar mtime check for NFO / poster / fanart / thumb (the
+    // parent dir's mtime bumps when any sidecar is added or removed on most
+    // filesystems).
+    let (file_changed, metadata_stale, needs_essential, needs_thumbnails, needs_trickplay) =
+        if let Some((_, scanned_at, _existing_size, scan_version, deleted_at, sv, tv, pv, cm, cs)) =
+            &existing
+        {
+            let mut sidecar_sources: Vec<&Path> = Vec::new();
             if let Some(n) = nfo_path.as_ref() {
-                sources.push(n);
+                sidecar_sources.push(n);
             }
             if let Some(parent) = video.parent() {
-                sources.push(parent);
+                sidecar_sources.push(parent);
             }
-            let file_changed = deleted_at.is_some()
-                || *existing_size != file_size
-                || any_newer_than(&sources, scanned_at);
+            let stored_sig: Option<(i64, i64)> = match (cm, cs) {
+                (Some(m), Some(s)) => Some((*m, *s)),
+                _ => None,
+            };
+            let cur_sig = (mtime_secs(video), file_size);
+            let content_changed =
+                stored_sig.is_some() && stored_sig != Some(cur_sig);
+            let content_unknown = stored_sig.is_none();
+            let sidecars_changed = any_newer_than(&sidecar_sources, scanned_at);
+            let file_changed =
+                deleted_at.is_some() || content_changed || sidecars_changed;
             let metadata_stale = *scan_version != MEDIA_SCAN_VERSION;
             (
                 file_changed,
                 metadata_stale,
-                file_changed || *sv < SUBTITLES_VERSION,
-                file_changed || *tv < THUMBNAILS_VERSION,
-                file_changed || *pv < TRICKPLAY_VERSION,
+                deleted_at.is_some()
+                    || content_changed
+                    || content_unknown
+                    || *sv < SUBTITLES_VERSION,
+                deleted_at.is_some() || content_changed || *tv < THUMBNAILS_VERSION,
+                deleted_at.is_some() || content_changed || *pv < TRICKPLAY_VERSION,
             )
         } else {
             (true, true, true, true, true)
         };
 
-    if !file_changed && !metadata_stale && !needs_subtitles && !needs_thumbnails && !needs_trickplay {
+    if !file_changed && !metadata_stale && !needs_essential && !needs_thumbnails && !needs_trickplay {
         let id = existing.as_ref().map(|r| r.0.clone()).unwrap_or_default();
         return Ok(Some(UpsertOutcome {
             id,
             has_sidecar_image: find_movie_image(video).is_some(),
             re_indexed: false,
-            needs_subtitles: false,
+            needs_essential: false,
             needs_thumbnails: false,
             needs_trickplay: false,
         }));
@@ -1580,7 +1922,7 @@ async fn upsert_movie(
         id,
         has_sidecar_image: image.is_some(),
         re_indexed: true,
-        needs_subtitles,
+        needs_essential,
         needs_thumbnails,
         needs_trickplay,
     }))

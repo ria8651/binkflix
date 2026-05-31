@@ -1,20 +1,41 @@
-//! On-demand video/audio technical metadata via `ffprobe`.
+//! Persisted video/audio technical metadata + validate-on-read refresh.
 //!
-//! Unlike subtitles (extracted once at scan time and cached in SQLite),
-//! tech info is only relevant when someone opens the debug menu, so we
-//! probe at request time and don't persist. Results are small — a single
-//! ffprobe call takes well under a second on local storage.
+//! `media.probe_json` is **load-bearing for correctness**, not a debug
+//! cache: it drives both the audio-track button in the player and the
+//! playback audio mapping inside [`super::hls::plan::derive_audio_plan`].
+//! A stale track list means the player either offers the wrong tracks
+//! (cosmetic) or maps a selected index against a list ffmpeg doesn't have
+//! (audible — audio drops). To stay correct independently of when the
+//! next scan runs, each read goes through [`load_fresh`], which compares
+//! `media.content_mtime` / `content_size` against the live file and
+//! triggers a single-file refresh (see
+//! [`super::scanner::refresh_media_file`]) on mismatch. The bulk scanner
+//! is now just a proactive cache-warmer over the same machinery. The
+//! column was originally `tech_json`; see migration 0022 for the rename.
 
+use super::AppState;
 use crate::types::{AudioTrackInfo, BrowserCompat, MediaTechInfo, VideoTrackInfo};
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use tokio::process::Command;
 
+/// Outcome of [`load_fresh`]: the (possibly freshly re-derived) tech info,
+/// plus whether a stale-read refresh actually ran. The bool lets the API
+/// layer hint to the client that local UI state (track lists, etc.) needs
+/// re-applying.
+pub struct FreshLoad {
+    pub info: Option<MediaTechInfo>,
+    pub refreshed: bool,
+}
+
 /// Read the cached probe for `media_id`, if the scanner has populated it.
+/// Most callers want [`load_fresh`] instead — this returns whatever's in
+/// the row without checking the file underneath it.
 pub async fn load(pool: &SqlitePool, media_id: &str) -> anyhow::Result<Option<MediaTechInfo>> {
     let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT tech_json FROM media WHERE id = ?")
+        sqlx::query_as("SELECT probe_json FROM media WHERE id = ?")
             .bind(media_id)
             .fetch_optional(pool)
             .await?;
@@ -27,11 +48,130 @@ pub async fn load(pool: &SqlitePool, media_id: &str) -> anyhow::Result<Option<Me
     }
 }
 
+/// Read `probe_json` validated against the live file. If the row's
+/// stored content signature mismatches the on-disk `(mtime, size)`, fires
+/// a single-file refresh (the essential pass — probe, probe_json,
+/// subtitles, signature stamp), spawns the cosmetic-asset refresh in the
+/// background, then returns the freshly-stored data.
+///
+/// Pre-fix rows (signature NULL) are treated as "trust the cache" so the
+/// first post-migration read doesn't storm the library with refreshes —
+/// the scanner backfills the signature forward-only.
+pub async fn load_fresh(state: &AppState, media_id: &str) -> anyhow::Result<FreshLoad> {
+    let row: Option<(Option<String>, String, Option<i64>, Option<i64>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT probe_json, path, content_mtime, content_size, deleted_at
+             FROM media WHERE id = ?",
+        )
+        .bind(media_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let Some((probe_json, path, content_mtime, content_size, deleted_at)) = row else {
+        return Ok(FreshLoad { info: None, refreshed: false });
+    };
+    if deleted_at.is_some() {
+        return Ok(FreshLoad { info: None, refreshed: false });
+    }
+
+    let cached: Option<MediaTechInfo> =
+        probe_json.as_deref().and_then(|s| serde_json::from_str(s).ok());
+
+    let stored_sig = match (content_mtime, content_size) {
+        (Some(m), Some(s)) => Some((m, s)),
+        _ => None,
+    };
+    let video = PathBuf::from(&path);
+    let cur_sig = stat_signature(&video);
+
+    // Signature absent (pre-fix row) → trust the cache; the next library
+    // scan will backfill it. Signature present + match → cache hit.
+    let needs_refresh = match stored_sig {
+        Some(sig) => sig != cur_sig,
+        None => false,
+    };
+
+    if !needs_refresh {
+        return Ok(FreshLoad { info: cached, refreshed: false });
+    }
+
+    // Concurrency guard: if a refresh is already in flight for this id,
+    // wait briefly and re-read the row rather than launching a second
+    // probe. Bounded by a hard timeout so a stuck refresh can't pin the
+    // request forever.
+    let did_refresh = refresh_with_lock(state, media_id).await;
+
+    let info = load(&state.pool, media_id).await.unwrap_or(None);
+    Ok(FreshLoad { info, refreshed: did_refresh })
+}
+
+/// Acquire the per-id refresh lock and run the refresh. If another task
+/// already holds it, wait for that one to finish and return `false`
+/// (caller should re-read). Bounded so a stuck refresh can't pin the
+/// request forever — 60s matches the segment-wait deadline.
+async fn refresh_with_lock(state: &AppState, media_id: &str) -> bool {
+    {
+        let mut locks = state.refresh_locks.lock().await;
+        if locks.contains(media_id) {
+            drop(locks);
+            return wait_for_release(state, media_id).await;
+        }
+        locks.insert(media_id.to_string());
+    }
+
+    let pool = state.pool.clone();
+    let progress = state.scan_progress.clone();
+    let ran = match super::scanner::refresh_media_file(&pool, Some(&progress), media_id).await {
+        Ok(ran) => ran,
+        Err(e) => {
+            tracing::warn!(%media_id, %e, "single-file refresh failed");
+            false
+        }
+    };
+
+    if ran {
+        // Cosmetic passes don't block the in-flight read.
+        let pool_bg = state.pool.clone();
+        let id_bg = media_id.to_string();
+        tokio::spawn(async move {
+            super::scanner::refresh_media_assets(&pool_bg, &id_bg).await;
+        });
+    }
+
+    state.refresh_locks.lock().await.remove(media_id);
+    ran
+}
+
+async fn wait_for_release(state: &AppState, media_id: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if !state.refresh_locks.lock().await.contains(media_id) {
+            return false;
+        }
+    }
+    false
+}
+
+fn stat_signature(video: &Path) -> (i64, i64) {
+    match std::fs::metadata(video) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            (mtime, m.len() as i64)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
 /// Persist probe results on the `media` row. Best-effort: errors are logged
 /// by the caller rather than propagated, since a missing cache is recoverable.
 pub async fn store(pool: &SqlitePool, media_id: &str, info: &MediaTechInfo) -> anyhow::Result<()> {
     let json = serde_json::to_string(info)?;
-    sqlx::query("UPDATE media SET tech_json = ? WHERE id = ?")
+    sqlx::query("UPDATE media SET probe_json = ? WHERE id = ?")
         .bind(json)
         .bind(media_id)
         .execute(pool)

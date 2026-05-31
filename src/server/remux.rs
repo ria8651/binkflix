@@ -125,8 +125,12 @@ pub async fn media_stream(
 }
 
 async fn load_or_probe_info(state: &AppState, id: &str, path: &str) -> Option<MediaTechInfo> {
-    if let Ok(Some(info)) = super::media_info::load(&state.pool, id).await {
-        return Some(info);
+    // Validate-on-read so the audio-codec branch below picks the *current*
+    // default track rather than what was on disk at last scan time.
+    if let Ok(fresh) = super::media_info::load_fresh(state, id).await {
+        if let Some(info) = fresh.info {
+            return Some(info);
+        }
     }
     super::media_info::probe(std::path::Path::new(path)).await.ok()
 }
@@ -198,8 +202,13 @@ async fn open_playback_session(
 }
 
 async fn verdict_for(state: &AppState, id: &str, path: &str) -> BrowserCompat {
-    if let Ok(Some(info)) = super::media_info::load(&state.pool, id).await {
-        return info.browser_compat;
+    // Validate-on-read: a swapped file might have crossed the Direct↔Remux
+    // line (e.g. AC3 → AAC means we could now stream direct). Refreshing
+    // here keeps the delivery mode honest.
+    if let Ok(fresh) = super::media_info::load_fresh(state, id).await {
+        if let Some(info) = fresh.info {
+            return info.browser_compat;
+        }
     }
     match super::media_info::probe(std::path::Path::new(path)).await {
         Ok(info) => {
