@@ -8,12 +8,22 @@ use super::plan::StreamPlan;
 /// the init.mp4 + segment URIs so hls.js's segment fetches inherit the
 /// full request shape — relative-URI resolution dropping the parent's
 /// query is a known footgun.
+///
+/// `cache_tag` is the plan-dir name (e.g. `v12-m…-s…-a0-tx…`) — the server's
+/// content-identity key. Threaded into the segment/init URIs as `&v=` so the
+/// `immutable` cache entries those URLs earn are correctly busted whenever the
+/// plan regenerates (source mtime/size change, plan-version bump, encode
+/// change). The m3u8 itself is served `no-store`, so a new generation yields a
+/// fresh playlist with fresh URLs and old pinned entries are never re-requested.
+/// The `serve` segment handler ignores `v=` (it resolves the plan dir from live
+/// source state), so the token is purely a client cache key.
 pub fn render_m3u8(
     plan: &StreamPlan,
     audio_idx: u32,
     mode: Option<&str>,
     bitrate_kbps: Option<u32>,
     time_offset: Option<f64>,
+    cache_tag: &str,
 ) -> String {
     let target = plan
         .segments
@@ -30,6 +40,9 @@ pub fn render_m3u8(
     }
     if let Some(b) = bitrate_kbps {
         query.push_str(&format!("&bitrate={b}"));
+    }
+    if !cache_tag.is_empty() {
+        query.push_str(&format!("&v={cache_tag}"));
     }
 
     let mut out = String::with_capacity(64 + plan.segments.len() * 48);
@@ -81,7 +94,7 @@ mod tests {
 
     #[test]
     fn renders_complete_vod_playlist() {
-        let s = render_m3u8(&sample_plan(), 0, None, None, None);
+        let s = render_m3u8(&sample_plan(), 0, None, None, None, "");
         assert!(s.starts_with("#EXTM3U\n"));
         assert!(s.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(s.contains("#EXT-X-MAP:URI=\"init.mp4?a=0\""));
@@ -94,13 +107,13 @@ mod tests {
     fn target_duration_covers_longest_segment() {
         let mut plan = sample_plan();
         plan.segments.push(Segment { i: 3, t: 12.0, d: 9.7 });
-        let s = render_m3u8(&plan, 0, None, None, None);
+        let s = render_m3u8(&plan, 0, None, None, None, "");
         assert!(s.contains("#EXT-X-TARGETDURATION:10"));
     }
 
     #[test]
     fn audio_idx_threads_into_segment_uris() {
-        let s = render_m3u8(&sample_plan(), 2, None, None, None);
+        let s = render_m3u8(&sample_plan(), 2, None, None, None, "");
         assert!(s.contains("#EXT-X-MAP:URI=\"init.mp4?a=2\""));
         assert!(s.contains("seg-00001.m4s?a=2"));
         assert!(s.contains("seg-00002.m4s?a=2"));
@@ -108,21 +121,37 @@ mod tests {
 
     #[test]
     fn mode_and_bitrate_thread_into_segment_uris() {
-        let s = render_m3u8(&sample_plan(), 0, Some("transcode"), Some(4000), None);
+        let s = render_m3u8(&sample_plan(), 0, Some("transcode"), Some(4000), None, "");
         assert!(s.contains("#EXT-X-MAP:URI=\"init.mp4?a=0&mode=transcode&bitrate=4000\""));
         assert!(s.contains("seg-00001.m4s?a=0&mode=transcode&bitrate=4000"));
     }
 
     #[test]
+    fn cache_tag_threads_into_segment_uris() {
+        let tag = "v12-m1709251234-s5242880-a0-tx4000h720";
+        let s = render_m3u8(&sample_plan(), 0, Some("transcode"), Some(4000), None, tag);
+        assert!(s.contains(&format!(
+            "#EXT-X-MAP:URI=\"init.mp4?a=0&mode=transcode&bitrate=4000&v={tag}\""
+        )));
+        assert!(s.contains(&format!("seg-00001.m4s?a=0&mode=transcode&bitrate=4000&v={tag}")));
+    }
+
+    #[test]
+    fn empty_cache_tag_omits_v_param() {
+        let s = render_m3u8(&sample_plan(), 0, None, None, None, "");
+        assert!(!s.contains("&v="));
+    }
+
+    #[test]
     fn time_offset_emits_ext_x_start() {
-        let s = render_m3u8(&sample_plan(), 0, None, None, Some(7.5));
+        let s = render_m3u8(&sample_plan(), 0, None, None, Some(7.5), "");
         assert!(s.contains("#EXT-X-START:TIME-OFFSET=7.500,PRECISE=YES"));
     }
 
     #[test]
     fn zero_or_negative_time_offset_is_omitted() {
-        let s_zero = render_m3u8(&sample_plan(), 0, None, None, Some(0.0));
-        let s_neg = render_m3u8(&sample_plan(), 0, None, None, Some(-1.0));
+        let s_zero = render_m3u8(&sample_plan(), 0, None, None, Some(0.0), "");
+        let s_neg = render_m3u8(&sample_plan(), 0, None, None, Some(-1.0), "");
         assert!(!s_zero.contains("EXT-X-START"));
         assert!(!s_neg.contains("EXT-X-START"));
     }

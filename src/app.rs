@@ -732,6 +732,13 @@ fn Search() -> Element {
                         r#type: "search",
                         placeholder: "Search shows and movies…",
                         autofocus: "true",
+                        // `autofocus` only fires on a hard page load, not on
+                        // SPA route navigation — so focus the box explicitly
+                        // once it mounts (e.g. after the topbar search icon
+                        // navigates here).
+                        onmounted: move |e| async move {
+                            let _ = e.set_focus(true).await;
+                        },
                         value: "{query.read()}",
                         oninput: move |e| {
                             query.set(e.value());

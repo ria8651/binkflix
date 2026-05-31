@@ -458,12 +458,20 @@ async fn serve(
                 None
             }
         });
+        // The plan-dir name is the server's content-identity key; thread it
+        // into the segment/init URIs (as `&v=`) so the `immutable` cache those
+        // URLs earn is busted whenever the plan regenerates. See `render_m3u8`.
+        let cache_tag = plan_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         let body = playlist::render_m3u8(
             &plan,
             audio_idx,
             params.mode.as_deref(),
             params.bitrate,
             time_offset,
+            cache_tag,
         );
         let mut resp = text_response(body, "application/vnd.apple.mpegurl", false);
         let h = resp.headers_mut();

@@ -861,6 +861,14 @@ function getDebugStats(videoId) {
 // without a `src` attribute and calls `attach(videoId, url)` instead.
 
 const HLS_ESM = "https://cdn.jsdelivr.net/npm/hls.js@1/+esm";
+
+// How many times the same fragment SN may (re)load with no playback progress
+// before the reload-storm watchdog gives up (see attachInner). Safely above
+// hls.js's handful of startup-probe fetches and any legit rapid re-seek of one
+// SN, yet at the ~20 reloads/sec a storm runs at it trips in well under a
+// second.
+const STORM_THRESHOLD = 6;
+
 let hlsPromise = null;
 function loadHlsJs() {
     if (!hlsPromise) {
@@ -1098,6 +1106,36 @@ async function attachInner(videoId, url, opts) {
             msg = `HLS ${detail}`;
         }
         surfaceError(video, msg);
+    });
+    // Fragment-reload-storm watchdog. A stale/incompatible cached artifact
+    // (e.g. an `immutable` segment or init.mp4 left over from a previous plan
+    // generation) can leave hls.js re-appending the same fragment forever —
+    // tens of FRAG_LOADED/sec, currentTime frozen, black screen + spinner, and
+    // unbounded memory growth (a real incident melted a tab to 25GB). Detection
+    // signal: the *same* fragment SN (re)loads repeatedly while currentTime
+    // doesn't advance. Healthy playback advances currentTime each segment
+    // (clears state); a normal pause loads each *new* SN once (counts stay 1);
+    // only a stall loop reloads one SN many times. Event-driven (no timer), so
+    // the closure GCs with the hls instance on destroy — nothing to clean up.
+    const wd = { counts: new Map(), lastCt: -1, fired: false };
+    hls.on(Hls.Events.FRAG_LOADED, (_evt, data) => {
+        if (wd.fired) return;
+        const ct = video.currentTime;
+        if (Math.abs(ct - wd.lastCt) > 0.25) {
+            // Real progress — reset and re-baseline.
+            wd.counts.clear();
+            wd.lastCt = ct;
+            return;
+        }
+        const sn = data?.frag?.sn;
+        if (sn == null) return;
+        const n = (wd.counts.get(sn) || 0) + 1;
+        wd.counts.set(sn, n);
+        if (n >= STORM_THRESHOLD) {
+            wd.fired = true;
+            surfaceError(video, "Playback stalled (segment reload loop). Please reload the page.");
+            try { hls.destroy(); } catch (_) { /* ignore */ }
+        }
     });
     hls.loadSource(url);
     hls.attachMedia(video);
