@@ -65,6 +65,10 @@ pub enum RemoteKind {
     Play { position_ms: i64 },
     Pause { position_ms: i64 },
     Seek { position_ms: i64 },
+    /// Periodic server drift nudge (not a deliberate user action). Applied
+    /// with loose thresholds and gated by a post-local-action grace window so
+    /// it never reverts a fresh local seek — see `apply_remote`.
+    Resync { playing: bool, position_ms: i64 },
 }
 
 /// One entry in the toast feed. `id` is monotonic; the toast component drains
@@ -464,11 +468,12 @@ fn handle_broadcast(ctx: RoomContext, b: Broadcast, seq: &mut u64) {
             current_sig.set(Some(applied.clone()));
             current_received_at_sig.set(stamp_now());
             // Also nudge the player if we've drifted enough; the bridge's
-            // effect picks this up via `last_remote`.
-            let kind = if state.playing {
-                RemoteKind::Play { position_ms: live_position_ms }
-            } else {
-                RemoteKind::Pause { position_ms: live_position_ms }
+            // effect picks this up via `last_remote`. Tagged as Resync (not
+            // Play/Pause) so `apply_remote` applies loose, grace-gated
+            // thresholds and never reverts a fresh local seek.
+            let kind = RemoteKind::Resync {
+                playing: state.playing,
+                position_ms: live_position_ms,
             };
             *seq = seq.wrapping_add(1);
             last_remote_sig.set(Some(RemoteEvent { seq: *seq, kind }));
@@ -728,6 +733,16 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
         // <video> element, set this to performance.now() + 300ms. Local
         // listeners check against it instead of decrementing a counter.
         let applying_until: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
+        // Last position (ms) we applied via `set_current_time`. The outbound
+        // `seeking` listener treats a local seek within `SEEK_SUPPRESS_MS` of
+        // this as our own correction and skips emitting (single-shot: reset to
+        // NaN once consumed). NaN = nothing pending.
+        let last_applied_seek_ms: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(f64::NAN)));
+        // Last position (ms) we actually emitted — drives the min-delta guard.
+        let last_emitted_seek_ms: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(f64::NAN)));
+        // `Date.now()` of the last genuine local play/pause/seek we emitted —
+        // drives the Resync grace window.
+        let last_local_action_ms: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
         let handle_slot: Rc<RefCell<Option<ListenerHandle>>> =
             use_hook(|| Rc::new(RefCell::new(None)));
 
@@ -796,6 +811,9 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
         {
             let video_dom_id = video_dom_id.clone();
             let applying_until_l = applying_until.clone();
+            let last_applied_seek_ms_l = last_applied_seek_ms.clone();
+            let last_emitted_seek_ms_l = last_emitted_seek_ms.clone();
+            let last_local_action_ms_l = last_local_action_ms.clone();
             let slot = handle_slot.clone();
             use_hook(|| {
                 wasm_bindgen_futures::spawn_local(async move {
@@ -805,32 +823,94 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
                         }
                         if let Some(video) = lookup_video(&video_dom_id) {
                             let mut handle = ListenerHandle::new(video.clone());
+                            let debounce = handle.debounce.clone();
                             let video_for_cb = video.clone();
+                            // Play/Pause are instantaneous, single-shot events:
+                            // gate-check, stamp the local-action clock (so a
+                            // stale Resync can't revert us), and emit.
                             let make = |mapper: Box<dyn Fn(i64) -> ClientMsg>|
                                 -> Closure<dyn FnMut()>
                             {
                                 let applying_until = applying_until_l.clone();
+                                let last_local = last_local_action_ms_l.clone();
                                 let video = video_for_cb.clone();
                                 Closure::wrap(Box::new(move || {
                                     if now_ms_f64() < applying_until.get() {
                                         return;
                                     }
                                     let pos_ms = (video.current_time() * 1000.0) as i64;
+                                    last_local.set(now_ms_f64());
                                     ctx.send(mapper(pos_ms));
                                 }) as Box<dyn FnMut()>)
                             };
                             let on_play = make(Box::new(|p| ClientMsg::Play { position_ms: p }));
                             let on_pause = make(Box::new(|p| ClientMsg::Pause { position_ms: p }));
-                            let on_seek = make(Box::new(|p| ClientMsg::Seek { position_ms: p }));
+                            // Seeks fire `seeking` eagerly (faster than `seeked`)
+                            // but can burst — a held arrow key sets currentTime
+                            // per keypress. Trailing-debounce them into one
+                            // ClientMsg::Seek, applying the suppression guards at
+                            // fire time so the latest position wins.
+                            let on_seeking = {
+                                let applying_until = applying_until_l.clone();
+                                let last_applied = last_applied_seek_ms_l.clone();
+                                let last_emitted = last_emitted_seek_ms_l.clone();
+                                let last_local = last_local_action_ms_l.clone();
+                                let video = video_for_cb.clone();
+                                let debounce = debounce.clone();
+                                Closure::wrap(Box::new(move || {
+                                    let applying_until = applying_until.clone();
+                                    let last_applied = last_applied.clone();
+                                    let last_emitted = last_emitted.clone();
+                                    let last_local = last_local.clone();
+                                    let video = video.clone();
+                                    let timeout = gloo_timers::callback::Timeout::new(
+                                        SEEK_DEBOUNCE_MS,
+                                        move || {
+                                            let now = now_ms_f64();
+                                            // Our own apply still inside the gate.
+                                            if now < applying_until.get() {
+                                                return;
+                                            }
+                                            let pos_ms =
+                                                (video.current_time() * 1000.0) as i64;
+                                            let posf = pos_ms as f64;
+                                            // Matches a position we just applied —
+                                            // our own correction. Consume (NaN) so
+                                            // a later genuine seek to the same spot
+                                            // still emits.
+                                            let applied = last_applied.get();
+                                            if !applied.is_nan()
+                                                && (posf - applied).abs() < SEEK_SUPPRESS_MS
+                                            {
+                                                last_applied.set(f64::NAN);
+                                                return;
+                                            }
+                                            // Too close to the last value we emitted
+                                            // — browser-internal micro-seek.
+                                            let emitted = last_emitted.get();
+                                            if !emitted.is_nan()
+                                                && (posf - emitted).abs() < SEEK_MIN_DELTA_MS
+                                            {
+                                                return;
+                                            }
+                                            last_emitted.set(posf);
+                                            last_local.set(now);
+                                            ctx.send(ClientMsg::Seek { position_ms: pos_ms });
+                                        },
+                                    );
+                                    // Replacing the prior Timeout cancels it.
+                                    *debounce.borrow_mut() = Some(timeout);
+                                }) as Box<dyn FnMut()>)
+                            };
                             let _ = video.add_event_listener_with_callback(
                                 "play", on_play.as_ref().unchecked_ref());
                             let _ = video.add_event_listener_with_callback(
                                 "pause", on_pause.as_ref().unchecked_ref());
                             let _ = video.add_event_listener_with_callback(
-                                "seeked", on_seek.as_ref().unchecked_ref());
+                                "seeking", on_seeking.as_ref().unchecked_ref());
                             handle.push("play", on_play);
                             handle.push("pause", on_pause);
-                            handle.push("seeked", on_seek);
+                            handle.push("seeking", on_seeking);
                             *slot.borrow_mut() = Some(handle);
 
                             // Initial catch-up: when the user is pulled into
@@ -846,6 +926,8 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
                             if ctx.current.peek().is_some() {
                                 let video_for_sync = video.clone();
                                 let applying_until_sync = applying_until_l.clone();
+                                let last_applied_sync = last_applied_seek_ms_l.clone();
+                                let last_local_sync = last_local_action_ms_l.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
                                     for _ in 0..100 {
                                         if video_for_sync.ready_state() >= 1 {
@@ -866,7 +948,13 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
                                     } else {
                                         RemoteKind::Pause { position_ms: projected }
                                     };
-                                    apply_remote(&video_for_sync, &kind, &applying_until_sync);
+                                    apply_remote(
+                                        &video_for_sync,
+                                        &kind,
+                                        &applying_until_sync,
+                                        &last_applied_sync,
+                                        &last_local_sync,
+                                    );
                                 });
                             }
                             return;
@@ -881,10 +969,18 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
         {
             let video_dom_id = video_dom_id.clone();
             let applying_until_r = applying_until.clone();
+            let last_applied_seek_ms_r = last_applied_seek_ms.clone();
+            let last_local_action_ms_r = last_local_action_ms.clone();
             use_effect(move || {
                 let Some(evt) = ctx.last_remote.read().clone() else { return };
                 let Some(video) = lookup_video(&video_dom_id) else { return };
-                apply_remote(&video, &evt.kind, &applying_until_r);
+                apply_remote(
+                    &video,
+                    &evt.kind,
+                    &applying_until_r,
+                    &last_applied_seek_ms_r,
+                    &last_local_action_ms_r,
+                );
             });
         }
     }
@@ -896,6 +992,33 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
 
     rsx! {}
 }
+
+// Coarse anti-echo gate (ms) opened when we apply a remote event. A backstop
+// for instant `play`/`pause` events and browser-internal seek bursts right
+// after an apply; the seek path's primary guard is position-match below.
+#[cfg(feature = "web")]
+const APPLYING_GATE_MS: f64 = 300.0;
+// How close a local `seeking` position must be to the last value we applied
+// via `set_current_time` to count as our own correction (and be suppressed).
+#[cfg(feature = "web")]
+const SEEK_SUPPRESS_MS: f64 = 400.0;
+// Minimum change from the last emitted seek before we emit again — drops
+// micro/browser-internal seeks from buffer churn or quality switches.
+#[cfg(feature = "web")]
+const SEEK_MIN_DELTA_MS: f64 = 250.0;
+// Trailing debounce for the eager `seeking` emit, coalescing bursts (e.g. a
+// held ArrowRight that sets currentTime per keypress) into one ClientMsg::Seek.
+#[cfg(feature = "web")]
+const SEEK_DEBOUNCE_MS: u32 = 200;
+// A periodic Resync only hard-snaps position beyond this drift; smaller drift
+// is tolerated so normal playback jitter never triggers a jump.
+#[cfg(feature = "web")]
+const RESYNC_DRIFT_SNAP_S: f64 = 2.0;
+// After a genuine local play/pause/seek, ignore Resync *position* snaps for
+// this long so an in-flight stale Resync can't revert a fresh local seek.
+// Kept under the 5s Resync period so at most one cycle is ever skipped.
+#[cfg(feature = "web")]
+const RESYNC_GRACE_MS: f64 = 1500.0;
 
 #[cfg(feature = "web")]
 fn now_ms_f64() -> f64 {
@@ -912,24 +1035,36 @@ fn lookup_video(dom_id: &str) -> Option<HtmlVideoElement> {
 }
 
 #[cfg(feature = "web")]
-fn apply_remote(video: &HtmlVideoElement, kind: &RemoteKind, applying_until: &Rc<Cell<f64>>) {
+fn apply_remote(
+    video: &HtmlVideoElement,
+    kind: &RemoteKind,
+    applying_until: &Rc<Cell<f64>>,
+    last_applied_seek_ms: &Rc<Cell<f64>>,
+    last_local_action_ms: &Rc<Cell<f64>>,
+) {
     // Open the time gate generously: a single seek can fire `seeking` +
     // `seeked` and possibly a `pause`/`play`, all of which we want to
     // suppress as locally-originated.
-    let gate = || applying_until.set(now_ms_f64() + 300.0);
+    let gate = || applying_until.set(now_ms_f64() + APPLYING_GATE_MS);
+    // Snap the element to `target` (seconds). Records the value so the outbound
+    // `seeking` listener recognises this as our own correction and doesn't
+    // re-broadcast it — that re-broadcast was the ping-pong loop's fuel.
+    let seek_to = |target: f64| {
+        gate();
+        last_applied_seek_ms.set(target * 1000.0);
+        video.set_current_time(target);
+    };
     match kind {
         RemoteKind::Seek { position_ms } => {
             let target = *position_ms as f64 / 1000.0;
             if (video.current_time() - target).abs() > 0.25 {
-                gate();
-                video.set_current_time(target);
+                seek_to(target);
             }
         }
         RemoteKind::Play { position_ms } => {
             let target = *position_ms as f64 / 1000.0;
             if (video.current_time() - target).abs() > 0.75 {
-                gate();
-                video.set_current_time(target);
+                seek_to(target);
             }
             if video.paused() {
                 gate();
@@ -939,12 +1074,30 @@ fn apply_remote(video: &HtmlVideoElement, kind: &RemoteKind, applying_until: &Rc
         RemoteKind::Pause { position_ms } => {
             let target = *position_ms as f64 / 1000.0;
             if (video.current_time() - target).abs() > 0.5 {
-                gate();
-                video.set_current_time(target);
+                seek_to(target);
             }
             if !video.paused() {
                 gate();
                 let _ = video.pause();
+            }
+        }
+        RemoteKind::Resync { playing, position_ms } => {
+            // Reconcile play/paused *state* unconditionally — it's cheap and
+            // correct even inside the grace window.
+            if *playing && video.paused() {
+                gate();
+                let _ = video.play();
+            } else if !*playing && !video.paused() {
+                gate();
+                let _ = video.pause();
+            }
+            // Position is only nudged on large drift, and never while a recent
+            // local action owns the truth — that grace window is what stops a
+            // stale in-flight Resync from reverting a fresh local seek.
+            let target = *position_ms as f64 / 1000.0;
+            let recent_local = now_ms_f64() - last_local_action_ms.get() < RESYNC_GRACE_MS;
+            if !recent_local && (video.current_time() - target).abs() > RESYNC_DRIFT_SNAP_S {
+                seek_to(target);
             }
         }
     }
@@ -954,12 +1107,19 @@ fn apply_remote(video: &HtmlVideoElement, kind: &RemoteKind, applying_until: &Rc
 struct ListenerHandle {
     target: Option<HtmlVideoElement>,
     listeners: Vec<(&'static str, Closure<dyn FnMut()>)>,
+    // Holds the pending trailing-debounce Timeout for the `seeking` emit.
+    // Dropping the handle on unmount drops the Timeout, cancelling it.
+    debounce: Rc<RefCell<Option<gloo_timers::callback::Timeout>>>,
 }
 
 #[cfg(feature = "web")]
 impl ListenerHandle {
     fn new(target: HtmlVideoElement) -> Self {
-        Self { target: Some(target), listeners: Vec::new() }
+        Self {
+            target: Some(target),
+            listeners: Vec::new(),
+            debounce: Rc::new(RefCell::new(None)),
+        }
     }
     fn push(&mut self, name: &'static str, cb: Closure<dyn FnMut()>) {
         self.listeners.push((name, cb));
