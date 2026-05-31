@@ -47,6 +47,11 @@ pub struct AppState {
     pub scan_lock: Arc<Mutex<()>>,
     pub libraries: Arc<Vec<(i64, PathBuf)>>,
     pub hls_producers: Arc<hls::ProducerRegistry>,
+    /// Server-driven HLS playback sessions (one per user/media/audio/mode),
+    /// opened from request observation in the HLS handler and closed by an
+    /// idle sweeper. Separate from `hls_producers` because producers are
+    /// shared across viewers but sessions are per-viewer.
+    pub active_sessions: Arc<hls::SessionRegistry>,
     /// H.264 hardware encoder picked at startup. The producer reads this
     /// (combined with the process-wide sticky-fallback flag inside
     /// `producer.rs`) when building each ffmpeg invocation.
@@ -384,9 +389,15 @@ async fn run_async() -> anyhow::Result<()> {
         scan_lock,
         libraries,
         hls_producers: hls::ProducerRegistry::new(),
+        active_sessions: hls::SessionRegistry::new(),
         hwenc,
         auth: auth_state.clone(),
     };
+
+    // Close any HLS playback sessions left dangling by a previous process
+    // (no idle sweep ran), then start the idle sweeper for this process.
+    analytics::close_dangling_sessions(&state.pool).await;
+    hls::spawn_session_sweeper(state.active_sessions.clone(), state.pool.clone());
 
     // Build the router: our routes first (they take priority), then the Dioxus
     // application mounted as the fallback so `/` and client-side routes work.

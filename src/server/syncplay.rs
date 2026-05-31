@@ -85,6 +85,22 @@ impl Hub {
         self.rooms.get(room).map(|r| r.clone())
     }
 
+    /// Which room (if any) this user is currently a member of. Used by the
+    /// HLS layer to attribute a server-driven playback session to a watch
+    /// party without the client having to pass `room_id` in URLs. A user in
+    /// multiple rooms (rare) resolves to the first match.
+    pub fn room_for_user(&self, user_sub: &str) -> Option<String> {
+        self.rooms.iter().find_map(|e| {
+            let in_room = e
+                .members
+                .lock()
+                .ok()
+                .map(|g| g.iter().any(|m| m.user_sub == user_sub))
+                .unwrap_or(false);
+            in_room.then(|| e.meta.id.clone())
+        })
+    }
+
     fn maybe_drop(&self, room: &str) {
         if let Some(entry) = self.rooms.get(room) {
             if entry.tx.receiver_count() == 0 {

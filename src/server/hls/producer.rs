@@ -11,9 +11,9 @@
 //!   client GET seg-N.m4s
 //!        │
 //!        ▼
-//!   ensure_segment ──► slot mutex ──► (cache hit? → serve)
-//!        │                          (out of range? → kill old, launch new)
-//!        │                          (in range? → bump high_water + wait)
+//!   ensure_segment ──► pool mutex ──► (cache hit? → serve)
+//!        │                          (covered by a pooled producer? → follow + wait)
+//!        │                          (uncovered region? → spawn another producer)
 //!        ▼
 //!   producer ffmpeg writes seg-{i:05}.m4s into a per-run scratch dir
 //!        │
@@ -51,14 +51,19 @@
 //! offset). We pre-roll input `-ss` by one plan-segment so that
 //! priming lands inside a throwaway segment the watcher discards.
 //!
-//! ## Lifecycle
+//! ## Lifecycle (region pool)
 //!
-//! * **Start**: any segment request to a media without a running
-//!   producer spawns one targeted at that segment.
-//! * **In range**: requests within `[start_idx, head + LOOKAHEAD]` just
-//!   bump high_water and wait for ffmpeg to catch up.
-//! * **Out of range** (seek backward, or far seek forward): kill the
-//!   current run and relaunch at the new target.
+//! Each `(media, audio, mode)` key owns a *pool* of producers. Nothing
+//! is ever killed because another viewer moved — that's what lets a
+//! watch party share a file without members thrashing each other.
+//!
+//! * **Follow**: a request whose segment is covered by an existing
+//!   producer (`[start_idx, head + LOOKAHEAD_WINDOW]`) bumps that
+//!   producer's read-ahead and waits on the shared cache. Synced viewers
+//!   thus coalesce onto one ffmpeg.
+//! * **Spawn**: a request for an uncovered region (seek into cold cache)
+//!   spawns an *additional* producer in the pool, targeted at it. The old
+//!   one is left alone.
 //! * **Backpressure (pull-driven)**: ffmpeg is SIGSTOP'd whenever
 //!   `head ≥ target_head`. `target_head` only advances when a request
 //!   arrives — each request bumps it to `max(target_head, idx +
@@ -72,6 +77,7 @@ use super::cache;
 use super::hwenc::HwEncoder;
 use super::plan::{AudioPlan, Mode, StreamPlan};
 use dashmap::DashMap;
+use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -104,15 +110,27 @@ const PREROLL_SEGMENTS: u32 = 1;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SEGMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Registry key: `(media_id, audio_idx, mode_tag)`. Different audio tracks
-/// AND different encode modes/bitrates run as independent producers because
-/// each writes a different segment cache dir; killing one to start another
-/// would destroy any other client's playback on the same file.
+/// How often a follower re-checks its leader while waiting on the shared
+/// cache, and how long the leader's `head` may stall short of the target
+/// before the follower gives up and spawns its own producer.
+const FOLLOWER_POLL: Duration = Duration::from_millis(200);
+const FOLLOWER_STALL_GRACE: Duration = Duration::from_millis(1500);
+
+/// Registry key: `(media_id, audio_idx, mode_tag)`. Each key maps to a
+/// *pool* of producers, not a single one. A segment request follows a
+/// pooled producer already covering its region (so synced viewers
+/// coalesce onto one ffmpeg); a request for a genuinely different region
+/// spawns an additional producer. A producer is never killed because
+/// another viewer moved — abandoned ones fill their lookahead, SIGSTOP
+/// under backpressure (zero CPU), and idle-reap. The on-disk canonical
+/// cache is shared across the whole pool (it's keyed only by this tuple),
+/// so two producers promoting the same segment is a harmless
+/// first-writer-wins.
 type ProducerKey = (String, u32, String);
 
 #[derive(Default)]
 pub struct ProducerRegistry {
-    by_media: DashMap<ProducerKey, Arc<Mutex<Option<ProducerHandle>>>>,
+    by_media: DashMap<ProducerKey, Arc<Mutex<Vec<ProducerHandle>>>>,
 }
 
 impl ProducerRegistry {
@@ -120,17 +138,19 @@ impl ProducerRegistry {
         Arc::new(Self::default())
     }
 
-    fn slot(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Arc<Mutex<Option<ProducerHandle>>> {
+    fn pool(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Arc<Mutex<Vec<ProducerHandle>>> {
         self.by_media
             .entry((media_id.to_string(), audio_idx, mode_tag.to_string()))
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
             .clone()
     }
 
     pub async fn snapshot(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Option<crate::types::HlsProducerState> {
-        let slot = self.by_media.get(&(media_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone())?;
-        let guard = slot.lock().await;
-        let h = guard.as_ref()?;
+        let pool = self.by_media.get(&(media_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone())?;
+        let guard = pool.lock().await;
+        // Report the lead producer (furthest along). The debug panel
+        // shows one row; the pool is usually size 1 anyway.
+        let h = guard.iter().max_by_key(|h| h.head.load(Ordering::Acquire))?;
         let start_idx = h.start_idx;
         let head = h.head.load(Ordering::Acquire);
         let target_head = h.target_head.load(Ordering::Acquire);
@@ -145,6 +165,45 @@ impl ProducerRegistry {
             lookahead_buffer: LOOKAHEAD_BUFFER,
             lookahead_window: LOOKAHEAD_WINDOW,
         })
+    }
+}
+
+/// Index of the best producer in `pool` whose window covers `idx`
+/// (`start_idx ≤ idx ≤ head + LOOKAHEAD_WINDOW`), excluding any whose
+/// `head` Arc is in `skip` (producers a caller already found stalled).
+/// Prefers the producer furthest along (highest `head`) so the follower
+/// waits the least.
+fn pick_covering(pool: &[ProducerHandle], idx: u32, skip: &[Arc<AtomicU32>]) -> Option<usize> {
+    pool.iter()
+        .enumerate()
+        .filter(|(_, h)| {
+            covers(h.start_idx, h.head.load(Ordering::Acquire), idx)
+                && !skip.iter().any(|s| Arc::ptr_eq(s, &h.head))
+        })
+        .max_by_key(|(_, h)| h.head.load(Ordering::Acquire))
+        .map(|(i, _)| i)
+}
+
+/// Whether a producer at `start_idx` whose canonical `head` has reached
+/// `head` can serve segment `idx` without a far-seek relaunch: `idx` must
+/// be at or after the run's start and no more than `LOOKAHEAD_WINDOW` past
+/// `head` (a fresh fast input-seek beats sequential decode beyond that, so
+/// such a request spawns its own producer instead of following).
+fn covers(start_idx: u32, head: u32, idx: u32) -> bool {
+    idx >= start_idx && idx <= head.saturating_add(LOOKAHEAD_WINDOW)
+}
+
+/// Bump a producer's read-ahead target to cover `idx`, refresh its idle
+/// timer, and resume it if backpressure had it SIGSTOP'd.
+async fn nudge(h: &ProducerHandle, idx: u32, total: u32) {
+    let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
+    h.target_head.fetch_max(new_target, Ordering::AcqRel);
+    *h.last_request_at.write().await = Instant::now();
+    if h.paused.load(Ordering::Acquire) {
+        if let Some(pid) = h.child.id() {
+            let _ = signal_resume(pid);
+            h.paused.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -221,6 +280,49 @@ pub struct ProducerCtx {
     /// sticky fallback flag has been set by a prior failed launch — see
     /// [`effective_hw`].
     pub hw: HwEncoder,
+    /// DB handle for best-effort `transcode.*` lifecycle telemetry.
+    pub pool: SqlitePool,
+}
+
+/// Just the bits a spawned watcher/reaper/stderr-reader needs to emit a
+/// `transcode.*` event — so we don't drag a whole `ProducerCtx` (with its
+/// `Arc<StreamPlan>` etc.) into every background task.
+#[derive(Clone)]
+struct EventMeta {
+    pool: SqlitePool,
+    media_id: String,
+    audio_idx: u32,
+    mode_tag: String,
+}
+
+impl EventMeta {
+    fn from_ctx(ctx: &ProducerCtx) -> Self {
+        Self {
+            pool: ctx.pool.clone(),
+            media_id: ctx.media_id.clone(),
+            audio_idx: ctx.audio_idx,
+            mode_tag: ctx.mode_tag.clone(),
+        }
+    }
+
+    /// Best-effort fire-and-forget event. `extra` fields are merged onto
+    /// the standard `{audio_idx, mode_tag}` envelope.
+    fn emit(&self, kind: &'static str, extra: serde_json::Value) {
+        let pool = self.pool.clone();
+        let media = self.media_id.clone();
+        let aidx = self.audio_idx;
+        let mode = self.mode_tag.clone();
+        tokio::spawn(async move {
+            let mut data = serde_json::json!({ "audio_idx": aidx, "mode_tag": mode });
+            if let (Some(obj), Some(ex)) = (data.as_object_mut(), extra.as_object()) {
+                for (k, v) in ex {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            crate::server::analytics::record_event(&pool, kind, None, Some(&media), None, &data)
+                .await;
+        });
+    }
 }
 
 /// Process-wide sticky flag: once a hwenc producer fails to start, every
@@ -255,99 +357,140 @@ pub async fn ensure_segment(
     let total = ctx.plan.segments.len() as u32;
     let seg_path = ctx.plan_dir.join(cache::segment_filename(idx));
 
-    // Fast path: cached on disk. Still bump target_head so a running
-    // producer keeps its read-ahead window aligned with where the
-    // client actually is.
+    // Fast path: cached on disk. Still nudge a covering producer so it
+    // keeps its read-ahead window aligned with where the client is.
     if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
-        bump_target_head(registry, &ctx.media_id, ctx.audio_idx, &ctx.mode_tag, idx, total).await;
+        bump_covering(registry, &ctx.media_id, ctx.audio_idx, &ctx.mode_tag, idx, total).await;
         return Ok(seg_path);
     }
 
-    // Slot mutex serialises start/restart so concurrent seek-back-to-back
-    // can't fire two ffmpegs on the same (media, audio_idx, mode).
-    let slot = registry.slot(&ctx.media_id, ctx.audio_idx, &ctx.mode_tag);
-    {
-        let mut guard = slot.lock().await;
-        let needs_restart = match guard.as_ref() {
-            Some(h) => {
-                let head = h.head.load(Ordering::Acquire);
-                idx < h.start_idx || idx > head.saturating_add(LOOKAHEAD_WINDOW)
-            }
-            None => true,
-        };
-        if needs_restart {
-            if let Some(old) = guard.take() {
-                old.shutdown().await;
-            }
-            *guard = Some(launch_producer(ctx.clone(), idx, slot.clone()).await?);
-            // Drop the slot lock before sweeping siblings — they take
-            // their own slot locks, and holding two at once invites
-            // deadlock if a concurrent request races on a sibling.
-            drop(guard);
-            shutdown_siblings(registry, &ctx.media_id, ctx.audio_idx, &ctx.mode_tag).await;
-        } else {
-            let h = guard.as_mut().expect("checked above");
-            let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
-            h.target_head.fetch_max(new_target, Ordering::AcqRel);
-            *h.last_request_at.write().await = Instant::now();
-            if h.paused.load(Ordering::Acquire) {
-                if let Some(pid) = h.child.id() {
-                    let _ = signal_resume(pid);
-                    h.paused.store(false, Ordering::Release);
+    let pool = registry.pool(&ctx.media_id, ctx.audio_idx, &ctx.mode_tag);
+    let overall_deadline = Instant::now() + SEGMENT_WAIT_TIMEOUT;
+    // Producers we tried to follow but found stalled — don't re-follow
+    // them on the next loop, spawn our own instead.
+    let mut stalled: Vec<Arc<AtomicU32>> = Vec::new();
+
+    loop {
+        // Decide under the pool lock: follow a covering producer, or
+        // spawn a new one. The lock serialises this decision so a synced
+        // burst of requests resolves to one spawn + N follows, not N
+        // spawns (thundering-herd guard within the key).
+        let leader_head = {
+            let mut guard = pool.lock().await;
+            if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
+                if let Some(i) = pick_covering(&guard, idx, &[]) {
+                    nudge(&guard[i], idx, total).await;
                 }
+                return Ok(seg_path);
+            }
+            if let Some(i) = pick_covering(&guard, idx, &stalled) {
+                nudge(&guard[i], idx, total).await;
+                guard[i].head.clone()
+            } else {
+                // No live producer covers this region — spawn one. Holding
+                // the pool lock across the launch is what makes concurrent
+                // requests for the same region coalesce.
+                let handle = launch_producer(ctx.clone(), idx, pool.clone()).await?;
+                guard.push(handle);
+                drop(guard);
+                wait_for_file(&seg_path, overall_deadline.saturating_duration_since(Instant::now())).await?;
+                return Ok(seg_path);
+            }
+        };
+
+        match follow_wait(&seg_path, &pool, idx, &leader_head, total, overall_deadline).await {
+            FollowOutcome::Ready => return Ok(seg_path),
+            FollowOutcome::Respawn => stalled.push(leader_head),
+            FollowOutcome::Timeout => {
+                anyhow::bail!("timed out waiting for {}", seg_path.display())
             }
         }
     }
-
-    wait_for_file(&seg_path, SEGMENT_WAIT_TIMEOUT).await?;
-    Ok(seg_path)
 }
 
-/// Kill any other producer for the same `media_id` whose `(audio_idx,
-/// mode_tag)` differs from the active one. Called when a fresh
-/// producer launches: switching mode (Remux ↔ Transcode), bitrate, or
-/// audio track from the player UI is the same user replacing their
-/// previous pull, so the old ffmpeg shouldn't keep burning CPU until
-/// its 30s idle reaper trips. A second user simultaneously playing
-/// the same file in a different mode is rare on a self-hosted setup,
-/// and they'd recover automatically — `ensure_segment` just relaunches
-/// their producer on their next segment fetch.
-async fn shutdown_siblings(
+enum FollowOutcome {
+    /// The followed producer delivered the segment to canonical.
+    Ready,
+    /// The leader stalled / disappeared — caller should re-decide (spawn).
+    Respawn,
+    /// Overall deadline elapsed.
+    Timeout,
+}
+
+/// Wait on the shared cache for a producer (`leader_head`) we're
+/// following to deliver `seg_path`, keeping it alive and advancing toward
+/// `idx`. Bounded by `overall_deadline` (correctness backstop — never an
+/// indefinite wait); returns `Respawn` early if the leader leaves the
+/// pool or its `head` stalls short of `idx` past `FOLLOWER_STALL_GRACE`.
+async fn follow_wait(
+    seg_path: &Path,
+    pool: &Arc<Mutex<Vec<ProducerHandle>>>,
+    idx: u32,
+    leader_head: &Arc<AtomicU32>,
+    total: u32,
+    overall_deadline: Instant,
+) -> FollowOutcome {
+    let mut last_head = leader_head.load(Ordering::Acquire);
+    let mut last_progress = Instant::now();
+    loop {
+        if tokio::fs::try_exists(seg_path).await.unwrap_or(false) {
+            return FollowOutcome::Ready;
+        }
+        if Instant::now() >= overall_deadline {
+            return FollowOutcome::Timeout;
+        }
+        tokio::time::sleep(FOLLOWER_POLL).await;
+
+        let now_head = leader_head.load(Ordering::Acquire);
+        if now_head > last_head {
+            last_head = now_head;
+            last_progress = Instant::now();
+        }
+
+        // Keep the leader alive (refresh idle timer) and advancing toward
+        // our target. If it's no longer in the pool, it was reaped/removed.
+        let still_following = {
+            let guard = pool.lock().await;
+            if tokio::fs::try_exists(seg_path).await.unwrap_or(false) {
+                return FollowOutcome::Ready;
+            }
+            match guard.iter().find(|p| Arc::ptr_eq(&p.head, leader_head)) {
+                Some(h) => {
+                    nudge(h, idx, total).await;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !still_following {
+            return FollowOutcome::Respawn;
+        }
+        if last_progress.elapsed() >= FOLLOWER_STALL_GRACE
+            && leader_head.load(Ordering::Acquire) < idx
+        {
+            return FollowOutcome::Respawn;
+        }
+    }
+}
+
+/// Fast-path helper: nudge whichever pooled producer already covers `idx`
+/// (no-op if none does — the segment is already on disk).
+async fn bump_covering(
     registry: &ProducerRegistry,
     media_id: &str,
-    keep_audio_idx: u32,
-    keep_mode_tag: &str,
+    audio_idx: u32,
+    mode_tag: &str,
+    idx: u32,
+    total: u32,
 ) {
-    let siblings: Vec<(ProducerKey, Arc<Mutex<Option<ProducerHandle>>>)> = registry
+    if let Some(pool) = registry
         .by_media
-        .iter()
-        .filter_map(|entry| {
-            let (mid, aidx, tag) = entry.key();
-            if mid != media_id {
-                return None;
-            }
-            if *aidx == keep_audio_idx && tag == keep_mode_tag {
-                return None;
-            }
-            Some((entry.key().clone(), entry.value().clone()))
-        })
-        .collect();
-    for (key, slot) in siblings {
-        let mut guard = slot.lock().await;
-        if let Some(old) = guard.take() {
-            tracing::info!(media = %media_id, audio = key.1, mode = %key.2, "shutting down sibling producer");
-            old.shutdown().await;
-        }
-    }
-}
-
-async fn bump_target_head(registry: &ProducerRegistry, media_id: &str, audio_idx: u32, mode_tag: &str, idx: u32, total: u32) {
-    if let Some(slot) = registry.by_media.get(&(media_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone()) {
-        let guard = slot.lock().await;
-        if let Some(h) = guard.as_ref() {
-            let new_target = idx.saturating_add(LOOKAHEAD_BUFFER).min(total);
-            h.target_head.fetch_max(new_target, Ordering::AcqRel);
-            *h.last_request_at.write().await = Instant::now();
+        .get(&(media_id.to_string(), audio_idx, mode_tag.to_string()))
+        .map(|e| e.clone())
+    {
+        let guard = pool.lock().await;
+        if let Some(i) = pick_covering(&guard, idx, &[]) {
+            nudge(&guard[i], idx, total).await;
         }
     }
 }
@@ -368,7 +511,7 @@ async fn wait_for_file(path: &Path, timeout: Duration) -> anyhow::Result<()> {
 async fn launch_producer(
     ctx: ProducerCtx,
     target_idx: u32,
-    slot: Arc<Mutex<Option<ProducerHandle>>>,
+    pool: Arc<Mutex<Vec<ProducerHandle>>>,
 ) -> anyhow::Result<ProducerHandle> {
     // Retry loop for the hw-encoder runtime fallback. We try with the
     // resolved hw encoder; if the ffmpeg child dies within 750ms (the
@@ -379,7 +522,7 @@ async fn launch_producer(
     // loop is at most two iterations.
     loop {
         let active_hw = effective_hw(ctx.hw);
-        let mut handle = launch_once(ctx.clone(), target_idx, slot.clone()).await?;
+        let mut handle = launch_once(ctx.clone(), target_idx, pool.clone()).await?;
         if active_hw == HwEncoder::None {
             return Ok(handle);
         }
@@ -424,7 +567,7 @@ async fn wait_for_early_exit(child: &mut Child, total: Duration) -> EarlyExit {
 async fn launch_once(
     ctx: ProducerCtx,
     target_idx: u32,
-    slot: Arc<Mutex<Option<ProducerHandle>>>,
+    pool: Arc<Mutex<Vec<ProducerHandle>>>,
 ) -> anyhow::Result<ProducerHandle> {
     tokio::fs::create_dir_all(&ctx.plan_dir).await?;
 
@@ -450,6 +593,7 @@ async fn launch_once(
         .get((ff_start_idx as usize).saturating_sub(1))
         .ok_or_else(|| anyhow::anyhow!("ff_start_idx {ff_start_idx} out of plan range"))?;
     let start_t = seg.t;
+    let meta = EventMeta::from_ctx(&ctx);
 
     tracing::info!(
         media = %ctx.media_id,
@@ -457,6 +601,10 @@ async fn launch_once(
         "launching producer ffmpeg"
     );
     let (mut child, argv) = spawn_ffmpeg(&ctx, ff_start_idx, start_t, run_dir.path())?;
+    meta.emit(
+        "transcode.spawn",
+        serde_json::json!({ "target_idx": target_idx, "start_t": start_t }),
+    );
 
     // Persist the exact ffmpeg invocation per plan so a future failure
     // can be diagnosed without scraping container logs — "ask the user
@@ -469,7 +617,15 @@ async fn launch_once(
     if let Some(stderr) = child.stderr.take() {
         let id = ctx.media_id.clone();
         let log_path = ctx.plan_dir.join("ffmpeg.log");
+        let warn_meta = meta.clone();
         tokio::spawn(async move {
+            // Timestamp/corruption warnings worth surfacing as telemetry —
+            // these are the fingerprint of A/V-sync-hostile source files.
+            // Emit at most one event per category per run (deduped) to
+            // keep the events table quiet.
+            const WARN_NEEDLES: [&str; 4] =
+                ["Packet duration", "out of range", "Non-monotonous DTS", "corrupt"];
+            let mut warned: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
             // Truncate per run — last run wins. The watcher already
             // delivers the previous run's segments to canonical before
             // a new producer launches, so the only consumer of
@@ -490,6 +646,15 @@ async fn launch_once(
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(target: "binkflix::hls::ffmpeg", media = %id, "{line}");
+                for needle in WARN_NEEDLES {
+                    if line.contains(needle) && warned.insert(needle) {
+                        let sample: String = line.chars().take(200).collect();
+                        warn_meta.emit(
+                            "transcode.ffmpeg_warning",
+                            serde_json::json!({ "needle": needle, "sample": sample }),
+                        );
+                    }
+                }
                 if let Some(w) = log.as_mut() {
                     if w.write_all(line.as_bytes()).await.is_err()
                         || w.write_all(b"\n").await.is_err()
@@ -522,14 +687,16 @@ async fn launch_once(
         head.clone(),
         total_segments,
         target_idx,
+        meta.clone(),
     );
     let reaper = spawn_reaper(
         ctx.media_id.clone(),
-        slot,
+        pool,
         head.clone(),
         target_head.clone(),
         paused.clone(),
         last_request_at.clone(),
+        meta,
     );
 
     Ok(ProducerHandle {
@@ -823,11 +990,15 @@ fn spawn_watcher(
     head: Arc<AtomicU32>,
     total_segments: u32,
     target_idx: u32,
+    meta: EventMeta,
 ) -> JoinHandle<()> {
     use std::collections::{BTreeMap, HashMap};
     let canonical_init = plan_dir.join("init.mp4");
     let scratch_init = run_dir.join("init.mp4");
     let mut prev_sizes: HashMap<u32, u64> = HashMap::new();
+    // Throttle promote-failure telemetry — the watcher ticks every 100ms,
+    // so a persistent failure would otherwise flood the events table.
+    let mut promote_failures: u64 = 0;
     tokio::spawn(async move {
         loop {
             // Snapshot the scratch dir: idx → (path, size).
@@ -888,6 +1059,15 @@ fn spawn_watcher(
                         error = %e,
                         "failed to promote segment"
                     );
+                    // First failure, then every 50th, so a stuck producer
+                    // leaves a breadcrumb without flooding the table.
+                    if promote_failures % 50 == 0 {
+                        meta.emit(
+                            "transcode.promote_failure",
+                            serde_json::json!({ "idx": idx, "error": e.to_string() }),
+                        );
+                    }
+                    promote_failures += 1;
                 }
             }
 
@@ -922,31 +1102,35 @@ fn spawn_watcher(
 
 fn spawn_reaper(
     media_id: String,
-    slot: Arc<Mutex<Option<ProducerHandle>>>,
+    pool: Arc<Mutex<Vec<ProducerHandle>>>,
     head: Arc<AtomicU32>,
     target_head: Arc<AtomicU32>,
     paused: Arc<AtomicBool>,
     last_request_at: Arc<RwLock<Instant>>,
+    meta: EventMeta,
 ) -> JoinHandle<()> {
     // Pull-driven backpressure: ffmpeg may advance only as far as
     // `target_head`. `target_head` only moves when a request arrives,
     // so a stalled client (broken MSE, paused playback) leaves ffmpeg
     // SIGSTOP'd within ≤LOOKAHEAD_BUFFER segments instead of racing
-    // to EOF.
+    // to EOF. The reaper identifies *its own* producer within the pool
+    // by `Arc::ptr_eq` on the `head` Arc it was handed at launch.
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
             let last = *last_request_at.read().await;
             if last.elapsed() >= IDLE_TIMEOUT {
-                let mut guard = slot.lock().await;
-                if let Some(h) = guard.as_ref() {
-                    if Arc::ptr_eq(&h.head, &head) {
-                        let old = guard.take().expect("guard had Some");
-                        drop(guard);
-                        tracing::info!(media = %media_id, "reaping idle hls producer");
-                        old.shutdown().await;
-                    }
+                let mut guard = pool.lock().await;
+                if let Some(pos) = guard.iter().position(|h| Arc::ptr_eq(&h.head, &head)) {
+                    let old = guard.swap_remove(pos);
+                    drop(guard);
+                    tracing::info!(media = %media_id, "reaping idle hls producer");
+                    meta.emit(
+                        "transcode.reap",
+                        serde_json::json!({ "head": head.load(Ordering::Acquire) }),
+                    );
+                    old.shutdown().await;
                 }
                 return;
             }
@@ -955,7 +1139,7 @@ fn spawn_reaper(
             let target = target_head.load(Ordering::Acquire);
             let is_paused = paused.load(Ordering::Acquire);
             if !is_paused && h >= target {
-                if let Some(pid) = current_pid(&slot, &head).await {
+                if let Some(pid) = current_pid(&pool, &head).await {
                     match signal_pause(pid) {
                         Ok(()) => {
                             paused.store(true, Ordering::Release);
@@ -966,7 +1150,7 @@ fn spawn_reaper(
                     }
                 }
             } else if is_paused && target > h {
-                if let Some(pid) = current_pid(&slot, &head).await {
+                if let Some(pid) = current_pid(&pool, &head).await {
                     match signal_resume(pid) {
                         Ok(()) => {
                             paused.store(false, Ordering::Release);
@@ -982,14 +1166,11 @@ fn spawn_reaper(
 }
 
 async fn current_pid(
-    slot: &Arc<Mutex<Option<ProducerHandle>>>,
+    pool: &Arc<Mutex<Vec<ProducerHandle>>>,
     head_marker: &Arc<AtomicU32>,
 ) -> Option<u32> {
-    let guard = slot.lock().await;
-    let h = guard.as_ref()?;
-    if !Arc::ptr_eq(&h.head, head_marker) {
-        return None;
-    }
+    let guard = pool.lock().await;
+    let h = guard.iter().find(|h| Arc::ptr_eq(&h.head, head_marker))?;
     h.child.id()
 }
 
@@ -1152,5 +1333,18 @@ mod tests {
         assert!(out.starts_with("ffmpeg -i "));
         assert!(out.contains(" -c:v libx264"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn covers_window() {
+        // A producer started at seg 10 that has reached head 20.
+        // In-range: from its start through head + LOOKAHEAD_WINDOW.
+        assert!(covers(10, 20, 10)); // exactly at start
+        assert!(covers(10, 20, 20)); // exactly at head
+        assert!(covers(10, 20, 20 + LOOKAHEAD_WINDOW)); // edge of window
+        // Out of range: before start (seek backward) → spawn own.
+        assert!(!covers(10, 20, 9));
+        // Out of range: far seek forward past the window → spawn own.
+        assert!(!covers(10, 20, 20 + LOOKAHEAD_WINDOW + 1));
     }
 }

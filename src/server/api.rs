@@ -72,6 +72,18 @@ struct PlaybackSampleBody {
     /// `idle` | `loading` | `stalled` — matches the HTMLMediaElement
     /// `networkState` enum surface the player can observe.
     network_state: Option<String>,
+    /// Per-viewer signals only the browser can see (optional client
+    /// metrics stream). `audio_idx` directly catches "wrong audio track"
+    /// by comparing across room members; frame counts are cumulative
+    /// `getVideoPlaybackQuality()` values (delta at query time).
+    #[serde(default)]
+    audio_idx: Option<u32>,
+    #[serde(default)]
+    dropped_frames: Option<i64>,
+    #[serde(default)]
+    decoded_frames: Option<i64>,
+    #[serde(default)]
+    player_error: Option<String>,
 }
 
 async fn playback_sample(
@@ -110,6 +122,10 @@ async fn playback_sample(
             transcode_rate_x100: body.transcode_rate_x100,
             observed_kbps: body.observed_kbps,
             network_state: body.network_state.as_deref(),
+            audio_idx: body.audio_idx,
+            dropped_frames: body.dropped_frames,
+            decoded_frames: body.decoded_frames,
+            player_error: body.player_error.as_deref(),
         },
     )
     .await;

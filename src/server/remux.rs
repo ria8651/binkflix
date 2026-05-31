@@ -188,6 +188,7 @@ async fn open_playback_session(
             target_bitrate_kbps: None,
             browser: browser.as_deref(),
             room_id: None,
+            audio_idx: None,
             forced_via_query,
         },
     )

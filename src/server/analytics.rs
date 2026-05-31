@@ -106,6 +106,7 @@ pub struct PlaybackSessionStart<'a> {
     pub target_bitrate_kbps: Option<u32>,
     pub browser: Option<&'a str>,
     pub room_id: Option<&'a str>,
+    pub audio_idx: Option<u32>,
     pub forced_via_query: bool,
 }
 
@@ -115,8 +116,8 @@ pub async fn open_playback_session(pool: &SqlitePool, s: PlaybackSessionStart<'_
             (id, user_sub, media_id, started_at, delivery_mode, chosen_reason,
              src_video_codec, src_audio_codec, src_container,
              out_video_codec, out_audio_codec, out_container,
-             target_bitrate_kbps, browser, room_id, forced_via_query)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             target_bitrate_kbps, browser, room_id, audio_idx, forced_via_query)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(s.id)
     .bind(s.user_sub)
@@ -133,6 +134,7 @@ pub async fn open_playback_session(pool: &SqlitePool, s: PlaybackSessionStart<'_
     .bind(s.target_bitrate_kbps.map(|n| n as i64))
     .bind(s.browser)
     .bind(s.room_id)
+    .bind(s.audio_idx.map(|n| n as i64))
     .bind(s.forced_via_query as i64)
     .execute(pool)
     .await;
@@ -170,6 +172,24 @@ pub async fn set_playback_outputs(
     }
 }
 
+/// Startup backstop: close playback sessions a previous process left open
+/// (its in-memory idle sweeper never ran). Scoped to rows older than a day
+/// so a quick restart doesn't stomp a legacy `/stream` session that the
+/// `SessionEndGuard` is about to close cleanly.
+pub async fn close_dangling_sessions(pool: &SqlitePool) {
+    let cutoff = now_secs() - 86_400;
+    let res = sqlx::query(
+        "UPDATE playback_sessions SET ended_at = started_at
+         WHERE ended_at IS NULL AND started_at < ?",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!(%e, "failed to close dangling playback sessions on startup");
+    }
+}
+
 pub async fn close_playback_session(
     pool: &SqlitePool,
     session_id: &str,
@@ -201,6 +221,10 @@ pub struct PlaybackSample<'a> {
     pub transcode_rate_x100: Option<i64>,
     pub observed_kbps: Option<i64>,
     pub network_state: Option<&'a str>,
+    pub audio_idx: Option<u32>,
+    pub dropped_frames: Option<i64>,
+    pub decoded_frames: Option<i64>,
+    pub player_error: Option<&'a str>,
 }
 
 pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
@@ -208,8 +232,9 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
         "INSERT INTO playback_samples
             (session_id, ts, position_ms, buffered_ahead_ms,
              transcode_position_ms, transcode_rate_x100,
-             observed_kbps, network_state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             observed_kbps, network_state,
+             audio_idx, dropped_frames, decoded_frames, player_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(s.session_id)
     .bind(now_ms())
@@ -219,6 +244,10 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
     .bind(s.transcode_rate_x100)
     .bind(s.observed_kbps)
     .bind(s.network_state)
+    .bind(s.audio_idx.map(|n| n as i64))
+    .bind(s.dropped_frames)
+    .bind(s.decoded_frames)
+    .bind(s.player_error)
     .execute(pool)
     .await;
     if let Err(e) = res {

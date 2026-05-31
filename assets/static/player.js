@@ -913,6 +913,82 @@ async function describeHttpError(resp) {
     return `Request failed (${resp.status}).`;
 }
 
+// HTMLMediaElement.networkState → the `idle|loading|stalled` surface the
+// server's playback_samples column expects. `stalled` isn't a networkState
+// value (it's an event), so it's inferred: loading-but-no-buffer-ahead.
+function networkStateLabel(video, bufferedAheadMs) {
+    switch (video.networkState) {
+        case 2: // NETWORK_LOADING
+            return bufferedAheadMs === 0 && !video.paused ? "stalled" : "loading";
+        case 1: // NETWORK_IDLE
+            return "idle";
+        default: // EMPTY / NO_SOURCE
+            return "idle";
+    }
+}
+
+// The selected audio track index, parsed from the m3u8 URL's `?a=`.
+// Mirrors the server's `audio_idx` so a "wrong audio track" can be caught
+// by comparing this across members of a watch party.
+function audioIdxFromUrl(url) {
+    try {
+        const v = new URL(url, location.href).searchParams.get("a");
+        const n = Number.parseInt(v ?? "0", 10);
+        return Number.isFinite(n) && n >= 0 ? n : 0;
+    } catch (_) {
+        return 0;
+    }
+}
+
+// Optional per-viewer metrics stream. Posts a playback sample every 5s
+// while a session is active. These are the signals only the browser can
+// see — rendered audio track, dropped/decoded frame counts, network
+// state, decode errors — so server-side telemetry can attribute A/V
+// issues to a specific viewer. Best-effort: failures are swallowed and
+// the next tick retries.
+const SAMPLE_INTERVAL_MS = 5000;
+function startSampler(videoId, sessionId, audioIdx) {
+    if (!sessionId) return null;
+    const tick = () => {
+        const video = getVideo(videoId);
+        if (!video) return;
+        const stats = getDebugStats(videoId);
+        if (!stats) return;
+        const bufferedAheadMs = stats.buffered_ahead_seconds != null
+            ? Math.round(stats.buffered_ahead_seconds * 1000)
+            : null;
+        const body = {
+            session_id: sessionId,
+            position_ms: Math.round((video.currentTime || 0) * 1000),
+            buffered_ahead_ms: bufferedAheadMs,
+            network_state: networkStateLabel(video, bufferedAheadMs),
+            audio_idx: audioIdx,
+            dropped_frames: stats.dropped_frames,
+            decoded_frames: stats.total_frames,
+            player_error: stats.error
+                ? `code ${stats.error.code}: ${stats.error.message || ""}`.trim()
+                : null,
+        };
+        // `keepalive` so the final sample still flushes during a soft-nav
+        // teardown without needing a separate sendBeacon path.
+        fetch("/api/playback/sample", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+            keepalive: true,
+        }).catch(() => { /* best-effort */ });
+    };
+    tick(); // immediate first sample so short plays still register
+    return setInterval(tick, SAMPLE_INTERVAL_MS);
+}
+
+// Record an attachment plus start its metrics sampler in one place, so
+// every code path through `attachInner` wires the session consistently.
+function finalizeAttach(videoId, hls, url, sessionId) {
+    const sampler = startSampler(videoId, sessionId, audioIdxFromUrl(url));
+    attached.set(videoId, { hls, url, sessionId, sampler });
+}
+
 function attach(videoId, url, opts) {
     // Serialize attach/detach through the same per-video queue the
     // subtitle code uses so a second `attach` arriving mid-`loadHlsJs`
@@ -946,12 +1022,18 @@ async function attachInner(videoId, url, opts) {
     // <video> element's, so without this the user sees nothing on a 501.
     // For non-HLS URLs the `<video>` element does surface load errors,
     // but we still pre-flight to give a richer message than "code 4".
+    // Server-derived playback session id, handed back on the m3u8
+    // response (see `X-Playback-Session` in the HLS handler). Drives the
+    // optional per-viewer metrics stream below. Absent on the `?mode=
+    // direct` /stream path, in which case no sampler runs.
+    let sessionId = null;
     try {
         const probe = await fetch(url, { method: "GET" });
         if (!probe.ok) {
             surfaceError(video, await describeHttpError(probe));
             return;
         }
+        sessionId = probe.headers.get("x-playback-session");
     } catch (e) {
         surfaceError(video, `Network error: ${e?.message || e}`);
         return;
@@ -964,7 +1046,7 @@ async function attachInner(videoId, url, opts) {
     // start position without any client-side fragment hack.
     if (isHls && video.canPlayType("application/vnd.apple.mpegurl")) {
         video.src = url;
-        attached.set(videoId, { hls: null, url });
+        finalizeAttach(videoId, null, url, sessionId);
         return;
     }
 
@@ -972,7 +1054,7 @@ async function attachInner(videoId, url, opts) {
     // which still hits the old `/stream` endpoint): set src directly.
     if (!isHls) {
         video.src = url;
-        attached.set(videoId, { hls: null, url });
+        finalizeAttach(videoId, null, url, sessionId);
         return;
     }
 
@@ -1028,12 +1110,13 @@ async function attachInner(videoId, url, opts) {
     if (initialTime > 0) {
         try { hls.startLoad(initialTime); } catch (_) { /* ignore */ }
     }
-    attached.set(videoId, { hls, url });
+    finalizeAttach(videoId, hls, url, sessionId);
 }
 
 function detachSource(videoId) {
     const entry = attached.get(videoId);
     if (!entry) return;
+    if (entry.sampler) clearInterval(entry.sampler);
     try { entry.hls?.destroy(); } catch (_) { /* ignore */ }
     const video = getVideo(videoId);
     if (video) {

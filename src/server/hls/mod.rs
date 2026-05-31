@@ -26,18 +26,21 @@ pub use cache::{cache_root, id_is_safe, is_allowed_name, mime_for};
 pub use hwenc::{detect as detect_hwenc, HwEncoder};
 pub use plan::PLAN_VERSION;
 pub use producer::{sweep_orphan_ffmpegs, ProducerRegistry};
+// SessionRegistry / spawn_session_sweeper are defined in this module.
 
 use super::error::{Error, Result};
 use super::AppState;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Extension, Router};
 use crate::types::MediaTechInfo;
+use dashmap::DashMap;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Query string carried on every HLS endpoint:
 /// * `?a=N` — source audio stream index (defaults to 0).
@@ -69,6 +72,89 @@ impl HlsParams {
     fn idx(&self) -> u32 {
         self.a.unwrap_or(0)
     }
+}
+
+/// Server-driven playback sessions for HLS. The producer pool is
+/// intentionally NOT keyed by user (viewers share producers), so per-viewer
+/// telemetry is tracked separately here: one session row per
+/// `(user, media, audio, mode)`, opened on the first request `serve()`
+/// observes and closed by the idle sweeper after [`SESSION_IDLE`] of no
+/// requests. No client `start`/`end` calls — the lifecycle is entirely
+/// request-driven.
+type SessionKey = (String, String, u32, String);
+
+struct ActiveSession {
+    id: String,
+    started: Instant,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+pub struct SessionRegistry {
+    by_key: DashMap<SessionKey, ActiveSession>,
+}
+
+/// Idle window before a session is considered ended. A viewer's session
+/// lingers this long after their last segment fetch before `ended_at` is
+/// written — fine for analytics.
+const SESSION_IDLE: Duration = Duration::from_secs(45);
+
+impl SessionRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Open-or-refresh the session for `key`. Returns `(session_id,
+    /// is_new)`; the caller inserts the DB row when `is_new`. No `.await`
+    /// is held across the DashMap entry lock.
+    fn touch(&self, key: SessionKey) -> (String, bool) {
+        use dashmap::mapref::entry::Entry;
+        let now = Instant::now();
+        match self.by_key.entry(key) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().last_seen = now;
+                (e.get().id.clone(), false)
+            }
+            Entry::Vacant(e) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                e.insert(ActiveSession {
+                    id: id.clone(),
+                    started: now,
+                    last_seen: now,
+                });
+                (id, true)
+            }
+        }
+    }
+
+    /// Close + drop sessions idle for [`SESSION_IDLE`]. Run on a loop from
+    /// startup (see [`spawn_session_sweeper`]).
+    pub async fn sweep(&self, pool: &sqlx::SqlitePool) {
+        let now = Instant::now();
+        let mut expired: Vec<(String, u64)> = Vec::new();
+        self.by_key.retain(|_, v| {
+            if now.duration_since(v.last_seen) >= SESSION_IDLE {
+                let watched_ms = v.last_seen.duration_since(v.started).as_millis() as u64;
+                expired.push((v.id.clone(), watched_ms));
+                false
+            } else {
+                true
+            }
+        });
+        for (id, watched_ms) in expired {
+            super::analytics::close_playback_session(pool, &id, Some(watched_ms)).await;
+        }
+    }
+}
+
+/// Spawn the 15s loop that closes idle HLS playback sessions.
+pub fn spawn_session_sweeper(sessions: Arc<SessionRegistry>, pool: sqlx::SqlitePool) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            sessions.sweep(&pool).await;
+        }
+    });
 }
 
 /// Cap on the audio index a request can ask for. Sanity bound; real
@@ -286,6 +372,8 @@ fn resolve_bitrate(explicit: Option<u32>, source_kbps: Option<u64>) -> u32 {
 
 async fn serve(
     State(state): State<AppState>,
+    Extension(session): Extension<super::auth::Session>,
+    headers: HeaderMap,
     Path((id, file)): Path<(String, String)>,
     Query(params): Query<HlsParams>,
 ) -> Result<Response> {
@@ -297,6 +385,60 @@ async fn serve(
     let resolved = resolve_plan(&state, &id, audio_idx, &params).await?;
     let ResolvedPlan { plan, plan_dir, src, info, mode_tag } = resolved;
     let path = plan_dir.join(&file);
+
+    // Server-driven playback session: open-or-refresh keyed by
+    // (user, media, audio, mode). Opened on the first request; refreshed
+    // (cheap, in-memory) on every later one; closed by the idle sweeper.
+    // `room_id` is derived from the syncplay hub so a watch party is
+    // attributed without the client passing anything.
+    let (session_id, is_new) = state.active_sessions.touch((
+        session.user_sub.clone(),
+        id.clone(),
+        audio_idx,
+        mode_tag.clone(),
+    ));
+    if is_new {
+        let delivery_mode = match &plan.mode {
+            plan::Mode::Remux => "remux",
+            plan::Mode::Transcode { .. } => "transcode",
+        };
+        let src_video = info.video.as_ref().map(|v| v.codec.as_str());
+        let src_audio = info.audio.get(audio_idx as usize).map(|a| a.codec.as_str());
+        let (out_video, out_audio, bitrate): (Option<&str>, Option<&str>, Option<u32>) =
+            match &plan.mode {
+                plan::Mode::Remux => (src_video, src_audio, None),
+                plan::Mode::Transcode { bitrate_kbps, .. } => {
+                    (Some("h264"), Some("aac"), Some(*bitrate_kbps))
+                }
+            };
+        let room_id = state.hub.room_for_user(&session.user_sub);
+        let browser = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(super::analytics::parse_ua);
+        super::analytics::open_playback_session(
+            &state.pool,
+            super::analytics::PlaybackSessionStart {
+                id: &session_id,
+                user_sub: Some(&session.user_sub),
+                media_id: &id,
+                delivery_mode,
+                chosen_reason: None,
+                src_video_codec: src_video,
+                src_audio_codec: src_audio,
+                src_container: info.container.as_deref(),
+                out_video_codec: out_video,
+                out_audio_codec: out_audio,
+                out_container: Some("mp4"),
+                target_bitrate_kbps: bitrate,
+                browser: browser.as_deref(),
+                room_id: room_id.as_deref(),
+                audio_idx: Some(audio_idx),
+                forced_via_query: params.mode.is_some(),
+            },
+        )
+        .await;
+    }
 
     if file == "index.m3u8" {
         // Clamp the requested start to inside the plan's covered range.
@@ -332,6 +474,11 @@ async fn serve(
         if let Ok(v) = HeaderValue::from_str(mode_str) {
             h.insert("X-Stream-Mode", v);
         }
+        // Hand the client its server-derived session id so the optional
+        // metrics stream can tag samples without a separate start call.
+        if let Ok(v) = HeaderValue::from_str(&session_id) {
+            h.insert("X-Playback-Session", v);
+        }
         // For transcode, advertise the H.264 encoder that's effectively
         // active. `current_encoder_name` honours the runtime-fallback
         // sticky flag, so a second playback after a hw-startup failure
@@ -354,6 +501,7 @@ async fn serve(
         mode_tag,
         audio: plan::derive_audio_plan(&info, audio_idx),
         hw: state.hwenc,
+        pool: state.pool.clone(),
     };
 
     if file == "init.mp4" {
