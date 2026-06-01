@@ -1080,7 +1080,7 @@ fn ContinueCard(
             on_change.call(());
         });
     };
-    let media_id_for_dismiss = item.media_id.clone();
+    let media_id_for_dismiss = item.progress_id.clone();
     let on_dismiss = move |evt: Event<MouseData>| {
         evt.stop_propagation();
         let id = media_id_for_dismiss.clone();

@@ -454,6 +454,11 @@ pub struct ProgressReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContinueItem {
     pub media_id: String,
+    /// The `watch_progress` row backing this tile. Equals `media_id` for movies
+    /// and in-progress episodes; for an "up next" tile (where `media_id` is the
+    /// next, not-yet-started episode) it's the *completed* previous episode that
+    /// generated the tile. Dismiss/hide must target this, not `media_id`.
+    pub progress_id: String,
     pub kind: String,
     /// For episodes, the episode's own title; for movies, the movie title.
     /// The client composes the second-line subtitle ("Show · S1E2" / year)

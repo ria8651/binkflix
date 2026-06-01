@@ -234,6 +234,7 @@ pub async fn continue_watching(
                     continue;
                 }
                 out.push(ContinueItem {
+                    progress_id: r.media_id.clone(),
                     media_id: r.media_id,
                     kind: "movie".into(),
                     title: r.title,
@@ -256,6 +257,7 @@ pub async fn continue_watching(
                 }
                 if r.completed == 0 {
                     out.push(ContinueItem {
+                        progress_id: r.media_id.clone(),
                         media_id: r.media_id,
                         kind: "episode".into(),
                         title: r.title,
@@ -279,6 +281,9 @@ pub async fn continue_watching(
                         continue;
                     }
                     out.push(ContinueItem {
+                        // Dismissing this "up next" tile must hide the *previous*
+                        // completed episode's row — the next episode has no row yet.
+                        progress_id: r.media_id,
                         media_id: next.id,
                         kind: "episode".into(),
                         title: next.title,
