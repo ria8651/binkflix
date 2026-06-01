@@ -121,8 +121,9 @@ pub async fn open_playback_session(pool: &SqlitePool, s: PlaybackSessionStart<'_
             (id, user_sub, media_id, started_at, delivery_mode, chosen_reason,
              src_video_codec, src_audio_codec, src_container,
              out_video_codec, out_audio_codec, out_container,
-             target_bitrate_kbps, browser, room_id, audio_idx, forced_via_query)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             target_bitrate_kbps, browser, room_id, audio_idx, forced_via_query,
+             server_build_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(s.id)
     .bind(s.user_sub)
@@ -141,6 +142,7 @@ pub async fn open_playback_session(pool: &SqlitePool, s: PlaybackSessionStart<'_
     .bind(s.room_id)
     .bind(s.audio_idx.map(|n| n as i64))
     .bind(s.forced_via_query as i64)
+    .bind(crate::types::BUILD_ID)
     .execute(pool)
     .await;
     if let Err(e) = res {
@@ -230,6 +232,10 @@ pub struct PlaybackSample<'a> {
     pub dropped_frames: Option<i64>,
     pub decoded_frames: Option<i64>,
     pub player_error: Option<&'a str>,
+    /// Build the viewer's frontend bundle was compiled with (reported by the
+    /// client). Differs from the session's `server_build_id` when the viewer
+    /// is on a stale cached frontend.
+    pub client_build_id: Option<&'a str>,
 }
 
 pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
@@ -238,8 +244,9 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
             (session_id, ts, position_ms, buffered_ahead_ms,
              transcode_position_ms, transcode_rate_x100,
              observed_kbps, network_state,
-             audio_idx, dropped_frames, decoded_frames, player_error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             audio_idx, dropped_frames, decoded_frames, player_error,
+             client_build_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(s.session_id)
     .bind(now_ms())
@@ -253,6 +260,7 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
     .bind(s.dropped_frames)
     .bind(s.decoded_frames)
     .bind(s.player_error)
+    .bind(s.client_build_id)
     .execute(pool)
     .await;
     if let Err(e) = res {

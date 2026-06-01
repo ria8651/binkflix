@@ -84,6 +84,10 @@ struct PlaybackSampleBody {
     decoded_frames: Option<i64>,
     #[serde(default)]
     player_error: Option<String>,
+    /// Build id of the client bundle posting this sample. Compared against the
+    /// session's `server_build_id` to catch viewers on a stale cached frontend.
+    #[serde(default)]
+    client_build_id: Option<String>,
 }
 
 async fn playback_sample(
@@ -126,6 +130,7 @@ async fn playback_sample(
             dropped_frames: body.dropped_frames,
             decoded_frames: body.decoded_frames,
             player_error: body.player_error.as_deref(),
+            client_build_id: body.client_build_id.as_deref(),
         },
     )
     .await;

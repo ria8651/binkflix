@@ -30,6 +30,19 @@ pub enum Route {
 
 #[component]
 pub fn App() -> Element {
+    // Publish the compiled-in build id so player.js can stamp playback
+    // telemetry with the frontend build this tab is actually running. A
+    // stale cached client carries an old id here vs the server's current
+    // build — see migration 0023. Client-only (effects don't run during SSR).
+    use_effect(|| {
+        spawn(async {
+            let _ = document::eval(&format!(
+                "window.__binkflixBuildId = {:?};",
+                crate::types::BUILD_ID
+            ))
+            .await;
+        });
+    });
     rsx! {
         document::Stylesheet { href: asset!("/assets/tokens.css") }
         document::Stylesheet { href: asset!("/assets/style.css") }
@@ -40,11 +53,8 @@ pub fn App() -> Element {
         }
         // Synchronous stub queues calls made before the async module below
         // finishes evaluating; the module replays the queue on load.
-        // Served via axum's ServeDir (see server/mod.rs) rather than the
-        // Dioxus asset pipeline, which strips Content-Type — browsers reject
-        // `<script type="module">` without `application/javascript`.
-        document::Script { src: "/static/player-stub.js" }
-        document::Script { src: "/static/player.js", r#type: "module" }
+        document::Script { src: asset!("/assets/player-stub.js") }
+        document::Script { src: asset!("/assets/player.js"), r#type: "module" }
         Router::<Route> {}
     }
 }

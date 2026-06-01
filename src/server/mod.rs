@@ -443,15 +443,16 @@ async fn run_async() -> anyhow::Result<()> {
     }
     let my_routes = my_routes.with_state(state.clone());
 
-    // Vendored static files that need stable, unhashed URLs — JASSUB's worker
-    // and wasm can't go through Dioxus's asset pipeline because the JS module
-    // references them by literal path at runtime. Served directly from
-    // `assets/jassub/` so the URLs stay same-origin (CORS-safe for Worker).
-    // Vendored static files that need stable, unhashed URLs — JASSUB's worker
-    // and wasm can't go through Dioxus's asset pipeline because the JS module
-    // references them by literal path at runtime. Same for our own player.js:
-    // the asset pipeline was stripping Content-Type, which browsers reject
-    // for `<script type="module">`. ServeDir sets the right MIME.
+    // Vendored static files that need stable, unhashed URLs and so can't go
+    // through Dioxus's asset pipeline:
+    //   /jassub  — JASSUB's worker + wasm, referenced by literal path at
+    //              runtime by the ES module (and same-origin → CORS-safe for
+    //              the Worker).
+    //   /static  — web fonts, referenced from style.css by absolute
+    //              `/static/fonts/...` URLs.
+    // (player.js itself now goes through `asset!()` — Dioxus 0.7 serves it
+    // with the correct `text/javascript`, so it gets content-hashed
+    // cache-busting like the rest of the bundle.)
     let router = axum::Router::new()
         .serve_dioxus_application(ServeConfig::new(), App)
         .nest_service("/jassub", ServeDir::new("assets/jassub"))

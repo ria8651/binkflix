@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Build identity baked in at compile time, shared by client and server (same
+/// crate, same build → same value). The Docker build populates
+/// `BINKFLIX_BUILD_ID` (a git short SHA); when unset it's empty rather than a
+/// guessed label — we don't actually know it's a dev build. Used to tag
+/// playback telemetry so a stale cached frontend — an old client build talking
+/// to a newer server — is detectable in analytics. See migration 0023.
+// Consumed only by the `web` (app.rs) and `server` (analytics) builds; the
+// default feature set compiles neither, so allow it to be unused there.
+#[allow(dead_code)]
+pub const BUILD_ID: &str = match option_env!("BINKFLIX_BUILD_ID") {
+    Some(s) => s,
+    None => "",
+};
+
 /// Returned by `/api/me`. Lets the client gate UI on the same perms the
 /// server enforces.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

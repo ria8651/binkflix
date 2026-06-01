@@ -967,6 +967,10 @@ function startSampler(videoId, sessionId, audioIdx) {
             : null;
         const body = {
             session_id: sessionId,
+            // Build of the frontend bundle actually running in this tab,
+            // published by the WASM client on mount. A mismatch against the
+            // session's server build flags a stale cached client.
+            client_build_id: window.__binkflixBuildId || null,
             position_ms: Math.round((video.currentTime || 0) * 1000),
             buffered_ahead_ms: bufferedAheadMs,
             network_state: networkStateLabel(video, bufferedAheadMs),
