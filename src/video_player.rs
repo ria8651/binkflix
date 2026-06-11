@@ -833,19 +833,24 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                         .map(|d| d.show.title);
                     match media_snapshot {
                         Some(Ok(m)) => {
-                            let (primary, secondary) = if m.kind == "episode" {
+                            let (primary, secondary, show_link) = if m.kind == "episode" {
                                 let ep_label = match (m.season_number, m.episode_number) {
                                     (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02} · {}", m.title)),
                                     _ => Some(m.title.clone()),
                                 };
                                 let primary = show_title.unwrap_or_else(|| m.title.clone());
-                                (primary, ep_label)
+                                let link = m.show_id.clone().map(|sid| crate::app::Route::ShowDetail { id: sid });
+                                (primary, ep_label, link)
                             } else {
-                                (m.title.clone(), m.year.map(|y| y.to_string()))
+                                (m.title.clone(), m.year.map(|y| y.to_string()), None)
                             };
                             rsx! {
                                 div { class: "player-topbar-title",
-                                    div { class: "player-topbar-primary", "{primary}" }
+                                    if let Some(to) = show_link {
+                                        Link { to, class: "player-topbar-primary player-topbar-primary-link", "{primary}" }
+                                    } else {
+                                        div { class: "player-topbar-primary", "{primary}" }
+                                    }
                                     if let Some(sec) = secondary {
                                         div { class: "player-topbar-secondary", "{sec}" }
                                     }
