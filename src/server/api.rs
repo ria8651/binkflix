@@ -63,11 +63,11 @@ struct PlaybackSampleBody {
     session_id: String,
     position_ms: i64,
     buffered_ahead_ms: Option<i64>,
-    transcode_position_ms: Option<i64>,
-    /// Transcode rate as `realtime × 100` (e.g. 125 == 1.25× realtime).
-    /// Integer rather than float so SQL aggregation (avg, min, max) is
-    /// straightforward and we don't pay for `REAL` storage on every row.
-    transcode_rate_x100: Option<i64>,
+    /// Viewer's own network throughput (the one transcode-ish field the
+    /// browser can actually see). `transcode_position_ms` /
+    /// `transcode_rate_x100` are *not* accepted from the client — they
+    /// describe ffmpeg's progress and are filled server-side from the live
+    /// producer in `playback_sample`.
     observed_kbps: Option<i64>,
     /// `idle` | `loading` | `stalled` — matches the HTMLMediaElement
     /// `networkState` enum surface the player can observe.
@@ -97,33 +97,55 @@ async fn playback_sample(
 ) -> StatusCode {
     // Verify the caller actually owns this playback session. Without this,
     // any authenticated peer can spray samples attributed to someone else's
-    // session_id (or to a fabricated one) and pollute analytics.
-    let row: Option<(Option<String>,)> = match sqlx::query_as(
-        "SELECT user_sub FROM playback_sessions WHERE id = ?",
-    )
-    .bind(&body.session_id)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => return StatusCode::NO_CONTENT,
+    // session_id (or to a fabricated one) and pollute analytics. We pull the
+    // delivery params in the same round-trip so we can attach authoritative
+    // server-side transcode telemetry below.
+    let row: Option<(Option<String>, String, String, Option<i64>, Option<i64>)> =
+        match sqlx::query_as(
+            "SELECT user_sub, media_id, delivery_mode, audio_idx, target_bitrate_kbps
+             FROM playback_sessions WHERE id = ?",
+        )
+        .bind(&body.session_id)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => return StatusCode::NO_CONTENT,
+        };
+    let Some((owner, media_id, delivery_mode, audio_idx, target_bitrate)) = row else {
+        // Unknown session.
+        return StatusCode::FORBIDDEN;
     };
-    let owner = row.and_then(|(s,)| s);
-    // Reject samples for unknown sessions, and for sessions whose recorded
-    // user_sub doesn't match the caller. Sessions whose owner column is
-    // NULL (legacy rows from before auth was wired in) are also rejected so
-    // we don't keep an unauthenticated escape hatch alive.
+    // Reject samples for sessions whose recorded user_sub doesn't match the
+    // caller. Sessions whose owner column is NULL (legacy rows from before
+    // auth was wired in) are also rejected so we don't keep an
+    // unauthenticated escape hatch alive.
     if owner.as_deref() != Some(session.user_sub.as_str()) {
         return StatusCode::FORBIDDEN;
     }
+
+    // `transcode_position_ms` / `transcode_rate_x100` describe ffmpeg's
+    // progress, which only the server can see — fill them from the live
+    // producer rather than trusting the client (which leaves them None).
+    // `observed_kbps` stays whatever the client reports: it's the viewer's
+    // own network throughput. Resolve the same `(audio_idx, mode_tag)` key
+    // the HLS endpoint cached under so we snapshot the right producer.
+    let (transcode_position_ms, transcode_rate_x100) =
+        match server_transcode_telemetry(&state, &media_id, &delivery_mode, audio_idx, target_bitrate)
+            .await
+        {
+            Some((pos, rate)) => (Some(pos), Some(rate)),
+            None => (None, None),
+        };
+
     analytics::record_playback_sample(
         &state.pool,
         PlaybackSample {
             session_id: &body.session_id,
             position_ms: body.position_ms,
             buffered_ahead_ms: body.buffered_ahead_ms,
-            transcode_position_ms: body.transcode_position_ms,
-            transcode_rate_x100: body.transcode_rate_x100,
+            transcode_position_ms,
+            transcode_rate_x100,
             observed_kbps: body.observed_kbps,
             network_state: body.network_state.as_deref(),
             audio_idx: body.audio_idx,
@@ -135,6 +157,40 @@ async fn playback_sample(
     )
     .await;
     StatusCode::NO_CONTENT
+}
+
+/// Snapshot the live HLS producer for a session and return
+/// `(transcode_position_ms, transcode_rate_x100)`. `None` when the session
+/// isn't going through the transcode/remux pipeline (direct serve has no
+/// producer) or no producer is currently live for that key. The producer's
+/// `head` is the highest finished segment; segments are a nominal 6s, so the
+/// encoder's leading edge in media time is `head × 6000ms`.
+async fn server_transcode_telemetry(
+    state: &AppState,
+    media_id: &str,
+    delivery_mode: &str,
+    audio_idx: Option<i64>,
+    target_bitrate: Option<i64>,
+) -> Option<(i64, i64)> {
+    let mode_tag = match delivery_mode {
+        "remux" => "remux".to_string(),
+        "transcode" => {
+            // Reconstruct the same `tx{bitrate}h{height}` tag the HLS
+            // endpoint caches under (see `resolve_plan`).
+            let bitrate = u32::try_from(target_bitrate?).ok()?;
+            let height = super::hls::height_for_bitrate(bitrate);
+            format!("tx{bitrate}h{height}")
+        }
+        // "direct" (or anything else) doesn't spawn a producer.
+        _ => return None,
+    };
+    let audio_idx = audio_idx.and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
+    let snap = state
+        .hls_producers
+        .snapshot(media_id, audio_idx, &mode_tag)
+        .await?;
+    let position_ms = i64::from(snap.head) * 6000;
+    Some((position_ms, i64::from(snap.encode_rate_x100)))
 }
 
 async fn scan_status(State(state): State<AppState>) -> Json<crate::types::ScanProgress> {

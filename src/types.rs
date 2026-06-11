@@ -279,6 +279,13 @@ pub struct HlsProducerState {
     pub target_head: u32,
     pub paused: bool,
     pub idle_for_secs: f64,
+    /// Recent encode throughput as `realtime × 100` (e.g. 250 == ffmpeg is
+    /// producing 2.5s of media per wall-second). Measured over a short
+    /// sliding window of `head` advances, so it reads ~0 whenever the
+    /// producer is SIGSTOP'd by backpressure (`paused == true`) — to tell
+    /// "encoder can't keep up" from "encoder throttled because the buffer
+    /// is full", read this together with `paused` and `head` vs `target_head`.
+    pub encode_rate_x100: u32,
     /// How many segments past the most recently requested one ffmpeg
     /// is permitted to read ahead.
     pub lookahead_buffer: u32,

@@ -25,6 +25,7 @@ mod producer;
 pub use cache::{cache_root, id_is_safe, is_allowed_name, mime_for};
 pub use hwenc::{detect as detect_hwenc, HwEncoder};
 pub use plan::PLAN_VERSION;
+pub use plan::height_for_bitrate;
 pub use producer::{sweep_orphan_ffmpegs, ProducerRegistry};
 // SessionRegistry / spawn_session_sweeper are defined in this module.
 

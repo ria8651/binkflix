@@ -155,6 +155,7 @@ impl ProducerRegistry {
         let head = h.head.load(Ordering::Acquire);
         let target_head = h.target_head.load(Ordering::Acquire);
         let paused = h.paused.load(Ordering::Acquire);
+        let encode_rate_x100 = h.rate_x100.load(Ordering::Acquire);
         let idle_for_secs = h.last_request_at.read().await.elapsed().as_secs_f64();
         Some(crate::types::HlsProducerState {
             start_idx,
@@ -162,6 +163,7 @@ impl ProducerRegistry {
             target_head,
             paused,
             idle_for_secs,
+            encode_rate_x100,
             lookahead_buffer: LOOKAHEAD_BUFFER,
             lookahead_window: LOOKAHEAD_WINDOW,
         })
@@ -220,6 +222,11 @@ pub struct ProducerHandle {
     /// Highest segment such that all of `[start_idx ..= head]` exist
     /// in canonical. Advanced by the watcher.
     pub head: Arc<AtomicU32>,
+    /// Recent encode throughput, `realtime × 100`. Maintained by the
+    /// watcher from a sliding window of `head` advances; surfaced via
+    /// `snapshot` for `transcode_rate_x100` telemetry. Reads ~0 while
+    /// SIGSTOP'd, since `head` doesn't move then.
+    pub rate_x100: Arc<AtomicU32>,
     /// Highest segment ffmpeg is allowed to advance to in this pull.
     /// Bumped by `ensure_segment` on each request to `idx +
     /// LOOKAHEAD_BUFFER`; ffmpeg is SIGSTOP'd whenever
@@ -671,6 +678,7 @@ async fn launch_once(
 
     let total_segments = ctx.plan.segments.len() as u32;
     let head = Arc::new(AtomicU32::new(target_idx.saturating_sub(1)));
+    let rate_x100 = Arc::new(AtomicU32::new(0));
     // Initial pull window: serve the requested segment plus a small
     // read-ahead. ffmpeg will produce up to here and then SIGSTOP until
     // another request bumps target_head further.
@@ -685,6 +693,7 @@ async fn launch_once(
         ctx.plan_dir.clone(),
         run_dir.path().to_path_buf(),
         head.clone(),
+        rate_x100.clone(),
         total_segments,
         target_idx,
         meta.clone(),
@@ -702,6 +711,7 @@ async fn launch_once(
     Ok(ProducerHandle {
         start_idx: target_idx,
         head,
+        rate_x100,
         target_head,
         paused,
         last_request_at,
@@ -988,17 +998,25 @@ fn spawn_watcher(
     plan_dir: PathBuf,
     run_dir: PathBuf,
     head: Arc<AtomicU32>,
+    rate_x100: Arc<AtomicU32>,
     total_segments: u32,
     target_idx: u32,
     meta: EventMeta,
 ) -> JoinHandle<()> {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     let canonical_init = plan_dir.join("init.mp4");
     let scratch_init = run_dir.join("init.mp4");
     let mut prev_sizes: HashMap<u32, u64> = HashMap::new();
     // Throttle promote-failure telemetry — the watcher ticks every 100ms,
     // so a persistent failure would otherwise flood the events table.
     let mut promote_failures: u64 = 0;
+    // Sliding window of (sampled_at, head) for the encode-rate estimate.
+    // One entry per tick; pruned to RATE_WINDOW. Rate = media-seconds
+    // produced (head delta × nominal 6s segment) per wall-second over the
+    // window, so a SIGSTOP'd producer (head frozen) decays to 0.
+    let mut rate_window: VecDeque<(Instant, u32)> = VecDeque::new();
+    const RATE_WINDOW: Duration = Duration::from_secs(6);
+    const NOMINAL_SEG_SECS: f64 = 6.0;
     tokio::spawn(async move {
         loop {
             // Snapshot the scratch dir: idx → (path, size).
@@ -1092,6 +1110,24 @@ fn spawn_watcher(
             if next != cur {
                 head.store(next, Ordering::Release);
             }
+
+            // Update the encode-rate estimate from the head trajectory over
+            // the trailing RATE_WINDOW. Oldest-vs-newest within the window
+            // keeps it a true throughput average (and ~0 while paused).
+            let now = Instant::now();
+            rate_window.push_back((now, next));
+            while rate_window.front().is_some_and(|(t, _)| now.duration_since(*t) > RATE_WINDOW) {
+                rate_window.pop_front();
+            }
+            if let (Some((t0, h0)), Some((t1, h1))) =
+                (rate_window.front().copied(), rate_window.back().copied())
+            {
+                let dt = t1.duration_since(t0).as_secs_f64();
+                let media_secs = h1.saturating_sub(h0) as f64 * NOMINAL_SEG_SECS;
+                let rate = if dt > 0.0 { (media_secs / dt * 100.0).round() } else { 0.0 };
+                rate_x100.store(rate.clamp(0.0, u32::MAX as f64) as u32, Ordering::Release);
+            }
+
             if next >= total_segments {
                 return;
             }
