@@ -743,6 +743,12 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
         // `Date.now()` of the last genuine local play/pause/seek we emitted —
         // drives the Resync grace window.
         let last_local_action_ms: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
+        // Hysteresis latch for drift correction: `true` while we're gliding the
+        // <video> back via `playbackRate` (a periodic Resync found us off by
+        // more than the slew onset). Stays latched across 5s Resync cycles until
+        // we're inside the deadband, so we converge to ~0 drift instead of
+        // parking at the snap threshold and flapping. See `apply_remote`.
+        let slewing: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
         let handle_slot: Rc<RefCell<Option<ListenerHandle>>> =
             use_hook(|| Rc::new(RefCell::new(None)));
 
@@ -814,6 +820,7 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
             let last_applied_seek_ms_l = last_applied_seek_ms.clone();
             let last_emitted_seek_ms_l = last_emitted_seek_ms.clone();
             let last_local_action_ms_l = last_local_action_ms.clone();
+            let slewing_l = slewing.clone();
             let slot = handle_slot.clone();
             use_hook(|| {
                 wasm_bindgen_futures::spawn_local(async move {
@@ -928,6 +935,7 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
                                 let applying_until_sync = applying_until_l.clone();
                                 let last_applied_sync = last_applied_seek_ms_l.clone();
                                 let last_local_sync = last_local_action_ms_l.clone();
+                                let slewing_sync = slewing_l.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
                                     for _ in 0..100 {
                                         if video_for_sync.ready_state() >= 1 {
@@ -954,6 +962,7 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
                                         &applying_until_sync,
                                         &last_applied_sync,
                                         &last_local_sync,
+                                        &slewing_sync,
                                     );
                                 });
                             }
@@ -971,6 +980,7 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
             let applying_until_r = applying_until.clone();
             let last_applied_seek_ms_r = last_applied_seek_ms.clone();
             let last_local_action_ms_r = last_local_action_ms.clone();
+            let slewing_r = slewing.clone();
             use_effect(move || {
                 let Some(evt) = ctx.last_remote.read().clone() else { return };
                 let Some(video) = lookup_video(&video_dom_id) else { return };
@@ -980,6 +990,7 @@ pub fn SyncplayBridge(video_dom_id: String, media_id: String) -> Element {
                     &applying_until_r,
                     &last_applied_seek_ms_r,
                     &last_local_action_ms_r,
+                    &slewing_r,
                 );
             });
         }
@@ -1010,10 +1021,32 @@ const SEEK_MIN_DELTA_MS: f64 = 250.0;
 // held ArrowRight that sets currentTime per keypress) into one ClientMsg::Seek.
 #[cfg(feature = "web")]
 const SEEK_DEBOUNCE_MS: u32 = 200;
-// A periodic Resync only hard-snaps position beyond this drift; smaller drift
-// is tolerated so normal playback jitter never triggers a jump.
+// Graded Resync drift correction. Rather than one hard-seek threshold (which
+// jerked any viewer parked near it back-and-forth as projection jitter tipped
+// the measured drift over the line), drift is corrected by *gliding*
+// `playbackRate` and a hard seek is reserved for gross drift:
+//   - below ONSET: tolerated (normal playback/offset jitter), no correction.
+//   - ONSET..HARD: glide back via playbackRate (imperceptible; pitch preserved
+//     by the browser for changes this small), latched until inside DEADBAND.
+//   - above HARD: too far to glide in reasonable time — hard seek (recorded as
+//     a snap for telemetry).
+// DEADBAND < ONSET gives hysteresis: once gliding we converge fully to ~0 drift
+// and won't restart until drift exceeds ONSET again, so nobody parks at a
+// threshold and flaps.
 #[cfg(feature = "web")]
-const RESYNC_DRIFT_SNAP_S: f64 = 2.0;
+const RESYNC_SLEW_ONSET_S: f64 = 0.75;
+#[cfg(feature = "web")]
+const RESYNC_SLEW_DEADBAND_S: f64 = 0.25;
+#[cfg(feature = "web")]
+const RESYNC_HARD_SNAP_S: f64 = 3.0;
+// playbackRate nudge per second of drift, and its cap. 0.06/s reaches the 10%
+// cap at ~1.7s of drift; 10% is the usual ceiling for staying imperceptible
+// with the browser's default pitch preservation. Resync fires every 5s, so the
+// per-cycle pull is at most ~0.10 × 5s = 0.5s — gentle and overshoot-resistant.
+#[cfg(feature = "web")]
+const RESYNC_SLEW_GAIN: f64 = 0.06;
+#[cfg(feature = "web")]
+const RESYNC_SLEW_MAX: f64 = 0.10;
 // After a genuine local play/pause/seek, ignore Resync *position* snaps for
 // this long so an in-flight stale Resync can't revert a fresh local seek.
 // Kept under the 5s Resync period so at most one cycle is ever skipped.
@@ -1041,11 +1074,20 @@ fn apply_remote(
     applying_until: &Rc<Cell<f64>>,
     last_applied_seek_ms: &Rc<Cell<f64>>,
     last_local_action_ms: &Rc<Cell<f64>>,
+    slewing: &Rc<Cell<bool>>,
 ) {
     // Open the time gate generously: a single seek can fire `seeking` +
     // `seeked` and possibly a `pause`/`play`, all of which we want to
     // suppress as locally-originated.
     let gate = || applying_until.set(now_ms_f64() + APPLYING_GATE_MS);
+    // End any in-progress glide and restore normal speed. Called whenever we
+    // hard-seek, hand control back to a local action, or reach the deadband.
+    let end_slew = || {
+        if slewing.get() {
+            video.set_playback_rate(1.0);
+            slewing.set(false);
+        }
+    };
     // Snap the element to `target` (seconds). Records the value so the outbound
     // `seeking` listener recognises this as our own correction and doesn't
     // re-broadcast it — that re-broadcast was the ping-pong loop's fuel.
@@ -1091,16 +1133,71 @@ fn apply_remote(
                 gate();
                 let _ = video.pause();
             }
-            // Position is only nudged on large drift, and never while a recent
-            // local action owns the truth — that grace window is what stops a
-            // stale in-flight Resync from reverting a fresh local seek.
+            // Position is corrected by gliding playbackRate (small drift) or a
+            // hard seek (gross drift), and never while a recent local action
+            // owns the truth — that grace window is what stops a stale in-flight
+            // Resync from reverting a fresh local seek.
             let target = *position_ms as f64 / 1000.0;
             let recent_local = now_ms_f64() - last_local_action_ms.get() < RESYNC_GRACE_MS;
-            if !recent_local && (video.current_time() - target).abs() > RESYNC_DRIFT_SNAP_S {
+            let drift = video.current_time() - target;
+            let abs = drift.abs();
+            // `drift` = local − target: ahead (>0) ⇒ slow down (rate < 1),
+            // behind (<0) ⇒ speed up (rate > 1).
+            let slew_rate =
+                || 1.0 + (-drift * RESYNC_SLEW_GAIN).clamp(-RESYNC_SLEW_MAX, RESYNC_SLEW_MAX);
+            if recent_local {
+                // Fresh local action owns the position — don't fight it; drop any
+                // glide so we're back at 1.0× before the grace window lifts.
+                end_slew();
+            } else if abs > RESYNC_HARD_SNAP_S {
+                // Too far to glide in reasonable time — jump. Telemetry: stash
+                // the snap on the element before seeking so player.js's sampler
+                // reports it (positive = snapped forward, negative = back).
+                end_slew();
+                record_resync_snap(video, (-drift * 1000.0) as i64);
                 seek_to(target);
+            } else if !*playing {
+                // Paused: gliding can't move us. Small drift is invisible and
+                // gets resolved by the next Play's seek; gross drift already
+                // hard-seeked above.
+                end_slew();
+            } else if slewing.get() {
+                // Mid-glide: keep nudging until we're inside the deadband.
+                if abs <= RESYNC_SLEW_DEADBAND_S {
+                    end_slew();
+                } else {
+                    video.set_playback_rate(slew_rate());
+                }
+            } else if abs > RESYNC_SLEW_ONSET_S {
+                // Drifted past the onset — start gliding back (latched until
+                // we reach the deadband).
+                video.set_playback_rate(slew_rate());
+                slewing.set(true);
             }
         }
     }
+}
+
+/// Record a Resync drift-snap on the `<video>` element's `data-*` attributes so
+/// player.js's 5s sampler can read-and-reset them into the next
+/// `/api/playback/sample` POST (`resync_snaps` / `resync_snap_ms`). The snap
+/// happens here (this is where `set_current_time` fires) but the telemetry POST
+/// is owned by player.js — the element is the surface both sides already hold,
+/// so stashing on it avoids a second POST path. `data-resync-snaps` accumulates
+/// a count (the sampler clears it each tick), so >1 in one 5s window surfaces
+/// threshold-edge flapping. `data-resync-snap-ms` is the last snap's signed
+/// delta. (Uses `set_attribute` rather than `dataset` — the latter needs the
+/// `DomStringMap` web-sys feature, which isn't enabled.)
+#[cfg(feature = "web")]
+fn record_resync_snap(video: &HtmlVideoElement, delta_ms: i64) {
+    let el: &web_sys::Element = video.unchecked_ref();
+    let count = el
+        .get_attribute("data-resync-snaps")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let _ = el.set_attribute("data-resync-snaps", &count.to_string());
+    let _ = el.set_attribute("data-resync-snap-ms", &delta_ms.to_string());
 }
 
 #[cfg(feature = "web")]
