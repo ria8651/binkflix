@@ -965,6 +965,18 @@ function startSampler(videoId, sessionId, audioIdx) {
         const bufferedAheadMs = stats.buffered_ahead_seconds != null
             ? Math.round(stats.buffered_ahead_seconds * 1000)
             : null;
+        // Resync drift-snaps stashed on the element by the WASM syncplay bridge
+        // (record_resync_snap in apply_remote). Read-and-reset so each sample
+        // reports only the snaps applied since the previous tick.
+        let resyncSnaps = null, resyncSnapMs = null;
+        if (video.dataset.resyncSnaps != null) {
+            resyncSnaps = Number(video.dataset.resyncSnaps) || 0;
+            resyncSnapMs = video.dataset.resyncSnapMs != null
+                ? Number(video.dataset.resyncSnapMs)
+                : null;
+            delete video.dataset.resyncSnaps;
+            delete video.dataset.resyncSnapMs;
+        }
         const body = {
             session_id: sessionId,
             // Build of the frontend bundle actually running in this tab,
@@ -980,6 +992,8 @@ function startSampler(videoId, sessionId, audioIdx) {
             player_error: stats.error
                 ? `code ${stats.error.code}: ${stats.error.message || ""}`.trim()
                 : null,
+            resync_snaps: resyncSnaps,
+            resync_snap_ms: resyncSnapMs,
         };
         // `keepalive` so the final sample still flushes during a soft-nav
         // teardown without needing a separate sendBeacon path.

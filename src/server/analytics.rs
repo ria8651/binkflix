@@ -236,6 +236,11 @@ pub struct PlaybackSample<'a> {
     /// client). Differs from the session's `server_build_id` when the viewer
     /// is on a stale cached frontend.
     pub client_build_id: Option<&'a str>,
+    /// Watch-party Resync drift-snaps applied since the previous sample.
+    /// `resync_snaps` counts them (>1 in one window = threshold-edge flapping);
+    /// `resync_snap_ms` is the last snap's signed delta (+ forward / − back).
+    pub resync_snaps: Option<i64>,
+    pub resync_snap_ms: Option<i64>,
 }
 
 pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
@@ -245,8 +250,8 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
              transcode_position_ms, transcode_rate_x100,
              observed_kbps, network_state,
              audio_idx, dropped_frames, decoded_frames, player_error,
-             client_build_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             client_build_id, resync_snaps, resync_snap_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(s.session_id)
     .bind(now_ms())
@@ -261,6 +266,8 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
     .bind(s.decoded_frames)
     .bind(s.player_error)
     .bind(s.client_build_id)
+    .bind(s.resync_snaps)
+    .bind(s.resync_snap_ms)
     .execute(pool)
     .await;
     if let Err(e) = res {

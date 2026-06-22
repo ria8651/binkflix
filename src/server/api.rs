@@ -88,6 +88,14 @@ struct PlaybackSampleBody {
     /// session's `server_build_id` to catch viewers on a stale cached frontend.
     #[serde(default)]
     client_build_id: Option<String>,
+    /// Watch-party drift-snap telemetry since the previous sample (set by the
+    /// syncplay bridge via the `<video>` element; see `record_resync_snap`).
+    /// `resync_snaps` is a count (>1 = threshold-edge flapping in one window);
+    /// `resync_snap_ms` is the last snap's signed delta (+ forward / − back).
+    #[serde(default)]
+    resync_snaps: Option<i64>,
+    #[serde(default)]
+    resync_snap_ms: Option<i64>,
 }
 
 async fn playback_sample(
@@ -153,6 +161,8 @@ async fn playback_sample(
             decoded_frames: body.decoded_frames,
             player_error: body.player_error.as_deref(),
             client_build_id: body.client_build_id.as_deref(),
+            resync_snaps: body.resync_snaps,
+            resync_snap_ms: body.resync_snap_ms,
         },
     )
     .await;
