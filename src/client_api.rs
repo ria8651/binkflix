@@ -64,6 +64,10 @@ pub async fn get_media_tech(id: &str) -> Result<MediaTechInfo, String> {
     fetch_json(&format!("/api/media/{id}/tech")).await
 }
 
+pub async fn get_markers(id: &str) -> Result<MarkersResponse, String> {
+    fetch_json(&format!("/api/media/{id}/markers.json")).await
+}
+
 // Only consumed from the `#[cfg(feature = "web")]` polling loop in
 // the debug panel; non-web builds compile but never call it.
 #[cfg_attr(not(feature = "web"), allow(dead_code))]

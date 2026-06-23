@@ -59,6 +59,16 @@ const MEDIA_SCAN_VERSION: i64 = 3;
 const SUBTITLES_VERSION: i64 = 1;
 const THUMBNAILS_VERSION: i64 = 1;
 const TRICKPLAY_VERSION: i64 = 1;
+/// Embedded-chapter markers are a byproduct of the essential pass's probe, so
+/// they're gated alongside subtitles via `needs_essential`. Bump this when the
+/// chapter→marker classification changes to re-derive on unchanged files
+/// without forcing a subtitle re-extract. (Audio-detected markers are gated
+/// separately by `AUDIO_MARKERS_VERSION` since they're season-scoped.)
+const MARKERS_VERSION: i64 = 1;
+/// Gates the per-season audio-fingerprint pass. Bump to force re-analysis of
+/// every season after a detection-algorithm change. Day-to-day re-analysis is
+/// driven by fingerprint freshness (a new/changed episode), not this constant.
+const AUDIO_MARKERS_VERSION: i64 = 1;
 
 async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)) {
     let mut p = handle.write().await;
@@ -811,12 +821,192 @@ pub async fn scan_library_with_progress(
         );
     }
 
+    // -- Phase 4: audio-fingerprint intro/outro detection (season-scoped) ----
+    // Runs independently of the per-file asset passes: it correlates whole
+    // seasons, so it can't live inside a per-file loop. No-op when `fpcalc`
+    // is unavailable, and gated per season on fingerprint freshness so a
+    // stable library re-scans for cheap.
+    run_audio_match_pass(pool, library_id, &cancel, &progress).await;
+
     info!(
         ?stats,
         total_elapsed_ms = started.elapsed().as_millis() as u64,
         "scan complete"
     );
     Ok(stats)
+}
+
+/// Phase 4 orchestration: find this library's multi-episode seasons and run
+/// audio-fingerprint detection on the ones that need it. Best-effort — a
+/// failure on one season is logged and the rest continue.
+async fn run_audio_match_pass(
+    pool: &SqlitePool,
+    library_id: i64,
+    cancel: &Option<CancelToken>,
+    progress: &Option<ProgressHandle>,
+) {
+    use super::markers::{self, FpcalcStatus};
+    if markers::fpcalc_status().await != FpcalcStatus::Available {
+        return;
+    }
+
+    // Seasons with ≥2 file-backed episodes — the quorum the detector needs.
+    let seasons: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT show_id, season_number
+         FROM media
+         WHERE library_id = ? AND kind = 'episode' AND deleted_at IS NULL
+               AND show_id IS NOT NULL AND season_number IS NOT NULL
+         GROUP BY show_id, season_number
+         HAVING COUNT(*) >= 2",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    if seasons.is_empty() {
+        return;
+    }
+
+    if let Some(p) = progress {
+        set_progress(p, |s| {
+            s.phase = "audio-match".into();
+            s.current = None;
+            s.active.clear();
+        })
+        .await;
+    }
+
+    for (show_id, season) in seasons {
+        if cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false) {
+            info!("audio-match cancelled between seasons");
+            break;
+        }
+        if let Err(e) = analyze_one_season(pool, &show_id, season, cancel).await {
+            warn!(%show_id, season, %e, "audio-match: season analysis failed");
+        }
+    }
+}
+
+/// Fingerprint + correlate one season, storing `audio`-source markers. Skips
+/// when nothing changed since the last analysis (all members have a current
+/// fingerprint and an up-to-date `audio_markers_version`).
+async fn analyze_one_season(
+    pool: &SqlitePool,
+    show_id: &str,
+    season: i64,
+    cancel: &Option<CancelToken>,
+) -> anyhow::Result<()> {
+    type Row = (
+        String,      // media id
+        String,      // path
+        Option<i64>, // media.content_mtime
+        Option<i64>, // media.content_size
+        i64,         // media.audio_markers_version
+        Option<i64>, // fingerprint.content_mtime
+        Option<i64>, // fingerprint.content_size
+        Option<i64>, // fingerprint.fp_algo_version
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT m.id, m.path, m.content_mtime, m.content_size, m.audio_markers_version,
+                f.content_mtime, f.content_size, f.fp_algo_version
+         FROM media m
+         LEFT JOIN media_fingerprints f ON f.media_id = m.id
+         WHERE m.show_id = ? AND m.season_number = ? AND m.kind = 'episode'
+               AND m.deleted_at IS NULL
+         ORDER BY m.episode_number",
+    )
+    .bind(show_id)
+    .bind(season)
+    .fetch_all(pool)
+    .await?;
+    if rows.len() < 2 {
+        return Ok(());
+    }
+    if rows.len() > super::markers::MAX_SEASON_EPISODES {
+        warn!(
+            %show_id, season, count = rows.len(), cap = super::markers::MAX_SEASON_EPISODES,
+            "audio-match: season exceeds size cap; skipping"
+        );
+        return Ok(());
+    }
+
+    // Re-analyse only if a member is new/changed (no current fingerprint) or
+    // the algorithm version moved.
+    let needs = rows.iter().any(|(_, _, mm, ms, amv, fm, fs, fv)| {
+        let fp_current =
+            mm.is_some() && mm == fm && ms == fs && *fv == Some(super::markers::FP_ALGO_VERSION);
+        !fp_current || *amv < AUDIO_MARKERS_VERSION
+    });
+    if !needs {
+        return Ok(());
+    }
+
+    let mut eps: Vec<super::markers::SeasonEpisode> = Vec::with_capacity(rows.len());
+    for (id, path, mm, ms, _, _, _, _) in &rows {
+        if cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false) {
+            return Ok(());
+        }
+        let video = Path::new(path);
+        let sig = match (mm, ms) {
+            (Some(m), Some(s)) => (*m, *s),
+            _ => stat_signature(video),
+        };
+        let fp = match super::markers::ensure_fingerprint(pool, id, video, sig).await {
+            Ok(fp) if !fp.is_empty() => fp,
+            Ok(_) => {
+                warn!(%id, "audio-match: empty fingerprint; skipping episode");
+                continue;
+            }
+            Err(e) => {
+                warn!(%id, %e, "audio-match: fingerprint failed; skipping episode");
+                continue;
+            }
+        };
+        let duration = match super::media_info::load(pool, id).await {
+            Ok(Some(info)) => info.duration_seconds.unwrap_or(0.0),
+            _ => 0.0,
+        };
+        eps.push(super::markers::SeasonEpisode { media_id: id.clone(), duration, fp });
+    }
+    if eps.len() < 2 {
+        return Ok(());
+    }
+
+    let analyzed = super::markers::analyze_season(&eps);
+    let analyzed_ids: std::collections::HashSet<&str> =
+        analyzed.iter().map(|(id, _)| id.as_str()).collect();
+    let mut total_markers = 0usize;
+    for (media_id, markers) in &analyzed {
+        total_markers += markers.len();
+        if let Err(e) = super::markers::store_markers(pool, media_id, "audio", markers).await {
+            warn!(%media_id, %e, "audio-match: failed to store markers");
+        }
+    }
+
+    // Clear stale `audio` markers for any season member we couldn't fingerprint
+    // this run (e.g. its file was replaced with one fpcalc can't process). Left
+    // alone they'd keep pointing the skip button at old content and never
+    // self-heal, since the failing fingerprint also blocks re-analysis.
+    for (id, ..) in &rows {
+        if !analyzed_ids.contains(id.as_str()) {
+            if let Err(e) = super::markers::store_markers(pool, id, "audio", &[]).await {
+                warn!(%id, %e, "audio-match: failed to clear stale markers");
+            }
+        }
+    }
+
+    // Stamp every member so an unchanged season skips next scan. Done even
+    // for members that failed to fingerprint — they'll re-trip via the
+    // fingerprint-freshness check (no row) on the next run anyway.
+    for (id, ..) in &rows {
+        let _ = sqlx::query("UPDATE media SET audio_markers_version = ? WHERE id = ?")
+            .bind(AUDIO_MARKERS_VERSION)
+            .bind(id.as_str())
+            .execute(pool)
+            .await;
+    }
+    info!(%show_id, season, episodes = eps.len(), markers = total_markers, "audio-match: season analysed");
+    Ok(())
 }
 
 // --- prune ---
@@ -970,11 +1160,11 @@ async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> Essen
     let signature = stat_signature(video);
 
     let t = std::time::Instant::now();
-    let (tech_info, embedded_subs) = match super::media_info::probe_full(video).await {
-        Ok(pair) => (Some(pair.0), pair.1),
+    let (tech_info, embedded_subs, chapters) = match super::media_info::probe_full(video).await {
+        Ok((info, subs, chapters)) => (Some(info), subs, chapters),
         Err(e) => {
             warn!(%media_id, %e, "ffprobe failed");
-            (None, Vec::new())
+            (None, Vec::new(), Vec::new())
         }
     };
     let probe_ms = t.elapsed().as_millis() as u64;
@@ -983,6 +1173,16 @@ async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> Essen
         if let Err(e) = super::media_info::store(pool, media_id, info).await {
             warn!(%media_id, %e, "failed to cache tech info");
         }
+    }
+
+    // Embedded-chapter markers ride along with the probe (free). Replace only
+    // the `chapter`-source rows so audio-detected markers (a separate, season-
+    // scoped producer) survive an essential re-run.
+    let duration = tech_info.as_ref().and_then(|t| t.duration_seconds).unwrap_or(0.0);
+    let chapter_markers = super::markers::chapters_to_markers(&chapters, duration);
+    if let Err(e) = super::markers::store_markers(pool, media_id, "chapter", &chapter_markers).await
+    {
+        warn!(%media_id, %e, "failed to store chapter markers");
     }
 
     let t = std::time::Instant::now();
@@ -997,11 +1197,13 @@ async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> Essen
     // with a version bump.
     if let Err(e) = sqlx::query(
         "UPDATE media SET subtitles_version = ?,
+                          markers_version  = ?,
                           content_mtime    = ?,
                           content_size     = ?
          WHERE id = ?",
     )
     .bind(SUBTITLES_VERSION)
+    .bind(MARKERS_VERSION)
     .bind(signature.0)
     .bind(signature.1)
     .bind(media_id)
@@ -1547,12 +1749,13 @@ async fn upsert_episode(
         i64,
         i64,
         i64,
+        i64,
         Option<i64>,
         Option<i64>,
     );
     let existing: Option<ExistingRow> = sqlx::query_as(
         "SELECT id, scanned_at, file_size, scan_version, deleted_at,
-                subtitles_version, thumbnails_version, trickplay_version,
+                subtitles_version, markers_version, thumbnails_version, trickplay_version,
                 content_mtime, content_size
          FROM media WHERE path = ?",
     )
@@ -1569,8 +1772,19 @@ async fn upsert_episode(
     // re-upsert through the existing `any_newer_than` path; the video itself
     // is covered by the signature.
     let (file_changed, metadata_stale, needs_essential, needs_thumbnails, needs_trickplay) =
-        if let Some((_, scanned_at, _existing_size, scan_version, deleted_at, sv, tv, pv, cm, cs)) =
-            &existing
+        if let Some((
+            _,
+            scanned_at,
+            _existing_size,
+            scan_version,
+            deleted_at,
+            sv,
+            mv,
+            tv,
+            pv,
+            cm,
+            cs,
+        )) = &existing
         {
             let mut sidecar_sources: Vec<&Path> = Vec::new();
             if let Some(n) = nfo_opt.as_ref() {
@@ -1597,7 +1811,8 @@ async fn upsert_episode(
                 deleted_at.is_some()
                     || content_changed
                     || content_unknown
-                    || *sv < SUBTITLES_VERSION,
+                    || *sv < SUBTITLES_VERSION
+                    || *mv < MARKERS_VERSION,
                 deleted_at.is_some() || content_changed || *tv < THUMBNAILS_VERSION,
                 deleted_at.is_some() || content_changed || *pv < TRICKPLAY_VERSION,
             )
@@ -1743,12 +1958,13 @@ async fn upsert_movie(
         i64,
         i64,
         i64,
+        i64,
         Option<i64>,
         Option<i64>,
     );
     let existing: Option<ExistingRow> = sqlx::query_as(
         "SELECT id, scanned_at, file_size, scan_version, deleted_at,
-                subtitles_version, thumbnails_version, trickplay_version,
+                subtitles_version, markers_version, thumbnails_version, trickplay_version,
                 content_mtime, content_size
          FROM media WHERE path = ?",
     )
@@ -1761,8 +1977,19 @@ async fn upsert_movie(
     // parent dir's mtime bumps when any sidecar is added or removed on most
     // filesystems).
     let (file_changed, metadata_stale, needs_essential, needs_thumbnails, needs_trickplay) =
-        if let Some((_, scanned_at, _existing_size, scan_version, deleted_at, sv, tv, pv, cm, cs)) =
-            &existing
+        if let Some((
+            _,
+            scanned_at,
+            _existing_size,
+            scan_version,
+            deleted_at,
+            sv,
+            mv,
+            tv,
+            pv,
+            cm,
+            cs,
+        )) = &existing
         {
             let mut sidecar_sources: Vec<&Path> = Vec::new();
             if let Some(n) = nfo_path.as_ref() {
@@ -1789,7 +2016,8 @@ async fn upsert_movie(
                 deleted_at.is_some()
                     || content_changed
                     || content_unknown
-                    || *sv < SUBTITLES_VERSION,
+                    || *sv < SUBTITLES_VERSION
+                    || *mv < MARKERS_VERSION,
                 deleted_at.is_some() || content_changed || *tv < THUMBNAILS_VERSION,
                 deleted_at.is_some() || content_changed || *pv < TRICKPLAY_VERSION,
             )

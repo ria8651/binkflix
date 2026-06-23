@@ -253,6 +253,64 @@ pub struct SubtitleTrack {
     pub forced: bool,
 }
 
+/// A time-based playback marker. Multiple detection sources (embedded
+/// chapters, audio-fingerprint matching across a season, manual edits) feed
+/// the same model; the player draws ticks for all of them and shows a skip
+/// button while the playhead is inside a skippable (intro/recap/outro/
+/// credits) one. `kind` is classified by position, so a recurring mid-runtime
+/// segment lands as `Chapter` rather than being forced into intro/outro.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerKind {
+    Intro,
+    Recap,
+    Outro,
+    Credits,
+    Chapter,
+}
+
+impl MarkerKind {
+    /// snake_case token — matches the wire/DB representation and the CSS
+    /// modifier class (`marker-<kind>`). Kept in lockstep with the `kind`
+    /// CHECK in migration 0024 and the serde rename above. (Whether a kind is
+    /// "skippable" is decided in player.js, where the playhead lives.)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarkerKind::Intro => "intro",
+            MarkerKind::Recap => "recap",
+            MarkerKind::Outro => "outro",
+            MarkerKind::Credits => "credits",
+            MarkerKind::Chapter => "chapter",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Marker {
+    pub kind: MarkerKind,
+    pub start_secs: f64,
+    pub end_secs: f64,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// "chapter" | "audio" | "silence" | "manual" — provenance, for the UI to
+    /// style ticks and for re-runs to replace only their own rows.
+    pub source: String,
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
+}
+
+fn default_confidence() -> f64 {
+    1.0
+}
+
+/// Response of `GET /api/media/{id}/markers.json`. A flat list in start order;
+/// the player derives "skip button visible?" by testing the playhead against
+/// the skippable markers and draws ticks for all of them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MarkersResponse {
+    pub markers: Vec<Marker>,
+}
+
 /// Debug-panel snapshot of the HLS pipeline for one media. Exposed by
 /// `/api/media/{id}/hls/state` and rendered as a YouTube-style timeline
 /// bar so an operator can see at a glance where ffmpeg is running, what

@@ -222,6 +222,27 @@ async function setVttInner(videoId, url, label, language) {
 // Idempotent: safe to call multiple times on the same video.
 
 const controllers = new Map(); // videoId -> teardown fn
+const markerMap = new Map(); // videoId -> [{kind,start_secs,end_secs,...}]
+
+// Intro/recap/outro/credits are "skippable" and drive the skip button;
+// generic `chapter` markers are navigational ticks only (return null).
+function skipLabelFor(kind) {
+    if (kind === "intro" || kind === "recap") return "Skip Intro";
+    if (kind === "outro" || kind === "credits") return "Skip Credits";
+    return null;
+}
+
+// Push the marker list for a video, tagged with the media id it belongs to.
+// player.js only needs it to gate the skip button — the scrub-bar *ticks* are
+// rendered by Dioxus. The id tag matters because the <video> element (and its
+// dom id) is reused across a soft-nav between episodes: `updateSkip` ignores
+// markers whose id doesn't match the element's live `data-media-id`, so E1's
+// segments can't drive the skip button while E2's markers are still loading.
+// The skip logic re-reads markerMap every timeupdate, so calling this before
+// or after initControls both work.
+function setMarkers(videoId, mediaId, markers) {
+    markerMap.set(videoId, { mediaId, markers: Array.isArray(markers) ? markers : [] });
+}
 
 const SVG_PLAY = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>`;
 const SVG_PAUSE = `<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>`;
@@ -255,6 +276,7 @@ function initControls(videoId) {
     const volSlider = $(".volume-slider");
     const volBtn = $(".volume-btn");
     const fsBtn = $(".fullscreen-btn");
+    const skipBtn = $(".player-skip-btn");
 
     let seeking = false;
     let activeTimer = null;
@@ -288,6 +310,39 @@ function initControls(videoId) {
         buffered = Math.max(buffered, played);
         scrub.style.setProperty("--played", played);
         scrub.style.setProperty("--buffered", buffered);
+        // Publish --played on the wrap so the marker beads (pure CSS) can colour
+        // themselves to match the bar segment they sit on. The scrub's own
+        // --played above drives its fill gradient; the beads inherit this one.
+        wrap.style.setProperty("--played", played);
+    };
+
+    // Show the skip button while the playhead sits inside a skippable
+    // marker; otherwise hide it. `data-target` carries the segment end so the
+    // click handler (and the `s` shortcut) know where to seek.
+    const updateSkip = () => {
+        if (!skipBtn) return;
+        const entry = markerMap.get(videoId);
+        // Only trust markers tagged with the episode currently in the element —
+        // the dom id is reused across a soft-nav, so a stale entry from the
+        // previous episode must not drive the skip button.
+        const ms = entry && entry.mediaId === (video.dataset.mediaId || "") ? entry.markers : [];
+        const t = video.currentTime;
+        let active = null;
+        for (const m of ms) {
+            const label = skipLabelFor(m.kind);
+            if (label && t >= m.start_secs && t < m.end_secs) {
+                active = { end: m.end_secs, label };
+                break;
+            }
+        }
+        if (active) {
+            if (skipBtn.textContent !== active.label) skipBtn.textContent = active.label;
+            skipBtn.dataset.target = String(active.end);
+            skipBtn.hidden = false;
+        } else if (!skipBtn.hidden) {
+            skipBtn.hidden = true;
+            delete skipBtn.dataset.target;
+        }
     };
 
     const syncTime = () => {
@@ -296,6 +351,7 @@ function initControls(videoId) {
         }
         if (timeCur) timeCur.textContent = fmtTime(video.currentTime);
         updateFill();
+        updateSkip();
     };
     const syncDuration = () => {
         if (timeDur) timeDur.textContent = fmtTime(video.duration);
@@ -467,6 +523,15 @@ function initControls(videoId) {
         video.muted = v === 0;
         volSlider.style.setProperty("--vol", (v * 100) + "%");
     };
+    const onSkipBtn = () => {
+        const t = parseFloat(skipBtn?.dataset.target);
+        if (!isFinite(t)) return;
+        // Clamp just shy of duration so jumping past a credits segment that
+        // runs to the very end doesn't trip `ended` / the up-next card.
+        const target = isFinite(video.duration) ? Math.min(t, video.duration - 0.1) : t;
+        video.currentTime = Math.max(0, target);
+        bumpActive();
+    };
     const onVolBtn = () => { video.muted = !video.muted; };
     const onFsBtn = () => {
         // Fullscreen just the wrap — back / title / room / theme controls
@@ -479,6 +544,9 @@ function initControls(videoId) {
     playBtn?.addEventListener("click", onPlayBtn);
     playBtn?.addEventListener("click", stopBubble);
     playBtn?.addEventListener("pointerup", blurSelf);
+    skipBtn?.addEventListener("click", onSkipBtn);
+    skipBtn?.addEventListener("click", stopBubble);
+    skipBtn?.addEventListener("pointerup", blurSelf);
     scrub?.addEventListener("input", onScrubInput);
     scrub?.addEventListener("change", onScrubChange);
     scrub?.addEventListener("click", stopBubble);
@@ -672,6 +740,11 @@ function initControls(videoId) {
                 e.preventDefault();
                 video.volume = Math.max(0, video.volume - vstep);
                 bumpActive(); break;
+            case "s":
+            case "S":
+                // Skip the current intro/outro, if one is active (button shown).
+                if (skipBtn && !skipBtn.hidden) { e.preventDefault(); onSkipBtn(); }
+                break;
             case "m":
             case "M":
                 e.preventDefault(); video.muted = !video.muted; bumpActive(); break;
@@ -725,6 +798,9 @@ function initControls(videoId) {
         playBtn?.removeEventListener("click", onPlayBtn);
         playBtn?.removeEventListener("click", stopBubble);
         playBtn?.removeEventListener("pointerup", blurSelf);
+        skipBtn?.removeEventListener("click", onSkipBtn);
+        skipBtn?.removeEventListener("click", stopBubble);
+        skipBtn?.removeEventListener("pointerup", blurSelf);
         scrub?.removeEventListener("input", onScrubInput);
         scrub?.removeEventListener("change", onScrubChange);
         scrub?.removeEventListener("click", stopBubble);
@@ -1257,6 +1333,7 @@ const realApi = {
     getDebugStats,
     getPlaybackState,
     seekTo,
+    setMarkers,
     flushProgress,
     attach,
     detach: fullDetach,

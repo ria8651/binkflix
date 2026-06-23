@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod filename;
 pub mod hls;
+pub mod markers;
 pub mod media_info;
 pub mod nfo;
 pub mod preferences;
@@ -306,6 +307,11 @@ async fn run_async() -> anyhow::Result<()> {
 
     // Probe ffmpeg once for hw H.264 encoders; pinned for the process.
     let hwenc = hls::detect_hwenc().await;
+
+    // Probe `fpcalc` once (memoized) so the audio-match availability + any
+    // "disabled" warning surface at startup rather than mid-scan. The scanner's
+    // season pass reads the same cached verdict.
+    let _ = markers::fpcalc_status().await;
 
     // Register each path as its own row in `libraries` and kick off scans in
     // the background so startup isn't blocked on large trees.

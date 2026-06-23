@@ -52,6 +52,7 @@ RUN sed -i 's/^Components: main$/Components: main non-free non-free-firmware/' \
  && apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
     intel-media-va-driver-non-free vainfo \
+    libchromaprint-tools \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
