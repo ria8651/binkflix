@@ -189,15 +189,24 @@ pub struct EmbeddedSubtitleStream {
     pub disposition: std::collections::BTreeMap<String, i64>,
 }
 
+/// A chapter as reported by `ffprobe -show_chapters`. Times are seconds.
+/// Turned into playback markers by [`super::markers::chapters_to_markers`].
+pub struct RawChapter {
+    pub start: f64,
+    pub end: f64,
+    pub title: Option<String>,
+}
+
 pub async fn probe(video: &Path) -> anyhow::Result<MediaTechInfo> {
     Ok(probe_full(video).await?.0)
 }
 
-/// Like [`probe`] but also returns subtitle stream metadata, so the scanner
-/// can avoid a second ffprobe just to enumerate subtitle tracks.
+/// Like [`probe`] but also returns subtitle stream metadata and embedded
+/// chapters, so the scanner can avoid a second ffprobe just to enumerate
+/// subtitle tracks or chapter markers.
 pub async fn probe_full(
     video: &Path,
-) -> anyhow::Result<(MediaTechInfo, Vec<EmbeddedSubtitleStream>)> {
+) -> anyhow::Result<(MediaTechInfo, Vec<EmbeddedSubtitleStream>, Vec<RawChapter>)> {
     // `-protocol_whitelist file`: harden in case `video` is ever a DB-sourced
     // path that's a URL ("http://…", "concat:…", "subfile:…"). Without it,
     // ffprobe would happily open network or composite inputs derived from
@@ -209,6 +218,10 @@ pub async fn probe_full(
             "-print_format", "json",
             "-show_format",
             "-show_streams",
+            // Embedded chapter markers — the cheapest marker source. Comes
+            // free with this probe; parsed into `RawChapter` and turned into
+            // markers by `super::markers::chapters_to_markers`.
+            "-show_chapters",
         ])
         .arg(video)
         .output()
@@ -275,6 +288,22 @@ pub async fn probe_full(
     let (browser_compat, compat_reason) =
         compute_compat(video_track.as_ref(), &audio_tracks, container.as_deref());
 
+    // Chapters with unparseable/missing times are dropped rather than failing
+    // the probe — the rest of the metadata is still useful.
+    let chapters: Vec<RawChapter> = parsed
+        .chapters
+        .iter()
+        .filter_map(|c| {
+            let start = c.start_time.as_deref()?.parse().ok()?;
+            let end = c.end_time.as_deref()?.parse().ok()?;
+            Some(RawChapter {
+                start,
+                end,
+                title: c.tags.get("title").cloned().filter(|s| !s.is_empty()),
+            })
+        })
+        .collect();
+
     let info = MediaTechInfo {
         container,
         duration_seconds: parsed.format.duration.as_deref().and_then(|s| s.parse().ok()),
@@ -285,7 +314,7 @@ pub async fn probe_full(
         browser_compat,
         compat_reason,
     };
-    Ok((info, subtitle_streams))
+    Ok((info, subtitle_streams, chapters))
 }
 
 /// Decide whether a file can be served as-is, remuxed cheaply, or needs
@@ -387,6 +416,16 @@ struct ProbeOutput {
     streams: Vec<ProbeStream>,
     #[serde(default)]
     format: ProbeFormat,
+    #[serde(default)]
+    chapters: Vec<ProbeChapter>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeChapter {
+    start_time: Option<String>,
+    end_time: Option<String>,
+    #[serde(default)]
+    tags: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

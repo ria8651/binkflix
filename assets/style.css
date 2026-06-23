@@ -1289,6 +1289,65 @@ a.player-topbar-primary-link:hover { text-decoration: underline; }
     border: none;
 }
 
+/* Marker beads: rounded markers that sit on the scrub bar, a little taller
+   than the track and vertically centred on it. Each bead's colour is set per
+   position by player.js (via .in-played / .in-buffered) so it matches the
+   segment of the bar it sits on — the accent on the played part, the track
+   tints on the unplayed part — rather than being a stray colour. Dioxus sets
+   each bead's `left` with a calc mirroring the scrub fill's thumb-inset math,
+   so it lines up exactly with where the playhead reaches it. */
+.player-scrub-wrap {
+    position: relative;
+    height: var(--scrub-hitbox);
+}
+.player-marker-ticks {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+.player-marker-tick {
+    --pos: 0; /* this bead's position, in percent (set inline by Dioxus) */
+    position: absolute;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 4px;
+    height: 14px; /* taller than the 8px idle track so it reads as a marker */
+    border-radius: 999px;
+    /* Fallback for engines without color-mix/clamp support. */
+    background: var(--scrub-track-rest);
+    /* Match the bar segment under the bead: the accent once the playhead has
+       passed it (--played ≥ --pos), the unplayed track tint before. --played
+       is published on .video-wrap by player.js and inherited here; the
+       clamp(…*1000…) collapses the sign of (played − pos) to a 0/1 switch. */
+    background: color-mix(
+        in srgb,
+        var(--scrub-track-played) calc(clamp(0, (var(--played, 0) - var(--pos)) * 1000, 1) * 100%),
+        var(--scrub-track-rest)
+    );
+    transition: height 120ms ease;
+}
+/* Grow with the track when the bar thickens on hover. */
+.player-scrub:hover ~ .player-marker-ticks .player-marker-tick { height: 17px; }
+
+/* Netflix-style skip button. A child of .player-chrome (so it fades with the
+   controls); player.js toggles `hidden`/text/`data-target` by playhead. */
+.player-skip-btn {
+    position: absolute;
+    right: var(--space-7);
+    bottom: calc(100% + var(--space-2));
+    padding: var(--space-3) var(--space-6);
+    background: var(--player-text);
+    color: #000;
+    border: none;
+    border-radius: var(--radius-button);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgb(0 0 0 / 0.5);
+}
+.player-skip-btn[hidden] { display: none; }
+.player-skip-btn:hover { background: var(--accent); color: var(--player-text); }
+
 .player-row {
     display: flex;
     align-items: center;

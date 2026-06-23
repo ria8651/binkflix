@@ -1,6 +1,6 @@
 use super::analytics::{self, PlaybackSample};
 use super::error::{Error, Result};
-use super::{media_info, subtitles, thumbnails, trickplay};
+use super::{markers, media_info, subtitles, thumbnails, trickplay};
 use super::AppState;
 use axum::extract::{Path, Request, State};
 use axum_extra::extract::Query;
@@ -27,6 +27,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/media/{id}/image", get(media_image))
         .route("/api/media/{id}/trickplay.json", get(media_trickplay_manifest))
         .route("/api/media/{id}/trickplay.jpg", get(media_trickplay_sprite))
+        .route("/api/media/{id}/markers.json", get(media_markers))
         .route("/api/media/{id}/fanart", get(media_fanart))
         .route("/api/shows/{id}", get(show))
         .route("/api/shows/{id}/poster", get(show_poster))
@@ -750,6 +751,22 @@ async fn media_trickplay_sprite(
         }
         None => Err(Error::NotFound),
     }
+}
+
+async fn media_markers(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response> {
+    // Validate-on-read for chapter markers: a file swap re-derives them via
+    // the shared single-file refresh (see `markers::load_fresh`). Audio
+    // markers are season-scoped and refreshed by the scanner, not here.
+    let resp = markers::load_fresh(&state, &id).await.map_err(Error::Other)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    Ok((StatusCode::OK, headers, Json(resp)).into_response())
 }
 
 async fn media_fanart(

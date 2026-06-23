@@ -131,6 +131,15 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         async move { get_media_tech(&id).await }
     });
 
+    // Playback markers (chapters now; audio-detected intro/outro once the
+    // scanner's season pass has run). Drives the scrub-bar ticks below and is
+    // pushed into player.js to gate the skip button.
+    let id_for_markers = id.clone();
+    let markers = use_resource(move || {
+        let id = id_for_markers.clone();
+        async move { get_markers(&id).await }
+    });
+
     // Title bar data. Movies show their title; episodes show the show
     // title with the episode number + title as a subtitle line.
     let id_for_media = id.clone();
@@ -697,6 +706,32 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         });
     });
 
+    // Feed markers to player.js so it can show the "Skip Intro/Credits"
+    // button when the playhead enters a skippable segment. The scrub-bar
+    // *ticks* are rendered in the Dioxus markup below; this push is only the
+    // imperative skip-button feed. Re-runs when the markers resource resolves
+    // or the source (re)attaches — player.js re-reads its marker map on every
+    // timeupdate, so ordering against initControls doesn't matter.
+    let id_for_markers_push = id.clone();
+    use_effect(move || {
+        if stream_src.read().is_empty() {
+            return;
+        }
+        let Some(Ok(resp)) = markers.read().clone() else {
+            return;
+        };
+        let payload = serde_json::to_string(&resp.markers).unwrap_or_else(|_| "[]".to_string());
+        // Tag the push with the media id so player.js can reject markers left
+        // over from a previous episode during a soft-nav (the <video> element
+        // and its dom id are reused). See `setMarkers` in player.js.
+        let js = format!(
+            "window.binkflixPlayer?.setMarkers('{video_dom_id}', '{id_for_markers_push}', {payload});"
+        );
+        spawn(async move {
+            let _ = document::eval(&js).await;
+        });
+    });
+
     // Pause + detach the stream when the component unmounts. Without this
     // the browser keeps the range request alive (and audio playing)
     // through a soft route change, which is jarring when navigating back
@@ -997,13 +1032,70 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     div { class: "player-scrub-preview-img" }
                     div { class: "player-scrub-preview-time", "0:00" }
                 }
-                input {
-                    class: "player-scrub",
-                    r#type: "range",
-                    min: "0",
-                    max: "1000",
-                    step: "1",
-                    value: "0",
+                // Auto-hiding "Skip Intro/Credits" button. Lives inside the
+                // chrome so it fades with the controls; player.js toggles
+                // `hidden`/text/`data-target` based on the playhead and wires
+                // the click (seek to the segment end).
+                button {
+                    class: "player-skip-btn",
+                    r#type: "button",
+                    hidden: true,
+                    "Skip"
+                }
+                div { class: "player-scrub-wrap",
+                    input {
+                        class: "player-scrub",
+                        r#type: "range",
+                        min: "0",
+                        max: "1000",
+                        step: "1",
+                        value: "0",
+                    }
+                    // Marker ticks overlaid on the scrub track. Positioned with
+                    // the same thumb-inset math as the `--played` fill so a tick
+                    // lines up exactly with where the playhead reaches it.
+                    {
+                        let dur = tech
+                            .read()
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .and_then(|t| t.duration_seconds)
+                            .unwrap_or(0.0);
+                        match markers.read().clone() {
+                            Some(Ok(resp)) if dur > 0.0 && !resp.markers.is_empty() => {
+                                // A bead at *each* boundary of every marker, so you can see content
+                                // before an intro (cold open) or after the credits (post-credits
+                                // scene). Boundaries within 0.5% of the episode start/end are dropped:
+                                // an intro that starts at 0s or credits that run to the very end have
+                                // no "outside" region to reveal, and an edge bead would just hide under
+                                // the thumb / bar end.
+                                let mut beads: Vec<(f64, &str)> = Vec::new();
+                                for m in resp.markers.iter() {
+                                    let kind = m.kind.as_str();
+                                    for b in [m.start_secs, m.end_secs] {
+                                        let pct = b / dur * 100.0;
+                                        if pct > 0.5 && pct < 99.5 {
+                                            beads.push((pct, kind));
+                                        }
+                                    }
+                                }
+                                rsx! {
+                                    div { class: "player-marker-ticks", aria_hidden: "true",
+                                        for (pct, kind) in beads {
+                                            div {
+                                                class: "player-marker-tick marker-{kind}",
+                                                // `--pos` (percent) lets the bead colour itself in CSS to
+                                                // match the bar segment it sits on, comparing against
+                                                // `--played` (published on .video-wrap by player.js).
+                                                style: "left: calc(var(--scrub-thumb) / 2 + (100% - var(--scrub-thumb)) * {pct} / 100); --pos: {pct};",
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => rsx! {},
+                        }
+                    }
                 }
                 div { class: "player-row",
                     {
