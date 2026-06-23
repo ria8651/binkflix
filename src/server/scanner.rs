@@ -2,7 +2,7 @@ use super::analytics::{self, ScanTiming};
 use super::filename;
 use super::nfo::{self, EpisodeNfo, MovieNfo};
 use super::{subtitles, thumbnails, trickplay};
-use crate::types::{ActiveJob, ScanProgress};
+use crate::types::{ActiveJob, Phase, ScanProgress, Stage};
 use chrono::NaiveDateTime;
 use futures::stream::{self, StreamExt};
 use sqlx::SqlitePool;
@@ -75,11 +75,11 @@ async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)
     f(&mut p);
 }
 
-async fn add_active(handle: &ProgressHandle, media_id: &str, title: &str, stage: &str) {
+async fn add_active(handle: &ProgressHandle, media_id: &str, title: &str, stage: Stage) {
     handle.write().await.active.push(ActiveJob {
         media_id: media_id.into(),
         title: title.into(),
-        stage: stage.into(),
+        stage,
     });
 }
 
@@ -391,7 +391,7 @@ pub async fn scan_library_with_progress(
     let root_display = root.display().to_string();
     if let Some(p) = &progress {
         set_progress(p, |s| {
-            s.phase = "indexing".into();
+            s.phase = Phase::Indexing;
             s.done = 0;
             s.total = 0;
             s.current = Some(root_display.clone());
@@ -589,7 +589,7 @@ pub async fn scan_library_with_progress(
         let essential_total = asset_jobs.iter().filter(|j| j.needs_essential).count();
         if let Some(p) = &progress {
             set_progress(p, |s| {
-                s.phase = "subtitles".into();
+                s.phase = Phase::Subtitles;
                 s.done = 0;
                 s.total = essential_total;
                 s.current = None;
@@ -611,7 +611,7 @@ pub async fn scan_library_with_progress(
                         return PerFile { job, tech_info: None };
                     }
                     if let Some(p) = &progress {
-                        add_active(p, &job.media_id, &job.title, "subtitles").await;
+                        add_active(p, &job.media_id, &job.title, Stage::Subtitles).await;
                     }
                     let started = std::time::Instant::now();
                     let outcome = run_essential(&pool, &job.media_id, &job.video).await;
@@ -653,7 +653,7 @@ pub async fn scan_library_with_progress(
         let thumbnails_total = pass1.iter().filter(|f| f.job.needs_thumbnails).count();
         if let Some(p) = &progress {
             set_progress(p, |s| {
-                s.phase = "thumbnails".into();
+                s.phase = Phase::Thumbnails;
                 s.done = 0;
                 s.total = thumbnails_total;
                 s.active.clear();
@@ -680,7 +680,7 @@ pub async fn scan_library_with_progress(
                         0
                     } else {
                         if let Some(p) = &progress {
-                            add_active(p, &f.job.media_id, &f.job.title, "thumbnail").await;
+                            add_active(p, &f.job.media_id, &f.job.title, Stage::Thumbnail).await;
                         }
                         let t = std::time::Instant::now();
                         thumbnails::scan_for_media(&pool, &f.job.media_id, &f.job.video).await;
@@ -730,7 +730,7 @@ pub async fn scan_library_with_progress(
         let trickplay_total = pass2.iter().filter(|f| f.job.needs_trickplay).count();
         if let Some(p) = &progress {
             set_progress(p, |s| {
-                s.phase = "trickplay".into();
+                s.phase = Phase::Trickplay;
                 s.done = 0;
                 s.total = trickplay_total;
                 s.active.clear();
@@ -751,7 +751,7 @@ pub async fn scan_library_with_progress(
                         return;
                     }
                     if let Some(p) = &progress {
-                        add_active(p, &f.job.media_id, &f.job.title, "trickplay").await;
+                        add_active(p, &f.job.media_id, &f.job.title, Stage::Trickplay).await;
                     }
                     // Duration normally comes from pass-1's probe. When only
                     // trickplay is stale (pass 1 was skipped), fall back to
@@ -873,7 +873,7 @@ async fn run_audio_match_pass(
     let total = seasons.len();
     if let Some(p) = progress {
         set_progress(p, |s| {
-            s.phase = "audio-match".into();
+            s.phase = Phase::AudioMatch;
             s.done = 0;
             s.total = total;
             s.current = None;
@@ -900,7 +900,7 @@ async fn run_audio_match_pass(
                 }
                 let label = format!("{title} — Season {season}");
                 if let Some(p) = &progress {
-                    add_active(p, &show_id, &label, "analysing").await;
+                    add_active(p, &show_id, &label, Stage::Analysing).await;
                 }
                 if let Err(e) = analyze_one_season(&pool, &show_id, season, &cancel).await {
                     warn!(%show_id, season, %e, "audio-match: season analysis failed");
@@ -1454,7 +1454,7 @@ pub async fn refresh_media_file(
     let video = PathBuf::from(&path);
 
     if let Some(p) = progress {
-        add_active(p, media_id, &title, "refreshing").await;
+        add_active(p, media_id, &title, Stage::Refreshing).await;
     }
 
     let started = std::time::Instant::now();

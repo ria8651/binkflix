@@ -2,6 +2,7 @@ use super::analytics::{self, PlaybackSample};
 use super::error::{Error, Result};
 use super::{markers, media_info, subtitles, thumbnails, trickplay};
 use super::AppState;
+use crate::types::Phase;
 use axum::extract::{Path, Request, State};
 use axum_extra::extract::Query;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -252,13 +253,13 @@ async fn start_scan(
     if params.restart && already_running {
         gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let mut p = progress.write().await;
-        p.phase = "restarting".into();
+        p.phase = Phase::Restarting;
         p.current = None;
         p.active.clear();
     } else {
         let mut p = progress.write().await;
         p.running = true;
-        p.phase = "starting".into();
+        p.phase = Phase::Starting;
         p.done = 0;
         p.total = 0;
         p.current = None;

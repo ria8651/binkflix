@@ -413,6 +413,33 @@ pub struct CreateRoomResp {
     pub id: String,
 }
 
+/// What an in-flight asset job is currently doing. Serialised to the client,
+/// which is pinned to the server build, so the variant set is always in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stage {
+    Subtitles,
+    Thumbnail,
+    Trickplay,
+    /// Season audio-fingerprint analysis.
+    Analysing,
+    /// Single-item re-extraction triggered outside a full scan.
+    Refreshing,
+}
+
+impl Stage {
+    /// Short tag rendered in the active-jobs list.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stage::Subtitles => "subtitles",
+            Stage::Thumbnail => "thumbnail",
+            Stage::Trickplay => "trickplay",
+            Stage::Analysing => "analysing",
+            Stage::Refreshing => "refreshing",
+        }
+    }
+}
+
 /// One asset-extraction job currently in flight during phase 2. Phase 2 runs
 /// up to `BINKFLIX_SCAN_CONCURRENCY` of these in parallel, and `current`
 /// can only hold one filename, so we list them out separately for the UI.
@@ -420,8 +447,62 @@ pub struct CreateRoomResp {
 pub struct ActiveJob {
     pub media_id: String,
     pub title: String,
-    /// "probing" | "subtitles" | "thumbnail" | "trickplay" | "saving"
-    pub stage: String,
+    pub stage: Stage,
+}
+
+/// Which stage of the scan pipeline is currently running. Serialised to the
+/// client, which is pinned to the server build (cache-busted assets), so the
+/// variant set never falls out of sync — no unknown-variant fallback needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Phase {
+    /// Scan requested; the worker hasn't entered its first pass yet.
+    Starting,
+    /// Phase 1 — walking the tree, upserting show/media rows.
+    Indexing,
+    /// Phase 2 pass 1 — probe + subtitle extraction.
+    Subtitles,
+    /// Phase 2 pass 2 — poster/thumbnail frames.
+    Thumbnails,
+    /// Phase 2 pass 3 — scrub-bar sprite sheets.
+    Trickplay,
+    /// Phase 3 — season audio-fingerprint intro/outro detection.
+    AudioMatch,
+    /// Restart requested mid-scan; the worker is winding down to re-run.
+    Restarting,
+    /// Not scanning — the resting/default state.
+    #[default]
+    Idle,
+}
+
+impl Phase {
+    /// Human label shown in the rescan popover while a scan runs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Phase::Starting => "Starting…",
+            Phase::Indexing => "Indexing library…",
+            Phase::Subtitles => "Extracting subtitles…",
+            Phase::Thumbnails => "Extracting thumbnails…",
+            Phase::Trickplay => "Building trickplay…",
+            Phase::AudioMatch => "Analysing audio…",
+            Phase::Restarting => "Restarting…",
+            Phase::Idle => "Scanning…",
+        }
+    }
+
+    /// Terse wire token (matches the serialised form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Starting => "starting",
+            Phase::Indexing => "indexing",
+            Phase::Subtitles => "subtitles",
+            Phase::Thumbnails => "thumbnails",
+            Phase::Trickplay => "trickplay",
+            Phase::AudioMatch => "audio-match",
+            Phase::Restarting => "restarting",
+            Phase::Idle => "idle",
+        }
+    }
 }
 
 /// Live status of a library scan. Polled by the UI to drive the rescan button
@@ -430,7 +511,7 @@ pub struct ActiveJob {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ScanProgress {
     pub running: bool,
-    pub phase: String,
+    pub phase: Phase,
     pub done: usize,
     pub total: usize,
     pub current: Option<String>,

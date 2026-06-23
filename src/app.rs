@@ -369,7 +369,7 @@ fn RescanButton() -> Element {
         if s.total > 0 {
             format!("Scanning {}/{}", s.done, s.total)
         } else {
-            format!("Scanning — {}", s.phase)
+            format!("Scanning — {}", s.phase.as_str())
         }
     } else {
         "Rescan".to_string()
@@ -395,20 +395,7 @@ fn RescanButton() -> Element {
                 div { class: "menu rescan-menu",
                     div { class: "rescan-row",
                         strong {
-                            if running {
-                                if s.phase == "indexing" { "Indexing library…" }
-                                else if s.phase == "subtitles" { "Extracting subtitles…" }
-                                else if s.phase == "thumbnails" { "Extracting thumbnails…" }
-                                else if s.phase == "trickplay" { "Building trickplay…" }
-                                else if s.phase == "audio-match" { "Analysing audio…" }
-                                else if s.phase == "saving" { "Saving metadata…" }
-                                // Pre-0.9 builds and the brief moment between
-                                // phase 1 → phase 2 still report "assets".
-                                else if s.phase == "assets" { "Extracting assets…" }
-                                else { "Scanning…" }
-                            } else {
-                                "Library scan"
-                            }
+                            if running { {s.phase.label()} } else { "Library scan" }
                         }
                     }
                     if running {
@@ -440,7 +427,7 @@ fn RescanButton() -> Element {
                                 for j in s.active.iter() {
                                     div { class: "rescan-active-row",
                                         span { class: "rescan-active-title", "{j.title}" }
-                                        span { class: "rescan-active-stage", "{j.stage}" }
+                                        span { class: "rescan-active-stage", "{j.stage.as_str()}" }
                                     }
                                 }
                             }
@@ -457,7 +444,7 @@ fn RescanButton() -> Element {
                             r#type: "button",
                             onclick: move |_| {
                                 let mut w = status.write();
-                                w.phase = "restarting".into();
+                                w.phase = Phase::Restarting;
                                 w.current = None;
                                 w.active.clear();
                                 drop(w);
@@ -488,7 +475,7 @@ fn RescanButton() -> Element {
                             onclick: move |_| {
                                 let mut w = status.write();
                                 w.running = true;
-                                w.phase = "starting".into();
+                                w.phase = Phase::Starting;
                                 w.done = 0;
                                 w.total = 0;
                                 w.current = None;

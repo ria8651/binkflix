@@ -26,7 +26,7 @@ pub mod users;
 pub mod watch;
 
 use crate::app::App;
-use crate::types::ScanProgress;
+use crate::types::{Phase, ScanProgress};
 use axum::Router;
 use dioxus::prelude::{DioxusRouterExt, ServeConfig};
 use sqlx::SqlitePool;
@@ -137,7 +137,7 @@ pub async fn run_scans(
         let mut p = progress.write().await;
         *p = ScanProgress {
             running: true,
-            phase: "starting".into(),
+            phase: Phase::Starting,
             done: 0,
             total: 0,
             current: None,
@@ -193,7 +193,7 @@ pub async fn run_scans(
         .unwrap_or(0);
     let mut p = progress.write().await;
     p.running = false;
-    p.phase = "idle".into();
+    p.phase = Phase::Idle;
     p.current = None;
     p.active.clear();
     p.message = err;
