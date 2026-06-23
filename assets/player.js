@@ -842,6 +842,7 @@ function getDebugStats(videoId) {
         current_time: Number(video.currentTime.toFixed(1)),
         duration: isFinite(video.duration) ? Number(video.duration.toFixed(1)) : null,
         playback_rate: video.playbackRate,
+        paused: video.paused,
         dropped_frames: droppedFrames,
         total_frames: totalFrames,
         muted: video.muted,
@@ -849,6 +850,12 @@ function getDebugStats(videoId) {
         current_src: video.currentSrc || video.src,
         error: video.error ? { code: video.error.code, message: video.error.message || null } : null,
         stream_info: streamInfoCache.get(probeSrc) || null,
+        // Watch-party state stamped on the element by the WASM syncplay bridge
+        // (apply_remote). Present only while in a room. The debug panel renders
+        // these; the sampler also ships sync_drift_ms / room_playing.
+        sync_drift_ms: video.dataset.syncDriftMs != null ? Number(video.dataset.syncDriftMs) : null,
+        sync_mode: video.dataset.syncMode || null,
+        room_playing: video.dataset.roomPlaying != null ? video.dataset.roomPlaying === "1" : null,
     };
 }
 
@@ -994,6 +1001,14 @@ function startSampler(videoId, sessionId, audioIdx) {
                 : null,
             resync_snaps: resyncSnaps,
             resync_snap_ms: resyncSnapMs,
+            // Watch-party sync gauges (companion to the snap counters). drift +
+            // room_playing come off the element via getDebugStats; paused +
+            // rate are read straight from the <video>. paused vs room_playing
+            // surfaces play-state desyncs after the fact.
+            sync_drift_ms: stats.sync_drift_ms,
+            room_playing: stats.room_playing == null ? null : (stats.room_playing ? 1 : 0),
+            paused: video.paused ? 1 : 0,
+            playback_rate_x100: Math.round((video.playbackRate || 1) * 100),
         };
         // `keepalive` so the final sample still flushes during a soft-nav
         // teardown without needing a separate sendBeacon path.

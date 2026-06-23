@@ -1104,6 +1104,7 @@ fn apply_remote(
             }
         }
         RemoteKind::Play { position_ms } => {
+            set_video_attr(video, "data-room-playing", "1");
             let target = *position_ms as f64 / 1000.0;
             if (video.current_time() - target).abs() > 0.75 {
                 seek_to(target);
@@ -1114,6 +1115,7 @@ fn apply_remote(
             }
         }
         RemoteKind::Pause { position_ms } => {
+            set_video_attr(video, "data-room-playing", "0");
             let target = *position_ms as f64 / 1000.0;
             if (video.current_time() - target).abs() > 0.5 {
                 seek_to(target);
@@ -1124,6 +1126,7 @@ fn apply_remote(
             }
         }
         RemoteKind::Resync { playing, position_ms } => {
+            set_video_attr(video, "data-room-playing", if *playing { "1" } else { "0" });
             // Reconcile play/paused *state* unconditionally — it's cheap and
             // correct even inside the grace window.
             if *playing && video.paused() {
@@ -1141,14 +1144,20 @@ fn apply_remote(
             let recent_local = now_ms_f64() - last_local_action_ms.get() < RESYNC_GRACE_MS;
             let drift = video.current_time() - target;
             let abs = drift.abs();
+            // Drift gauge for the debug panel + telemetry (signed: + = ahead of
+            // the room, − = behind).
+            set_video_attr(video, "data-sync-drift-ms", &((drift * 1000.0) as i64).to_string());
             // `drift` = local − target: ahead (>0) ⇒ slow down (rate < 1),
             // behind (<0) ⇒ speed up (rate > 1).
             let slew_rate =
                 || 1.0 + (-drift * RESYNC_SLEW_GAIN).clamp(-RESYNC_SLEW_MAX, RESYNC_SLEW_MAX);
-            if recent_local {
+            // Which correction branch we took — surfaced as `data-sync-mode` for
+            // the debug panel.
+            let mode = if recent_local {
                 // Fresh local action owns the position — don't fight it; drop any
                 // glide so we're back at 1.0× before the grace window lifts.
                 end_slew();
+                "local"
             } else if abs > RESYNC_HARD_SNAP_S {
                 // Too far to glide in reasonable time — jump. Telemetry: stash
                 // the snap on the element before seeking so player.js's sampler
@@ -1156,24 +1165,32 @@ fn apply_remote(
                 end_slew();
                 record_resync_snap(video, (-drift * 1000.0) as i64);
                 seek_to(target);
+                "snap"
             } else if !*playing {
                 // Paused: gliding can't move us. Small drift is invisible and
                 // gets resolved by the next Play's seek; gross drift already
                 // hard-seeked above.
                 end_slew();
+                "paused"
             } else if slewing.get() {
                 // Mid-glide: keep nudging until we're inside the deadband.
                 if abs <= RESYNC_SLEW_DEADBAND_S {
                     end_slew();
+                    "insync"
                 } else {
                     video.set_playback_rate(slew_rate());
+                    "glide"
                 }
             } else if abs > RESYNC_SLEW_ONSET_S {
                 // Drifted past the onset — start gliding back (latched until
                 // we reach the deadband).
                 video.set_playback_rate(slew_rate());
                 slewing.set(true);
-            }
+                "glide"
+            } else {
+                "insync"
+            };
+            set_video_attr(video, "data-sync-mode", mode);
         }
     }
 }
@@ -1190,14 +1207,31 @@ fn apply_remote(
 /// `DomStringMap` web-sys feature, which isn't enabled.)
 #[cfg(feature = "web")]
 fn record_resync_snap(video: &HtmlVideoElement, delta_ms: i64) {
-    let el: &web_sys::Element = video.unchecked_ref();
-    let count = el
-        .get_attribute("data-resync-snaps")
+    let count = get_video_attr(video, "data-resync-snaps")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0)
         + 1;
-    let _ = el.set_attribute("data-resync-snaps", &count.to_string());
-    let _ = el.set_attribute("data-resync-snap-ms", &delta_ms.to_string());
+    set_video_attr(video, "data-resync-snaps", &count.to_string());
+    set_video_attr(video, "data-resync-snap-ms", &delta_ms.to_string());
+}
+
+/// Read/write a `data-*` attribute on the `<video>` element. The element is the
+/// shared surface between this WASM bridge and player.js (which owns the
+/// telemetry POST and debug-stats read), so the bridge stamps watch-party state
+/// here — `data-room-playing`, `data-sync-drift-ms`, `data-sync-mode`, and the
+/// snap counters — rather than opening a second channel. `set_attribute`/
+/// `get_attribute` are used over `dataset` because the latter needs the
+/// `DomStringMap` web-sys feature, which isn't enabled.
+#[cfg(feature = "web")]
+fn get_video_attr(video: &HtmlVideoElement, name: &str) -> Option<String> {
+    video.unchecked_ref::<web_sys::Element>().get_attribute(name)
+}
+
+#[cfg(feature = "web")]
+fn set_video_attr(video: &HtmlVideoElement, name: &str, value: &str) {
+    let _ = video
+        .unchecked_ref::<web_sys::Element>()
+        .set_attribute(name, value);
 }
 
 #[cfg(feature = "web")]

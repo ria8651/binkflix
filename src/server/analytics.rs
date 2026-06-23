@@ -241,6 +241,12 @@ pub struct PlaybackSample<'a> {
     /// `resync_snap_ms` is the last snap's signed delta (+ forward / − back).
     pub resync_snaps: Option<i64>,
     pub resync_snap_ms: Option<i64>,
+    /// Watch-party sync gauges: signed local−room drift, the room's intended
+    /// play state, the element's paused state, and the playback rate ×100.
+    pub sync_drift_ms: Option<i64>,
+    pub room_playing: Option<i64>,
+    pub paused: Option<i64>,
+    pub playback_rate_x100: Option<i64>,
 }
 
 pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
@@ -250,8 +256,9 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
              transcode_position_ms, transcode_rate_x100,
              observed_kbps, network_state,
              audio_idx, dropped_frames, decoded_frames, player_error,
-             client_build_id, resync_snaps, resync_snap_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             client_build_id, resync_snaps, resync_snap_ms,
+             sync_drift_ms, room_playing, paused, playback_rate_x100)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(s.session_id)
     .bind(now_ms())
@@ -268,6 +275,10 @@ pub async fn record_playback_sample(pool: &SqlitePool, s: PlaybackSample<'_>) {
     .bind(s.client_build_id)
     .bind(s.resync_snaps)
     .bind(s.resync_snap_ms)
+    .bind(s.sync_drift_ms)
+    .bind(s.room_playing)
+    .bind(s.paused)
+    .bind(s.playback_rate_x100)
     .execute(pool)
     .await;
     if let Err(e) = res {

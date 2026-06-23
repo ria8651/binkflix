@@ -68,6 +68,30 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
     // Stable DOM id so the JS helper can find the <video> element.
     let video_dom_id = "binkflix-video";
 
+    // Suppress browser `autoplay` only when we positively know we're joining a
+    // *paused* room. There, autoplay would race the syncplay bridge: the
+    // bridge's catch-up applies the room's pause at readyState>=1 (before
+    // autoplay kicks in), so `!video.paused()` is false and the pause is a
+    // no-op, then autoplay plays it and nothing re-pauses it — leaving the
+    // joiner playing while the room stays paused. With autoplay off the element
+    // simply stays paused and the catch-up (also a Play when appropriate) is the
+    // single authority. Solo playback, a playing room, and the room creator
+    // before any media is set (room state still unknown) all keep autoplaying.
+    // `peek` (not `read`) on `current`: the autoplay decision only matters at
+    // mount, and a joiner's room state is already populated by then. Subscribing
+    // would re-render the whole player every 5s (Resync rewrites `current`) for
+    // an attribute that's inert after load. `room_id` (rarely changing) is the
+    // reactive trigger for the join transition.
+    let room_ctx = crate::syncplay_client::use_room_context();
+    let room_paused = room_ctx.room_id.read().is_some()
+        && room_ctx
+            .current
+            .peek()
+            .as_ref()
+            .map(|s| !s.playing)
+            .unwrap_or(false);
+    let autoplay = !room_paused;
+
     // `None` = user hasn't touched the picker (fall back to default);
     // `Some(None)` = user explicitly chose "Off";
     // `Some(Some(id))` = user picked a track.
@@ -887,7 +911,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     rsx! {
                         video {
                             id: "{video_dom_id}",
-                            autoplay: true,
+                            autoplay,
                             preload: "metadata",
                             "data-fps": "{fps_attr}",
                             "data-media-id": "{id}",
@@ -1358,6 +1382,7 @@ fn DebugMenuBody(
         .as_ref()
         .and_then(|s| s.get("current_time"))
         .and_then(|v| v.as_f64());
+    let room_ctx = crate::syncplay_client::use_room_context();
     rsx! {
         if matches!(effective_mode, BrowserCompat::Remux | BrowserCompat::Transcode) {
             div { class: "debug-section",
@@ -1380,6 +1405,15 @@ fn DebugMenuBody(
             match &stats {
                 Some(v) => rsx! { DebugStatsRows { stats: v.clone() } },
                 None => rsx! { div { class: "debug-row muted", "Gathering…" } },
+            }
+        }
+        if room_ctx.room_id.read().is_some() {
+            div { class: "debug-section",
+                div { class: "debug-section-title", "Watch party" }
+                match &stats {
+                    Some(v) => rsx! { WatchPartyRows { stats: v.clone() } },
+                    None => rsx! { div { class: "debug-row muted", "Gathering…" } },
+                }
             }
         }
         div { class: "debug-section",
@@ -1641,6 +1675,55 @@ fn DebugStatsRows(stats: serde_json::Value) -> Element {
         if let Some(e) = err {
             DebugRow { label: "Error", value: e }
         }
+    }
+}
+
+/// Watch-party section of the debug panel — only rendered (by `DebugMenuBody`)
+/// while in a room. Membership/viewer count come from the room context; drift +
+/// correction mode are the values the syncplay bridge stamped on the <video>
+/// element, surfaced through `getDebugStats` as `sync_drift_ms` / `sync_mode` /
+/// `room_playing`.
+#[component]
+fn WatchPartyRows(stats: serde_json::Value) -> Element {
+    let get_str = |k: &str| stats.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let get_bool = |k: &str| stats.get(k).and_then(|v| v.as_bool());
+    let get_i64 = |k: &str| stats.get(k).and_then(|v| v.as_i64());
+
+    let room_ctx = crate::syncplay_client::use_room_context();
+    let viewers = *room_ctx.viewers.read();
+    let room_playing = get_bool("room_playing")
+        .or_else(|| room_ctx.current.read().as_ref().map(|s| s.playing));
+    let party_label = {
+        let state = match room_playing {
+            Some(true) => "playing",
+            Some(false) => "paused",
+            None => "—",
+        };
+        format!("{viewers} viewer{} · {state}", if viewers == 1 { "" } else { "s" })
+    };
+    let drift_ms = get_i64("sync_drift_ms");
+    let drift_label = drift_ms
+        .map(|ms| format!("{:+.1}s", ms as f64 / 1000.0))
+        .unwrap_or_else(|| "—".into());
+    // `drift` = local − room: negative means we're behind (speeding up to catch
+    // up), positive means ahead (slowing down).
+    let sync_label = match get_str("sync_mode").as_deref() {
+        Some("snap") => "snapped (jump)".to_string(),
+        Some("glide") => match drift_ms {
+            Some(ms) if ms < 0 => "catching up".to_string(),
+            Some(_) => "slowing down".to_string(),
+            None => "correcting".to_string(),
+        },
+        Some("insync") => "in sync".to_string(),
+        Some("paused") => "paused".to_string(),
+        Some("local") => "local action".to_string(),
+        _ => "—".to_string(),
+    };
+
+    rsx! {
+        DebugRow { label: "Party", value: party_label }
+        DebugRow { label: "Sync", value: sync_label }
+        DebugRow { label: "Drift", value: drift_label }
     }
 }
 

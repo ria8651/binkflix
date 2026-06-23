@@ -96,6 +96,17 @@ struct PlaybackSampleBody {
     resync_snaps: Option<i64>,
     #[serde(default)]
     resync_snap_ms: Option<i64>,
+    /// Watch-party sync gauges. `sync_drift_ms` is signed local−room drift at
+    /// the last Resync; `room_playing` / `paused` together expose play-state
+    /// desyncs; `playback_rate_x100` is the element's rate ×100 (≠100 = gliding).
+    #[serde(default)]
+    sync_drift_ms: Option<i64>,
+    #[serde(default)]
+    room_playing: Option<i64>,
+    #[serde(default)]
+    paused: Option<i64>,
+    #[serde(default)]
+    playback_rate_x100: Option<i64>,
 }
 
 async fn playback_sample(
@@ -163,6 +174,10 @@ async fn playback_sample(
             client_build_id: body.client_build_id.as_deref(),
             resync_snaps: body.resync_snaps,
             resync_snap_ms: body.resync_snap_ms,
+            sync_drift_ms: body.sync_drift_ms,
+            room_playing: body.room_playing,
+            paused: body.paused,
+            playback_rate_x100: body.playback_rate_x100,
         },
     )
     .await;
