@@ -826,7 +826,7 @@ pub async fn scan_library_with_progress(
     // seasons, so it can't live inside a per-file loop. No-op when `fpcalc`
     // is unavailable, and gated per season on fingerprint freshness so a
     // stable library re-scans for cheap.
-    run_audio_match_pass(pool, library_id, &cancel, &progress).await;
+    run_audio_match_pass(pool, library_id, concurrency, &cancel, &progress).await;
 
     info!(
         ?stats,
@@ -842,6 +842,7 @@ pub async fn scan_library_with_progress(
 async fn run_audio_match_pass(
     pool: &SqlitePool,
     library_id: i64,
+    concurrency: usize,
     cancel: &Option<CancelToken>,
     progress: &Option<ProgressHandle>,
 ) {
@@ -851,12 +852,14 @@ async fn run_audio_match_pass(
     }
 
     // Seasons with ≥2 file-backed episodes — the quorum the detector needs.
-    let seasons: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT show_id, season_number
-         FROM media
-         WHERE library_id = ? AND kind = 'episode' AND deleted_at IS NULL
-               AND show_id IS NOT NULL AND season_number IS NOT NULL
-         GROUP BY show_id, season_number
+    // Show title comes along so the progress UI can name the season it's on.
+    let seasons: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT m.show_id, m.season_number, COALESCE(s.title, 'Show')
+         FROM media m
+         JOIN shows s ON s.id = m.show_id
+         WHERE m.library_id = ? AND m.kind = 'episode' AND m.deleted_at IS NULL
+               AND m.show_id IS NOT NULL AND m.season_number IS NOT NULL
+         GROUP BY m.show_id, m.season_number
          HAVING COUNT(*) >= 2",
     )
     .bind(library_id)
@@ -867,24 +870,55 @@ async fn run_audio_match_pass(
         return;
     }
 
+    let total = seasons.len();
     if let Some(p) = progress {
         set_progress(p, |s| {
             s.phase = "audio-match".into();
+            s.done = 0;
+            s.total = total;
             s.current = None;
             s.active.clear();
         })
         .await;
     }
 
-    for (show_id, season) in seasons {
-        if cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false) {
-            info!("audio-match cancelled between seasons");
-            break;
-        }
-        if let Err(e) = analyze_one_season(pool, &show_id, season, cancel).await {
-            warn!(%show_id, season, %e, "audio-match: season analysis failed");
-        }
-    }
+    // Seasons are independent — each fingerprints + correlates its own
+    // episodes — so analyse up to `concurrency` at once, mirroring the
+    // per-file asset passes. The active list names every season in flight;
+    // `done` ticks up as each finishes. `media_id` carries the show id so
+    // the row can be retired by id (a show can have >1 season in flight).
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    stream::iter(seasons.into_iter())
+        .map(|(show_id, season, title)| {
+            let pool = pool.clone();
+            let progress = progress.clone();
+            let cancel = cancel.clone();
+            let done = done.clone();
+            async move {
+                if cancel.as_ref().map(|c| c.is_cancelled()).unwrap_or(false) {
+                    return;
+                }
+                let label = format!("{title} — Season {season}");
+                if let Some(p) = &progress {
+                    add_active(p, &show_id, &label, "analysing").await;
+                }
+                if let Err(e) = analyze_one_season(&pool, &show_id, season, &cancel).await {
+                    warn!(%show_id, season, %e, "audio-match: season analysis failed");
+                }
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Some(p) = &progress {
+                    let sid = show_id.clone();
+                    set_progress(p, |s| {
+                        s.done = n;
+                        s.active.retain(|j| j.media_id != sid);
+                    })
+                    .await;
+                }
+            }
+        })
+        .buffer_unordered(concurrency)
+        .for_each(|_| async {})
+        .await;
 }
 
 /// Fingerprint + correlate one season, storing `audio`-source markers. Skips

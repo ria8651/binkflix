@@ -400,6 +400,7 @@ fn RescanButton() -> Element {
                                 else if s.phase == "subtitles" { "Extracting subtitles…" }
                                 else if s.phase == "thumbnails" { "Extracting thumbnails…" }
                                 else if s.phase == "trickplay" { "Building trickplay…" }
+                                else if s.phase == "audio-match" { "Analysing audio…" }
                                 else if s.phase == "saving" { "Saving metadata…" }
                                 // Pre-0.9 builds and the brief moment between
                                 // phase 1 → phase 2 still report "assets".
