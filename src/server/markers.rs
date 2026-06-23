@@ -46,6 +46,13 @@ const HAMMING_BITS: u32 = 6;
 /// Minimum shared-segment length worth a marker (~15 s) — shorter shared runs
 /// (stings, logos) are dropped.
 const MIN_SEGMENT_SECS: f64 = 15.0;
+/// Upper bound on a shared segment, as a fraction of episode runtime. A real
+/// intro/recap/credits is a small slice of the episode; a match spanning more
+/// than this means two episodes share ~their entire content (duplicate or
+/// mislabeled files, or a merge that swallowed the real intro) — not a
+/// skippable segment. Emitting it would put "Skip Intro" over the whole
+/// episode, so it's dropped rather than guessing a boundary.
+const MAX_SEGMENT_FRACTION: f64 = 0.7;
 /// Bridge this many consecutive mismatches inside an otherwise-aligned run
 /// (~1 s) so a brief divergence doesn't split one intro into two.
 const MAX_GAP_ITEMS: usize = 8;
@@ -473,6 +480,12 @@ pub fn analyze_season(eps: &[SeasonEpisode]) -> Vec<(String, Vec<Marker>)> {
             if end - start < MIN_SEGMENT_SECS {
                 continue;
             }
+            // A segment covering most of the runtime isn't an intro/credits —
+            // the two episodes share ~their whole content. Drop it so the skip
+            // button can't cover the entire episode.
+            if ep.duration > 0.0 && end - start > ep.duration * MAX_SEGMENT_FRACTION {
+                continue;
+            }
             let kind = classify_by_position(start, end, ep.duration);
             let title = match kind {
                 MarkerKind::Chapter => Some("Recurring segment".to_string()),
@@ -533,6 +546,47 @@ mod tests {
             assert!(ms[0].end_secs > MIN_SEGMENT_SECS, "intro ≥ min length, got {}", ms[0].end_secs);
         }
         assert!(by_id["c"].is_empty(), "a unique episode must get no shared markers");
+    }
+
+    #[test]
+    fn whole_episode_match_is_not_emitted_as_skip_segment() {
+        // Two episodes that share their ENTIRE content (a duplicate/mislabeled
+        // rip): the same fingerprint stream end-to-end. A third, distinct
+        // episode shares only a real ~27 s intro with them. The pair's
+        // whole-length run must NOT surface as a skippable marker, while the
+        // genuine short intro the third episode shares still does.
+        let intro = lcg_stream(42, 220);
+        let body = lcg_stream(7, 11000); // ~22 min at FP_ITEM_SECS
+        let dup: Vec<u32> = intro.iter().chain(body.iter()).copied().collect();
+        let with_intro = |seed: u32| {
+            let mut fp = intro.clone();
+            fp.extend(lcg_stream(seed, 11000));
+            fp
+        };
+        let dur = dup.len() as f64 * FP_ITEM_SECS;
+        let eps = vec![
+            SeasonEpisode { media_id: "a".into(), duration: dur, fp: dup.clone() },
+            SeasonEpisode { media_id: "b".into(), duration: dur, fp: dup },
+            SeasonEpisode { media_id: "c".into(), duration: dur, fp: with_intro(99) },
+        ];
+        let by_id: HashMap<String, Vec<Marker>> = analyze_season(&eps).into_iter().collect();
+
+        for id in ["a", "b"] {
+            for m in &by_id[id] {
+                assert!(
+                    m.end_secs - m.start_secs <= dur * MAX_SEGMENT_FRACTION,
+                    "episode {id} got an implausibly long shared segment ({:.0}s of {:.0}s): {m:?}",
+                    m.end_secs - m.start_secs,
+                    dur,
+                );
+            }
+        }
+        // The third episode still gets the genuine short shared intro.
+        let c = &by_id["c"];
+        assert!(
+            c.iter().any(|m| m.kind == MarkerKind::Intro && m.start_secs < 2.0),
+            "the real short intro shared with the duplicates should still be detected, got {c:?}"
+        );
     }
 
     #[test]

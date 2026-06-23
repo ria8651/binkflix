@@ -68,7 +68,7 @@ const MARKERS_VERSION: i64 = 1;
 /// Gates the per-season audio-fingerprint pass. Bump to force re-analysis of
 /// every season after a detection-algorithm change. Day-to-day re-analysis is
 /// driven by fingerprint freshness (a new/changed episode), not this constant.
-const AUDIO_MARKERS_VERSION: i64 = 1;
+const AUDIO_MARKERS_VERSION: i64 = 2;
 
 async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)) {
     let mut p = handle.write().await;
