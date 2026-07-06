@@ -1,8 +1,9 @@
 //! Project-local scratch space.
 //!
-//! All on-disk temp files go under `BINKFLIX_TMP` (default `./data/tmp`)
-//! so `/tmp` isn't polluted and crash leftovers stay alongside the rest
-//! of the dev data dir. Sites that need a same-filesystem invariant
+//! All on-disk temp files go under `BINKFLIX_TMP` (default `<data dir>/tmp`,
+//! the data dir being the directory holding `BINKFLIX_DB`) so `/tmp` isn't
+//! polluted and crash leftovers stay alongside the rest of the data dir.
+//! Sites that need a same-filesystem invariant
 //! (e.g. HLS producer scratch, which hard-links into the canonical
 //! plan_dir) build their `TempDir` directly with `tempdir_in(parent)`
 //! against their own anchor instead of using this helper.
@@ -10,9 +11,16 @@
 use std::path::PathBuf;
 
 pub fn tmp_root() -> PathBuf {
-    std::env::var("BINKFLIX_TMP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./data/tmp"))
+    if let Ok(p) = std::env::var("BINKFLIX_TMP") {
+        return PathBuf::from(p);
+    }
+    // Default beside the DB, not the CWD: a container points BINKFLIX_DB at the
+    // mounted volume but has no writable ./data.
+    let db = std::env::var("BINKFLIX_DB").unwrap_or_else(|_| "./data/binkflix.db".into());
+    PathBuf::from(db)
+        .parent()
+        .map(|d| d.join("tmp"))
+        .unwrap_or_else(|| PathBuf::from("./data/tmp"))
 }
 
 /// Create the tmp root if missing and best-effort sweep stale entries

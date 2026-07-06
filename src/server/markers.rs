@@ -334,7 +334,14 @@ pub async fn ensure_fingerprint(
             return Ok(decode_fp(&raw));
         }
     }
-    let fp = fingerprint(video).await?;
+    // Store a row even on failure (empty `raw`) to negative-cache the attempt,
+    // else a file fpcalc can't read re-runs — and re-analyses its whole season —
+    // every scan. Self-heals when the file changes (mtime/size moves `sig`).
+    let fp = fingerprint(video).await;
+    let raw = match &fp {
+        Ok(fp) => encode_fp(fp),
+        Err(_) => Vec::new(),
+    };
     sqlx::query(
         "INSERT OR REPLACE INTO media_fingerprints
             (media_id, content_mtime, content_size, fp_algo_version, raw)
@@ -344,10 +351,10 @@ pub async fn ensure_fingerprint(
     .bind(sig.0)
     .bind(sig.1)
     .bind(FP_ALGO_VERSION)
-    .bind(encode_fp(&fp))
+    .bind(raw)
     .execute(pool)
     .await?;
-    Ok(fp)
+    fp
 }
 
 /// One episode's fingerprint + runtime, fed to [`analyze_season`].
