@@ -165,12 +165,22 @@ pub struct EpisodeSummary {
     pub runtime_minutes: Option<i64>,
     #[serde(default)]
     pub release_date: Option<String>,
+    /// Progress *within the current rewatch pass* — zero for an episode whose
+    /// stored position predates the pass. Outside a pass this is just the
+    /// stored position.
     #[serde(default)]
     pub position_secs: f64,
     #[serde(default)]
     pub duration_secs: f64,
+    /// Finished *in the current pass*. Outside a pass, finished at all.
     #[serde(default)]
     pub completed: i64,
+    /// How far the user got *before* the current pass began, as a percentage —
+    /// 100 for an episode finished in an earlier pass, the old partial position
+    /// for one they abandoned, 0 when no pass is active. Drawn as the dimmed
+    /// under-layer of the progress bar, with `position_secs` layered on top.
+    #[serde(default)]
+    pub seen_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -183,6 +193,12 @@ pub struct Season {
 pub struct ShowDetail {
     pub show: Show,
     pub seasons: Vec<Season>,
+    /// `Some(pass_no)` while a rewatch of this show is under way and still has
+    /// episodes left in it (2 = first rewatch). `None` once every episode is
+    /// done for the pass, so the button offers a fresh rewatch rather than
+    /// needing the finished one cleared by hand.
+    #[serde(default)]
+    pub rewatch_pass: Option<i64>,
 }
 
 /// Video/audio technical metadata probed on demand with ffprobe.
@@ -586,8 +602,19 @@ pub struct WatchProgress {
     pub media_id: String,
     pub position_secs: f64,
     pub duration_secs: f64,
+    /// Has the user ever finished this? Sticky — a rewatch never clears it.
     pub completed: bool,
     pub updated_at: i64,
+    /// Where playback should actually start, with the rewatch pass resolved
+    /// server-side: the stored position when it belongs to the current pass,
+    /// zero when it's a leftover from a previous one (or from having finished
+    /// the item). The player uses this instead of second-guessing `completed`.
+    #[serde(default)]
+    pub resume_secs: f64,
+    /// `Some(pass_no)` while a rewatch covering this item is under way — keyed
+    /// on the show for episodes, on the file itself for movies.
+    #[serde(default)]
+    pub rewatch_pass: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -600,11 +627,6 @@ pub struct ProgressReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContinueItem {
     pub media_id: String,
-    /// The `watch_progress` row backing this tile. Equals `media_id` for movies
-    /// and in-progress episodes; for an "up next" tile (where `media_id` is the
-    /// next, not-yet-started episode) it's the *completed* previous episode that
-    /// generated the tile. Dismiss/hide must target this, not `media_id`.
-    pub progress_id: String,
     pub kind: String,
     /// For episodes, the episode's own title; for movies, the movie title.
     /// The client composes the second-line subtitle ("Show · S1E2" / year)

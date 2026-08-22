@@ -644,9 +644,15 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
                     .map(|s| s.media_id == id_for_resume && room_ctx.room_id.peek().is_some())
                     .unwrap_or(false)
             {
+                // `resume_secs` already has the rewatch pass resolved server-
+                // side: it's zero for a position left over from a previous pass
+                // (or from having finished the thing), and the stored position
+                // when it belongs to the viewing in progress. Don't gate on
+                // `completed` here — an episode being rewatched is completed
+                // *and* legitimately resumable.
                 if let Ok(Some(p)) = get_progress(&id_for_resume).await {
-                    if !p.completed && p.position_secs > 5.0 {
-                        initial_time = p.position_secs;
+                    if p.resume_secs > 5.0 {
+                        initial_time = p.resume_secs;
                     }
                 }
             }

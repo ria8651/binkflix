@@ -46,6 +46,16 @@ pub fn router() -> Router<AppState> {
         .route("/api/continue-watching", get(super::watch::continue_watching))
         .route("/api/continue-watching/dismiss/{id}", post(super::watch::dismiss_cw))
         .route("/api/media/{id}/watched", post(super::watch::mark_watched).delete(super::watch::mark_unwatched))
+        // Start / end a rewatch pass. Scoped to the show for a series (a pass
+        // spans every episode) and to the file for a movie.
+        .route(
+            "/api/shows/{id}/rewatch",
+            post(super::watch::start_show_rewatch).delete(super::watch::end_show_rewatch),
+        )
+        .route(
+            "/api/media/{id}/rewatch",
+            post(super::watch::start_media_rewatch).delete(super::watch::end_media_rewatch),
+        )
         .route(
             "/api/preferences/{scope}",
             get(super::preferences::get_preferences).post(super::preferences::set_preferences),
@@ -529,7 +539,10 @@ pub struct Show {
     pub genres: Vec<String>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+/// Client-facing episode row. `position_secs` / `completed` are relative to the
+/// current rewatch pass (outside a pass, relative to all time); `seen_pct` is
+/// how far the user had got *before* the pass began.
+#[derive(Debug, Serialize)]
 pub struct EpisodeSummary {
     pub id: String,
     pub season_number: i64,
@@ -541,6 +554,7 @@ pub struct EpisodeSummary {
     pub position_secs: f64,
     pub duration_secs: f64,
     pub completed: i64,
+    pub seen_pct: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -553,6 +567,27 @@ pub struct Season {
 pub struct ShowResponse {
     pub show: Show,
     pub seasons: Vec<Season>,
+    pub rewatch_pass: Option<i64>,
+}
+
+/// One episode plus the raw watch-progress timestamps the pass arithmetic
+/// needs. `EpisodeSummary` itself carries the *resolved* view (progress within
+/// the current pass, plus how far the user had got before it), so the client
+/// never has to compare timestamps to draw a bar.
+#[derive(sqlx::FromRow)]
+struct EpisodeRow {
+    id: String,
+    season_number: i64,
+    episode_number: i64,
+    title: String,
+    plot: Option<String>,
+    runtime_minutes: Option<i64>,
+    release_date: Option<String>,
+    position_secs: f64,
+    duration_secs: f64,
+    completed: i64,
+    last_completed_at: Option<i64>,
+    updated_at: i64,
 }
 
 async fn show(
@@ -581,14 +616,16 @@ async fn show(
     .fetch_all(&state.pool)
     .await?;
 
-    let eps = sqlx::query_as::<_, EpisodeSummary>(
+    let rows = sqlx::query_as::<_, EpisodeRow>(
         "SELECT m.id,
                 COALESCE(m.season_number, 0)  AS season_number,
                 COALESCE(m.episode_number, 0) AS episode_number,
                 m.title, m.plot, m.runtime_minutes, m.release_date,
                 COALESCE(wp.position_secs, 0.0) AS position_secs,
                 COALESCE(wp.duration_secs, 0.0) AS duration_secs,
-                COALESCE(wp.completed, 0)       AS completed
+                COALESCE(wp.completed, 0)       AS completed,
+                wp.last_completed_at            AS last_completed_at,
+                COALESCE(wp.updated_at, 0)      AS updated_at
          FROM media m
          LEFT JOIN watch_progress wp
            ON wp.media_id = m.id AND wp.user_sub = ?
@@ -600,8 +637,53 @@ async fn show(
     .fetch_all(&state.pool)
     .await?;
 
+    // Zero when no rewatch is running, which makes every comparison below
+    // collapse to plain "has the user finished this / where were they".
+    let pass_start: i64 = sqlx::query_scalar(
+        "SELECT started_at FROM watch_scope_state
+         WHERE user_sub = ? AND scope_key = ? AND started_at > 0",
+    )
+    .bind(&session.user_sub)
+    .bind(format!("show:{id}"))
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or(0);
+
     let mut seasons: Vec<Season> = Vec::new();
-    for ep in eps {
+    let mut pass_remaining = false;
+    for r in rows {
+        let done = r.completed != 0 && r.last_completed_at.unwrap_or(0) >= pass_start;
+        // A position written before the pass started belongs to the previous
+        // viewing, so it counts towards the dimmed under-layer, not the live bar.
+        let fresh = r.updated_at >= pass_start;
+        let seen_pct = if pass_start == 0 {
+            0.0
+        } else if r.completed != 0 {
+            // Finished in an earlier pass (`done` is false here, so it can't be
+            // this one) — the whole bar is ground the user has covered before.
+            100.0
+        } else if !fresh && r.duration_secs > 0.0 {
+            // Abandoned part-way through an earlier pass. Once they play it
+            // again the position is overwritten and this hint is gone, which is
+            // as much history as one row can carry.
+            (r.position_secs / r.duration_secs * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        pass_remaining |= !done;
+        let ep = EpisodeSummary {
+            id: r.id,
+            season_number: r.season_number,
+            episode_number: r.episode_number,
+            title: r.title,
+            plot: r.plot,
+            runtime_minutes: r.runtime_minutes,
+            release_date: r.release_date,
+            position_secs: if fresh { r.position_secs } else { 0.0 },
+            duration_secs: if fresh { r.duration_secs } else { 0.0 },
+            completed: done as i64,
+            seen_pct,
+        };
         match seasons.last_mut() {
             Some(s) if s.number == ep.season_number => s.episodes.push(ep),
             _ => seasons.push(Season {
@@ -611,7 +693,25 @@ async fn show(
         }
     }
 
-    Ok(Json(ShowResponse { show, seasons }))
+    // A pass with nothing left in it reads as finished: the show is fully
+    // watched again and the button offers a fresh rewatch, no clearing needed.
+    let rewatch_pass = if pass_start > 0 && pass_remaining {
+        sqlx::query_scalar(
+            "SELECT pass_no FROM watch_scope_state WHERE user_sub = ? AND scope_key = ?",
+        )
+        .bind(&session.user_sub)
+        .bind(format!("show:{id}"))
+        .fetch_optional(&state.pool)
+        .await?
+    } else {
+        None
+    };
+
+    Ok(Json(ShowResponse {
+        show,
+        seasons,
+        rewatch_pass,
+    }))
 }
 
 // ---- File serving ----
@@ -1118,10 +1218,24 @@ fn build_movie_search_sql(
                 AND (wp.completed = 1 OR wp.position_secs > 0))"
                 .into(),
         ),
+        // `completed` is sticky, so "in progress" can't just be `completed = 0`
+        // any more — an item being rewatched is both. Pass-relative instead:
+        // touched since the pass began and not yet finished within it. With no
+        // pass running `started_at` is absent (COALESCE 0) and this reduces to
+        // the old predicate.
         "in_progress" => wheres.push(
             "EXISTS (SELECT 1 FROM watch_progress wp \
+               LEFT JOIN watch_scope_state wpass \
+                 ON wpass.user_sub = wp.user_sub \
+                AND wpass.scope_key = CASE \
+                      WHEN m.kind = 'episode' AND m.show_id IS NOT NULL \
+                      THEN 'show:' || m.show_id ELSE 'media:' || m.id END \
               WHERE wp.media_id = m.id AND wp.user_sub = ? \
-                AND wp.completed = 0 AND wp.position_secs > 0)"
+                AND wp.position_secs > 0 \
+                AND wp.updated_at >= COALESCE(wpass.started_at, 0) \
+                AND NOT (wp.completed = 1 \
+                         AND COALESCE(wp.last_completed_at, 0) \
+                             >= COALESCE(wpass.started_at, 0)))"
                 .into(),
         ),
         _ => {}

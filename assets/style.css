@@ -621,11 +621,19 @@ h2.section {
     box-shadow: var(--progress-shadow);
     z-index: 3;
 }
+/* Absolute, not in flow, so a rewatch can stack two fills in one track: the
+ * dimmed `.seen` layer underneath is ground covered before the current pass
+ * started, the normal fill on top is progress within it. */
 .card .progress-bar,
 .episode .progress-bar {
-    height: 100%;
+    position: absolute;
+    inset: 0 auto 0 0;
     background: var(--progress-fill-bg);
     border-radius: inherit;
+}
+.card .progress-bar.seen,
+.episode .progress-bar.seen {
+    opacity: var(--progress-seen-opacity);
 }
 
 /* ── Detail page ───────────────────────────────────────────── */

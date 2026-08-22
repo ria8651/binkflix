@@ -9,6 +9,7 @@ const ICON_PLAY_BTN: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" f
 const ICON_CHECK_BADGE: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>"#;
 const ICON_X_BADGE: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>"#;
 pub const ICON_GROUP: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>"#;
+const ICON_REWATCH: &str = r#"<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>"#;
 const ICON_SEARCH: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>"#;
 const ICON_REFRESH: &str = r#"<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15A9 9 0 0 1 5.64 18.36L1 14"/></svg>"#;
 
@@ -1068,7 +1069,9 @@ fn ContinueCard(
             on_change.call(());
         });
     };
-    let media_id_for_dismiss = item.progress_id.clone();
+    // Hiding is scope-level server-side (the show, or the movie), so any id
+    // belonging to the tile does — no need to point at the row behind it.
+    let media_id_for_dismiss = item.media_id.clone();
     let on_dismiss = move |evt: Event<MouseData>| {
         evt.stop_propagation();
         let id = media_id_for_dismiss.clone();
@@ -1277,6 +1280,11 @@ fn MediaDetail(id: String) -> Element {
     let media = use_resource(use_reactive!(|id| async move {
         get_media(&id).await
     }));
+    // Watch state, for the "Watch again" affordance on a movie. Cheap, and it
+    // keeps the rewatch flag off `Media` (which the library grid also fetches).
+    let mut progress = use_resource(use_reactive!(|id| async move {
+        get_progress(&id).await
+    }));
 
     rsx! {
         match &*media.read_unchecked() {
@@ -1420,6 +1428,30 @@ fn MediaDetail(id: String) -> Element {
                             Link { to: Route::MediaPlay { id: m.id.clone() }, class: "btn",
                                 span { dangerous_inner_html: ICON_PLAY_BTN }
                                 "Play"
+                            }
+                            {
+                                // Movies only: an episode's pass is owned by its
+                                // show, so that button belongs on the show page.
+                                let (watched, pass) = match &*progress.read_unchecked() {
+                                    Some(Ok(Some(p))) => (p.completed, p.rewatch_pass),
+                                    _ => (false, None),
+                                };
+                                let media_id = m.id.clone();
+                                (m.kind == "movie" && (watched || pass.is_some())).then(|| rsx! {
+                                    button {
+                                        class: "btn ghost",
+                                        onclick: move |_| {
+                                            let id = media_id.clone();
+                                            let start = pass.is_none();
+                                            spawn(async move {
+                                                let _ = set_rewatch("media", &id, start).await;
+                                                progress.restart();
+                                            });
+                                        },
+                                        span { dangerous_inner_html: ICON_REWATCH }
+                                        if pass.is_some() { "End rewatch" } else { "Watch again" }
+                                    }
+                                })
                             }
                             if m.kind == "episode" {
                                 if let Some(sid) = m.show_id.as_deref() {
@@ -1589,6 +1621,38 @@ fn ShowDetail(id: String) -> Element {
                                 })
                             }
                             {
+                                // Rewatching is declared, not guessed: this
+                                // button stamps the pass start, and every
+                                // episode's tick / bar / next-up position is
+                                // then read relative to it. Only offered once
+                                // there's something watched to go back over.
+                                let show_id = d.show.id.clone();
+                                let pass = d.rewatch_pass;
+                                let anything_seen = d
+                                    .seasons
+                                    .iter()
+                                    .flat_map(|s| s.episodes.iter())
+                                    .any(|e| e.completed != 0 || e.seen_pct > 0.0);
+                                (pass.is_some() || anything_seen).then(|| rsx! {
+                                    nav { class: "detail-actions",
+                                        button {
+                                            class: if pass.is_some() { "btn ghost" } else { "btn" },
+                                            onclick: move |_| {
+                                                let id = show_id.clone();
+                                                let start = pass.is_none();
+                                                spawn(async move {
+                                                    let _ = set_rewatch("shows", &id, start).await;
+                                                    detail.restart();
+                                                    cont.restart();
+                                                });
+                                            },
+                                            span { dangerous_inner_html: ICON_REWATCH }
+                                            if pass.is_some() { "End rewatch" } else { "Rewatch" }
+                                        }
+                                    }
+                                })
+                            }
+                            {
                                 // The single most-recent in-progress
                                 // episode for this show. Lives inside
                                 // the info column so the "play next"
@@ -1745,7 +1809,11 @@ fn SeasonBlock(season: Season, on_change: EventHandler<()>) -> Element {
 
 #[component]
 fn EpisodeRow(episode: EpisodeSummary, on_change: EventHandler<()>) -> Element {
+    // `completed` / `position_secs` are scoped to the current rewatch pass, so
+    // the tick and the bright bar track this time through; `seen_pct` is the
+    // dimmed record of the last one.
     let completed = episode.completed != 0;
+    let seen_pct = episode.seen_pct;
     let pct = if completed {
         100.0
     } else if episode.duration_secs > 0.0 {
@@ -1780,9 +1848,17 @@ fn EpisodeRow(episode: EpisodeSummary, on_change: EventHandler<()>) -> Element {
                     div { class: "play-overlay",
                         span { class: "icon-btn overlay lg", dangerous_inner_html: ICON_PLAY_BTN }
                     }
-                    if pct > 0.0 {
+                    if pct > 0.0 || seen_pct > 0.0 {
                         div { class: "progress",
-                            div { class: "progress-bar", style: "width: {pct}%;" }
+                            // Two layers during a rewatch: how far the user got
+                            // before this pass, dimmed, with the current pass
+                            // painted over the top of it.
+                            if seen_pct > 0.0 {
+                                div { class: "progress-bar seen", style: "width: {seen_pct}%;" }
+                            }
+                            if pct > 0.0 {
+                                div { class: "progress-bar", style: "width: {pct}%;" }
+                            }
                         }
                     }
                     if !completed {

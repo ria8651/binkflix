@@ -255,6 +255,33 @@ pub async fn mark_watched(_id: &str) -> Result<(), String> {
     Err("client fetcher invoked on non-wasm target".to_string())
 }
 
+/// Start (`start = true`) or end a rewatch pass. `scope` is `"shows"` or
+/// `"media"` — a series rewatch spans every episode, a movie rewatch is just
+/// the one file.
+#[cfg(feature = "web")]
+pub async fn set_rewatch(scope: &str, id: &str, start: bool) -> Result<(), String> {
+    let url = format!("/api/{scope}/{id}/rewatch");
+    let req = if start {
+        gloo_net::http::Request::post(&url)
+    } else {
+        gloo_net::http::Request::delete(&url)
+    };
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("network error hitting {url}: {e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("{url} returned HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "web"))]
+#[allow(dead_code)]
+pub async fn set_rewatch(_scope: &str, _id: &str, _start: bool) -> Result<(), String> {
+    Err("client fetcher invoked on non-wasm target".to_string())
+}
+
 #[cfg(feature = "web")]
 pub async fn dismiss_continue_watching(id: &str) -> Result<(), String> {
     let url = format!("/api/continue-watching/dismiss/{id}");

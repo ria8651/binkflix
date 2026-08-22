@@ -191,6 +191,9 @@
   --progress-radius: 0;
   --progress-inset: 0;
   --progress-shadow: none;
+  /* Opacity of the "seen in an earlier pass" under-layer drawn during a
+   * rewatch, with the current pass's fill painted over the top of it. */
+  --progress-seen-opacity: 0.4;
 
   /* Episode row chrome (on the show-detail page). Same split as the card
    * tile: the row container vs the thumbnail inside. Defaults reproduce the
