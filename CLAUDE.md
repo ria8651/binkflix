@@ -1,3 +1,7 @@
-Keep the build warning-free across default, `--features web --target wasm32-unknown-unknown`, and `--features server`.
+# `Claude.md`
 
-The wasm client is served by and version-locked to the server (asset hashes are cache-busted), so the two never run skewed versions. Shared wire types in `src/types.rs` can therefore be strict enums (e.g. `Phase`, `Stage`) without `#[serde(other)]` fallbacks — don't add unknown-variant handling for version skew that can't happen.
+Keep the build clean
+
+Fe version is locked to server hence API is fluid
+
+Commit style: "<area>: <message>", under 70 chars, lowercase (unless proper noun), merges as "merge: <theirs> into <ours>"
