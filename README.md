@@ -142,7 +142,10 @@ See [.env.example](.env.example). Short version:
 - `BINKFLIX_DB` — SQLite path, default `./data/binkflix.db`.
 - `BINKFLIX_BIND` — override the bind address. If unset, `dx serve` picks one.
 - `RUST_LOG` — tracing filter, defaults to `info,binkflix=debug`.
-- `BINKFLIX_HWACCEL` — H.264 hardware encoder for the HLS transcode path. `auto` (default), `none`, `vaapi`, `qsv`, or `videotoolbox`. `auto` probes `ffmpeg -encoders` plus the relevant device files at startup; falls back to libx264 if nothing usable is found, and again at runtime if a hwenc spawn fails. Pass `/dev/dri` into the container (`devices: ["/dev/dri:/dev/dri"]` in compose, `--device /dev/dri:/dev/dri` with raw docker) to enable VAAPI/QSV; without it the server runs as before with libx264.
+- `BINKFLIX_HWACCEL` — H.264 hardware encoder for the HLS transcode path. `auto` (default), `none`, `vaapi`, `qsv`, or `videotoolbox`. Pass `/dev/dri` into the container (`devices: ["/dev/dri:/dev/dri"]` in compose, `--device /dev/dri:/dev/dri` with raw docker) to enable VAAPI/QSV; without it the server runs with libx264.
+  - `auto` probes `ffmpeg -encoders` plus the relevant device files at startup and falls back to libx264 if nothing usable is found. At runtime, a transcode whose hw-encoder ffmpeg dies during startup falls back to libx264 **for that launch only** — nothing is remembered process-wide, so the next stream tries hardware again.
+  - Naming an encoder explicitly (`vaapi`/`qsv`/`videotoolbox`) additionally selects **strict** mode: software is never substituted, because libx264 can't hold real-time on the hardware this runs on, which makes a silent substitution an outage that merely looks like a slow server. A hwenc failure — missing encoder or device at startup, or a failed launch at runtime — fails the transcode with a 500 and an ERROR log instead. Direct play and remux don't touch the GPU and keep working, so the server still boots and serves.
+  - Either way a failed hw launch emits a `transcode.hwenc_failure` analytics event (with `encoder`, `exit_status`, and `fell_back`), so degradation is queryable rather than log-only.
 
 ## API (for now)
 

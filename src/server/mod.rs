@@ -55,10 +55,10 @@ pub struct AppState {
     /// idle sweeper. Separate from `hls_producers` because producers are
     /// shared across viewers but sessions are per-viewer.
     pub active_sessions: Arc<hls::SessionRegistry>,
-    /// H.264 hardware encoder picked at startup. The producer reads this
-    /// (combined with the process-wide sticky-fallback flag inside
-    /// `producer.rs`) when building each ffmpeg invocation.
-    pub hwenc: hls::HwEncoder,
+    /// H.264 hardware encoder resolved at startup, plus whether it was an
+    /// explicit (strict) request. The producer reads this when building each
+    /// ffmpeg invocation; any fallback from it is decided per launch.
+    pub hwenc: hls::HwEncConfig,
     /// `None` disables bastion auth entirely — set `BASTION_ORIGIN` to enable.
     pub auth: Option<auth::AuthState>,
     /// Per-media-id reentrancy guard for single-file refreshes. A

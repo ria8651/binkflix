@@ -1553,13 +1553,16 @@ fn DebugMenuBody(
 struct ObservedStream {
     mode: BrowserCompat,
     content_type: Option<String>,
-    /// Server-reported ffmpeg H.264 encoder for transcode mode
-    /// (`libx264`, `h264_vaapi`, `h264_qsv`, `h264_videotoolbox`).
-    /// `None` for non-transcode responses or older servers.
+    /// ffmpeg H.264 encoder the server *asks* producers to use for transcode
+    /// mode (`libx264`, `h264_vaapi`, `h264_qsv`, `h264_videotoolbox`).
+    /// `None` for non-transcode responses or older servers. Not necessarily
+    /// what encoded a given segment: a launch whose hwenc ffmpeg dies during
+    /// startup falls back to libx264 for that launch, which this can't see —
+    /// it comes off a cacheable response written before any producer exists.
     encoder: Option<String>,
     /// Rate control that encoder is running: `crf 21`, `q:v 70`, or `abr`.
-    /// Server-resolved — it depends on the sticky hw fallback and the host
-    /// arch, neither of which the client can see.
+    /// Server-resolved because it depends on the host arch, which the client
+    /// can't see. Tracks `encoder`, so it carries the same caveat.
     ratecontrol: Option<String>,
 }
 

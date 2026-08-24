@@ -74,7 +74,7 @@
 //! * **Idle**: 30s of no requests reaps the producer entirely.
 
 use super::cache;
-use super::hwenc::HwEncoder;
+use super::hwenc::{HwEncConfig, HwEncoder};
 use super::plan::{AudioPlan, Mode, StreamPlan};
 use dashmap::DashMap;
 use sqlx::SqlitePool;
@@ -343,11 +343,12 @@ pub struct ProducerCtx {
     /// ffmpeg gets `-map 0:a:N?` either way; the optional flag just means
     /// "no audio in the output" if the stream is missing.
     pub audio: Option<AudioPlan>,
-    /// H.264 hardware encoder picked at server startup. Note that the
-    /// *effective* encoder may degrade to `None` mid-process if the
-    /// sticky fallback flag has been set by a prior failed launch — see
-    /// [`effective_hw`].
-    pub hw: HwEncoder,
+    /// Hardware-encoder configuration resolved at server startup. The
+    /// encoder a given launch actually ends up on may differ: a hwenc
+    /// ffmpeg that dies during startup falls back to libx264 for *that
+    /// launch only* (lenient mode) or fails the request (strict) — see
+    /// [`launch_producer`].
+    pub hw: HwEncConfig,
     /// DB handle for best-effort `transcode.*` lifecycle telemetry.
     pub pool: SqlitePool,
 }
@@ -393,34 +394,23 @@ impl EventMeta {
     }
 }
 
-/// Process-wide sticky flag: once a hwenc producer fails to start, every
-/// subsequent producer (this one and future) uses libx264. Cheaper to
-/// reason about than per-media retry state, and a hwenc that fails once
-/// will keep failing for the same reason (missing driver, busted device,
-/// codec rejection by the kernel module).
-static HW_DISABLED: AtomicBool = AtomicBool::new(false);
-
-fn effective_hw(ctx_hw: HwEncoder) -> HwEncoder {
-    if HW_DISABLED.load(Ordering::Acquire) {
-        HwEncoder::None
-    } else {
-        ctx_hw
-    }
-}
-
-/// What the m3u8 endpoint should advertise as `X-Stream-Encoder` for a
-/// given context — accounts for the sticky fallback flag.
-pub fn current_encoder_name(ctx_hw: HwEncoder) -> &'static str {
-    effective_hw(ctx_hw).ffmpeg_name()
+/// What the m3u8 endpoint advertises as `X-Stream-Encoder`: the encoder
+/// producers are *asked* to use. Runtime fallback is per-launch and lives
+/// entirely inside `launch_producer`, so it isn't knowable here — this
+/// response is written before any producer for the stream exists.
+pub fn requested_encoder_name(cfg: &HwEncConfig) -> &'static str {
+    cfg.requested_name()
 }
 
 /// What the m3u8 endpoint should advertise as `X-Stream-Ratecontrol`.
 ///
-/// Resolved server-side on purpose: the client can see neither the sticky
-/// hw-fallback flag nor the Apple-Silicon gate inside `select_rate_control`,
-/// so any client-side guess would misreport both.
-pub fn current_rate_control_name(ctx_hw: HwEncoder, hard_cap: bool) -> String {
-    match select_rate_control(effective_hw(ctx_hw), hard_cap) {
+/// Resolved server-side on purpose: the client can't see the Apple-Silicon
+/// gate inside `select_rate_control`, so any client-side guess would
+/// misreport it. Like the encoder name, this describes the *requested*
+/// backend — a launch that falls back to libx264 also falls back to its
+/// rate control.
+pub fn requested_rate_control_name(cfg: &HwEncConfig, hard_cap: bool) -> String {
+    match select_rate_control(cfg.encoder, hard_cap) {
         RateControl::CappedCrf => format!("crf {TRANSCODE_CRF}"),
         RateControl::VideotoolboxQuality => format!("q:v {VIDEOTOOLBOX_QUALITY}"),
         RateControl::VaapiQvbr => format!("qvbr {VAAPI_QUALITY}"),
@@ -595,32 +585,73 @@ async fn launch_producer(
     target_idx: u32,
     pool: Arc<Mutex<Vec<ProducerHandle>>>,
 ) -> anyhow::Result<ProducerHandle> {
-    // Retry loop for the hw-encoder runtime fallback. We try with the
-    // resolved hw encoder; if the ffmpeg child dies within 750ms (the
-    // signature of a driver/kernel-module rejection — by the time
-    // surfaces are negotiated the encoder has either claimed the device
-    // or thrown), we set the process-wide `HW_DISABLED` flag, log, and
-    // retry once with libx264. Software won't trip the same path so the
-    // loop is at most two iterations.
+    // Retry loop for the hw-encoder runtime fallback, scoped to this launch
+    // and nothing else. We try with the configured hw encoder; if the ffmpeg
+    // child dies *unsuccessfully* within 750ms (the signature of a
+    // driver/kernel-module rejection — by then the encoder has either
+    // claimed the device or thrown), we log, emit telemetry, and retry once
+    // with libx264. libx264 won't trip the same path so the loop is at most
+    // two iterations.
+    //
+    // Three things this deliberately does NOT do, each of which was a bug:
+    //
+    //  * Probe non-transcode plans. A remux is `-c:v copy` with no encoder
+    //    in the pipeline, so it cannot fail *as* a hwenc — and because a
+    //    stream copy of a page-cached file can reach EOF before the reaper's
+    //    first backpressure tick, it routinely exits inside the window.
+    //  * Treat a successful exit as a failure. Status 0 means ffmpeg did the
+    //    job; a short tail-of-file transcode can legitimately finish in
+    //    <750ms.
+    //  * Remember anything process-wide. A per-launch decision stays
+    //    per-launch, so one bad read (or one genuinely busy GPU) can't
+    //    strand every later stream on software until the container restarts.
+    let mut hw = ctx.hw.encoder;
     loop {
-        let active_hw = effective_hw(ctx.hw);
-        let mut handle = launch_once(ctx.clone(), target_idx, pool.clone()).await?;
-        if active_hw == HwEncoder::None {
+        let mut handle = launch_once(ctx.clone(), hw, target_idx, pool.clone()).await?;
+        // Skipping the wait entirely (rather than waiting and ignoring the
+        // result) keeps 750ms off every remux launch.
+        if !hwenc_at_risk(hw, &ctx.plan.mode) {
             return Ok(handle);
         }
-        match wait_for_early_exit(&mut handle.child, Duration::from_millis(750)).await {
-            EarlyExit::Alive => return Ok(handle),
-            EarlyExit::Exited(status) => {
+        let exit = wait_for_early_exit(&mut handle.child, Duration::from_millis(750)).await;
+        match classify_startup(hw, &ctx.plan.mode, &exit) {
+            StartupVerdict::Ok => return Ok(handle),
+            StartupVerdict::HwencFailed(status) => {
+                handle.shutdown().await;
+                // One event kind for both outcomes so "how often does the GPU
+                // fail to start" is a single query; `fell_back` says what was
+                // done about it.
+                let meta = EventMeta::from_ctx(&ctx);
+                meta.emit(
+                    "transcode.hwenc_failure",
+                    serde_json::json!({
+                        "encoder": hw.ffmpeg_name(),
+                        "exit_status": format!("{status:?}"),
+                        "fell_back": !ctx.hw.strict,
+                        "target_idx": target_idx,
+                    }),
+                );
+                if ctx.hw.strict {
+                    tracing::error!(
+                        media = %ctx.media_id,
+                        encoder = hw.ffmpeg_name(),
+                        ?status,
+                        "hwenc producer exited during startup; failing transcode (strict mode)"
+                    );
+                    anyhow::bail!(
+                        "hardware encoder {} failed to start and software fallback is disabled \
+                         (BINKFLIX_HWACCEL={})",
+                        hw.ffmpeg_name(),
+                        hw.env_value(),
+                    );
+                }
                 tracing::warn!(
                     media = %ctx.media_id,
-                    encoder = active_hw.ffmpeg_name(),
+                    encoder = hw.ffmpeg_name(),
                     ?status,
-                    "hwenc producer exited during startup; falling back to libx264 process-wide"
+                    "hwenc producer exited during startup; falling back to libx264 for this launch"
                 );
-                HW_DISABLED.store(true, Ordering::Release);
-                handle.shutdown().await;
-                // Loop body re-resolves `effective_hw(ctx.hw)`, which
-                // now returns `None` because of the flag we just set.
+                hw = HwEncoder::None;
             }
         }
     }
@@ -629,6 +660,36 @@ async fn launch_producer(
 enum EarlyExit {
     Alive,
     Exited(std::process::ExitStatus),
+}
+
+/// Could this launch's ffmpeg fail *as* a hardware encoder? Only if one is
+/// actually in the pipeline: `Mode::Remux` is `-c:v copy` and doesn't even
+/// get the `-init_hw_device` preamble, so nothing it does says anything
+/// about the GPU.
+fn hwenc_at_risk(hw: HwEncoder, mode: &Mode) -> bool {
+    hw != HwEncoder::None && matches!(mode, Mode::Transcode { .. })
+}
+
+enum StartupVerdict {
+    Ok,
+    HwencFailed(std::process::ExitStatus),
+}
+
+/// Read a launch's first 750ms. Only an *unsuccessful* exit on a plan that
+/// actually uses the hw encoder is evidence against the hardware; a status-0
+/// exit means ffmpeg finished the job, which a stream copy or a short
+/// tail-of-file transcode can genuinely do inside the window.
+fn classify_startup(hw: HwEncoder, mode: &Mode, exit: &EarlyExit) -> StartupVerdict {
+    match exit {
+        EarlyExit::Alive => StartupVerdict::Ok,
+        EarlyExit::Exited(status) => {
+            if hwenc_at_risk(hw, mode) && !status.success() {
+                StartupVerdict::HwencFailed(*status)
+            } else {
+                StartupVerdict::Ok
+            }
+        }
+    }
 }
 
 async fn wait_for_early_exit(child: &mut Child, total: Duration) -> EarlyExit {
@@ -646,8 +707,11 @@ async fn wait_for_early_exit(child: &mut Child, total: Duration) -> EarlyExit {
     EarlyExit::Alive
 }
 
+/// `hw` is the encoder for *this* attempt — `launch_producer` lowers it to
+/// `HwEncoder::None` when retrying after a hwenc startup failure.
 async fn launch_once(
     ctx: ProducerCtx,
+    hw: HwEncoder,
     target_idx: u32,
     pool: Arc<Mutex<Vec<ProducerHandle>>>,
 ) -> anyhow::Result<ProducerHandle> {
@@ -682,7 +746,7 @@ async fn launch_once(
         target_idx, ff_start_idx, start_t,
         "launching producer ffmpeg"
     );
-    let (mut child, argv) = spawn_ffmpeg(&ctx, ff_start_idx, start_t, run_dir.path())?;
+    let (mut child, argv) = spawn_ffmpeg(&ctx, hw, ff_start_idx, start_t, run_dir.path())?;
     meta.emit(
         "transcode.spawn",
         serde_json::json!({ "target_idx": target_idx, "start_t": start_t }),
@@ -798,11 +862,11 @@ async fn launch_once(
 
 fn spawn_ffmpeg(
     ctx: &ProducerCtx,
+    hw: HwEncoder,
     start_idx: u32,
     start_t: f64,
     run_dir: &Path,
 ) -> anyhow::Result<(Child, Vec<String>)> {
-    let hw = effective_hw(ctx.hw);
     // Common preamble + HLS muxer flags. Codec args (video copy vs
     // libx264) come from `apply_video_args` based on plan mode. Key
     // shared pieces:
@@ -1554,6 +1618,46 @@ mod tests {
         assert!(out.starts_with("ffmpeg -i "));
         assert!(out.contains(" -c:v libx264"));
         assert!(out.ends_with('\n'));
+    }
+
+    /// Both statuses this pair of tests needs, as ffmpeg would deliver them.
+    fn exited(code: i32) -> EarlyExit {
+        use std::os::unix::process::ExitStatusExt;
+        EarlyExit::Exited(std::process::ExitStatus::from_raw(code << 8))
+    }
+
+    fn transcode() -> Mode {
+        Mode::Transcode { bitrate_kbps: 8000, max_height: 1080, hard_cap: false }
+    }
+
+    #[test]
+    fn clean_exit_is_never_a_hwenc_failure() {
+        // The regression that stranded prod on libx264 for 17 days: ffmpeg
+        // finishing its work inside the probe window read as a dead GPU.
+        assert!(matches!(
+            classify_startup(HwEncoder::Vaapi, &transcode(), &exited(0)),
+            StartupVerdict::Ok
+        ));
+        assert!(matches!(
+            classify_startup(HwEncoder::Vaapi, &transcode(), &exited(1)),
+            StartupVerdict::HwencFailed(_)
+        ));
+    }
+
+    #[test]
+    fn remux_cannot_implicate_the_hw_encoder() {
+        // `-c:v copy` has no encoder in the pipeline, so however it dies it
+        // says nothing about the hardware — and a stream copy reaching EOF
+        // before the reaper's first tick made this the common case.
+        assert!(!hwenc_at_risk(HwEncoder::Vaapi, &Mode::Remux));
+        assert!(matches!(
+            classify_startup(HwEncoder::Vaapi, &Mode::Remux, &exited(1)),
+            StartupVerdict::Ok
+        ));
+        // Software transcodes have nothing to fall back *to*.
+        assert!(!hwenc_at_risk(HwEncoder::None, &transcode()));
+        // A hw transcode is the one case worth probing.
+        assert!(hwenc_at_risk(HwEncoder::Vaapi, &transcode()));
     }
 
     #[test]

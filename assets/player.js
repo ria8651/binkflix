@@ -854,10 +854,13 @@ function ensureStreamInfo(src) {
                 mode: r.headers.get("x-stream-mode"),
                 video_action: r.headers.get("x-stream-video"),
                 audio_action: r.headers.get("x-stream-audio"),
-                // Effective ffmpeg H.264 encoder for transcode mode.
-                // libx264 / h264_vaapi / h264_qsv / h264_videotoolbox.
-                // Absent for remux. Reflects the server's view *after*
-                // any sticky runtime fallback from a hw-startup failure.
+                // ffmpeg H.264 encoder the server asks producers to use for
+                // transcode mode: libx264 / h264_vaapi / h264_qsv /
+                // h264_videotoolbox. Absent for remux. This is the request,
+                // not the outcome — a launch whose hw encoder fails to start
+                // falls back to libx264 for that launch, and this response
+                // is both written before any producer exists and cacheable,
+                // so it can't reflect that.
                 encoder: r.headers.get("x-stream-encoder"),
                 // Rate-control mode the encoder is actually running:
                 // "crf 21" / "q:v 70" / "abr". Resolved server-side since

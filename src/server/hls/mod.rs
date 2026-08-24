@@ -23,7 +23,7 @@ mod playlist;
 mod producer;
 
 pub use cache::{cache_root, id_is_safe, is_allowed_name, mime_for};
-pub use hwenc::{detect as detect_hwenc, HwEncoder};
+pub use hwenc::{detect as detect_hwenc, HwEncConfig, HwEncoder};
 pub use plan::PLAN_VERSION;
 pub use producer::{sweep_orphan_ffmpegs, ProducerRegistry};
 // SessionRegistry / spawn_session_sweeper are defined in this module.
@@ -428,6 +428,17 @@ async fn serve(
     let ResolvedPlan { plan, plan_dir, src, info, mode_tag } = resolved;
     let path = plan_dir.join(&file);
 
+    // Strict mode with an unsatisfiable request (encoder missing from this
+    // ffmpeg build, no render device, typo'd env value): fail the transcode
+    // rather than quietly serving libx264 that can't hold real-time. Gated
+    // on the plan mode so direct play and remux — which never touch the GPU
+    // — keep working, which is also why this isn't a startup abort.
+    if let (plan::Mode::Transcode { .. }, Some(reason)) = (&plan.mode, state.hwenc.unmet) {
+        return Err(Error::Other(anyhow::anyhow!(
+            "transcode unavailable: explicit BINKFLIX_HWACCEL request cannot be honoured ({reason})"
+        )));
+    }
+
     // Server-driven playback session: open-or-refresh keyed by
     // (user, media, audio, mode). Opened on the first request; refreshed
     // (cheap, in-memory) on every later one; closed by the idle sweeper.
@@ -529,12 +540,13 @@ async fn serve(
         if let Ok(v) = HeaderValue::from_str(&session_id) {
             h.insert("X-Playback-Session", v);
         }
-        // For transcode, advertise the H.264 encoder that's effectively
-        // active. `current_encoder_name` honours the runtime-fallback
-        // sticky flag, so a second playback after a hw-startup failure
-        // already reads "libx264" here.
+        // For transcode, advertise the H.264 encoder producers are *asked*
+        // to use. This response is written before any producer for the
+        // stream exists, so it can't reflect the per-launch hw fallback —
+        // and being cacheable, it couldn't stay true if it tried. What
+        // actually encoded a given segment is reported separately.
         if let plan::Mode::Transcode { hard_cap, .. } = plan.mode {
-            let enc = producer::current_encoder_name(state.hwenc);
+            let enc = producer::requested_encoder_name(&state.hwenc);
             if let Ok(v) = HeaderValue::from_str(enc) {
                 h.insert("X-Stream-Encoder", v);
             }
@@ -542,7 +554,7 @@ async fn serve(
             // panel can't tell capped CRF from ABR from VideoToolbox's
             // uncapped quality mode, and would report a bitrate ceiling
             // that two of the three don't actually honour.
-            let rc = producer::current_rate_control_name(state.hwenc, hard_cap);
+            let rc = producer::requested_rate_control_name(&state.hwenc, hard_cap);
             if let Ok(v) = HeaderValue::from_str(&rc) {
                 h.insert("X-Stream-Ratecontrol", v);
             }
@@ -610,8 +622,14 @@ async fn ensure_init(state: &AppState, ctx: &producer::ProducerCtx) -> Result<()
     // itself.
     let registry = state.hls_producers.clone();
     let ctx_bg = ctx.clone();
+    // The producer's failure has to reach this poll loop, or a launch that
+    // can't succeed at all (strict mode with a dead hw encoder) reads as a
+    // 60-second hang instead of an error.
+    let (fail_tx, mut fail_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let _ = producer::ensure_segment(&registry, &ctx_bg, 1).await;
+        if let Err(e) = producer::ensure_segment(&registry, &ctx_bg, 1).await {
+            let _ = fail_tx.send(e);
+        }
     });
     // Poll for init.mp4. The watcher promotes it the first tick (≤100ms)
     // after ffmpeg writes it; ffmpeg writes it shortly after `-i` is
@@ -619,6 +637,16 @@ async fn ensure_init(state: &AppState, ctx: &producer::ProducerCtx) -> Result<()
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while std::time::Instant::now() < deadline {
         if tokio::fs::try_exists(&canonical).await.unwrap_or(false) {
+            return Ok(());
+        }
+        // A producer error only settles it if init.mp4 still isn't there:
+        // this producer may have lost a far-seek restart race to another
+        // that's about to write it. Re-check first, and let the client's
+        // retry cover the rare loss.
+        if let Ok(e) = fail_rx.try_recv() {
+            if !tokio::fs::try_exists(&canonical).await.unwrap_or(false) {
+                return Err(Error::Other(e));
+            }
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
