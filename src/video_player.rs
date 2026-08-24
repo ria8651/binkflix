@@ -9,13 +9,14 @@
 //! `web_sys`, and the DOM is the natural place for it anyway.
 //!
 //! Reactive subtitle pipeline:
-//!   * `user_pick`     — user's explicit choice (`None` = untouched).
-//!   * `effective_id`  — memo: user's pick if any, else the "default"/first
-//!                       track from the list. PartialEq-deduped.
-//!   * `sub_command`   — memo: the concrete call to make into JS
-//!                       (`Option<SubCommand>`). Deduped by value.
-//!   * the effect      — subscribes to `sub_command` only. Fires the eval
-//!                       exactly once per actual change.
+//!
+//! * `user_pick` — user's explicit choice (`None` = untouched).
+//! * `effective_id` — memo: user's pick if any, else the "default"/first
+//!   track from the list. PartialEq-deduped.
+//! * `sub_command` — memo: the concrete call to make into JS
+//!   (`Option<SubCommand>`). Deduped by value.
+//! * the effect — subscribes to `sub_command` only. Fires the eval exactly
+//!   once per actual change.
 
 use crate::client_api::*;
 use crate::types::*;
@@ -1461,6 +1462,7 @@ fn DebugMenuBody(
     let observed_mode = observed.as_ref().map(|o| o.mode);
     let observed_container = observed.as_ref().and_then(|o| o.container());
     let observed_encoder = observed.as_ref().and_then(|o| o.encoder.clone());
+    let observed_ratecontrol = observed.as_ref().and_then(|o| o.ratecontrol.clone());
     let buffered_ranges: Vec<(f64, f64)> = stats
         .as_ref()
         .and_then(|s| s.get("buffered_ranges"))
@@ -1533,6 +1535,7 @@ fn DebugMenuBody(
                         effective_mode: observed_mode.unwrap_or(effective_mode),
                         observed_container: observed_container.clone(),
                         observed_encoder: observed_encoder.clone(),
+                        observed_ratecontrol: observed_ratecontrol.clone(),
                         bitrate_override,
                     }
                 },
@@ -1554,6 +1557,10 @@ struct ObservedStream {
     /// (`libx264`, `h264_vaapi`, `h264_qsv`, `h264_videotoolbox`).
     /// `None` for non-transcode responses or older servers.
     encoder: Option<String>,
+    /// Rate control that encoder is running: `crf 21`, `q:v 70`, or `abr`.
+    /// Server-resolved — it depends on the sticky hw fallback and the host
+    /// arch, neither of which the client can see.
+    ratecontrol: Option<String>,
 }
 
 impl ObservedStream {
@@ -1566,13 +1573,14 @@ impl ObservedStream {
             .map(|s| s.to_ascii_lowercase());
         let content_type = info.get("content_type").and_then(|v| v.as_str()).map(String::from);
         let encoder = info.get("encoder").and_then(|v| v.as_str()).map(String::from);
+        let ratecontrol = info.get("ratecontrol").and_then(|v| v.as_str()).map(String::from);
         let mode = match mode_hdr.as_deref() {
             Some("direct") => BrowserCompat::Direct,
             Some("remux") => BrowserCompat::Remux,
             Some("transcode") => BrowserCompat::Transcode,
             _ => return None,
         };
-        Some(Self { mode, content_type, encoder })
+        Some(Self { mode, content_type, encoder, ratecontrol })
     }
 
     /// Human-readable container derived from the observed Content-Type.
@@ -1589,14 +1597,28 @@ impl ObservedStream {
     }
 }
 
-/// Mirror the server's auto-bitrate logic so the debug panel can show
-/// the same value the server would pick when the user has Auto selected.
-/// Keep in sync with `resolve_bitrate` in `src/server/hls/mod.rs`.
-fn auto_bitrate_kbps(source_kbps: Option<u64>) -> u32 {
-    let auto = source_kbps
+/// Mirror of `resolve_encode_target` in `src/server/hls/mod.rs` so the
+/// debug panel reports the same `(bitrate, height)` the producer is
+/// actually using. Explicit picks run bitrate → height (the menu labels
+/// promise a resolution); Auto runs source height → bitrate budget.
+fn encode_target(explicit: Option<u32>, info: &MediaTechInfo) -> (u32, u32) {
+    if let Some(b) = explicit {
+        let bitrate = b.clamp(200, 20_000);
+        return (bitrate, height_for_bitrate(bitrate));
+    }
+    let height = info
+        .video
+        .as_ref()
+        .and_then(|v| v.height)
+        .unwrap_or(720)
+        .min(1080);
+    let budget = bitrate_for_height(height);
+    let source_cap = info
+        .bitrate_kbps
         .and_then(|b| u32::try_from(b).ok())
-        .unwrap_or(4000);
-    auto.clamp(200, 6000)
+        .and_then(|b| b.checked_mul(2))
+        .unwrap_or(u32::MAX);
+    (budget.min(source_cap).max(200), height.max(1))
 }
 
 /// Mirror of `height_for_bitrate` in `src/server/hls/plan.rs`.
@@ -1609,6 +1631,16 @@ fn height_for_bitrate(bitrate_kbps: u32) -> u32 {
     }
 }
 
+/// Mirror of `bitrate_for_height` in `src/server/hls/plan.rs`.
+fn bitrate_for_height(height: u32) -> u32 {
+    match height {
+        h if h > 720 => 8000,
+        h if h > 480 => 4000,
+        h if h > 360 => 2000,
+        _ => 1000,
+    }
+}
+
 #[component]
 fn DeliveryRows(
     info: MediaTechInfo,
@@ -1618,6 +1650,10 @@ fn DeliveryRows(
     /// (`libx264`, `h264_vaapi`, etc.). Drives the transcode-mode label
     /// so the panel reflects whether GPU offload is in effect.
     observed_encoder: Option<String>,
+    /// Rate-control mode from `X-Stream-Ratecontrol` (`crf 21`, `q:v 70`,
+    /// `abr`). Decides how the bitrate row is phrased, since only capped
+    /// CRF and ABR actually respect the number.
+    observed_ratecontrol: Option<String>,
     bitrate_override: Option<u32>,
 ) -> Element {
     // Describe what the browser is actually receiving on the wire, as a
@@ -1691,26 +1727,37 @@ fn DeliveryRows(
                 .clone()
                 .unwrap_or_else(|| "fragmented MP4".into());
             // Mirror the server's bitrate/height pick so the panel
-            // shows the same numbers the producer is using. When the
-            // user picks "Auto", `bitrate_override` is None and we
-            // derive from the source's probed bitrate (clamped).
-            let target_bitrate = bitrate_override.unwrap_or_else(|| auto_bitrate_kbps(info.bitrate_kbps));
-            let target_height = height_for_bitrate(target_bitrate);
-            // Source resolution is the upper bound — never upscale.
+            // shows the same numbers the producer is using.
+            let (target_bitrate, target_height) = encode_target(bitrate_override, &info);
+            // Source resolution is the upper bound — never upscale. Auto
+            // already clamps to it; this covers the explicit presets.
             let effective_height = info
                 .video
                 .as_ref()
                 .and_then(|v| v.height)
                 .map(|h| h.min(target_height))
                 .unwrap_or(target_height);
-            let bitrate_label = if bitrate_override.is_some() {
-                format!("{target_bitrate} kbps")
-            } else {
-                format!("{target_bitrate} kbps (auto)")
-            };
             let encoder_label = observed_encoder
                 .clone()
                 .unwrap_or_else(|| "libx264".to_string());
+            // Phrase the bitrate row by what the encoder is actually
+            // doing, so the panel never implies a ceiling that isn't
+            // being enforced. Capped CRF treats the number as a ceiling
+            // it usually stays under; ABR targets it as an average;
+            // VideoToolbox's quality mode ignores it entirely (it can't
+            // be combined with one), so the row shows no number at all.
+            let auto_suffix = if bitrate_override.is_some() { "" } else { " · auto" };
+            let bitrate_label = match observed_ratecontrol.as_deref() {
+                Some(rc) if rc.starts_with("q:v") => {
+                    format!("quality {rc} · uncapped{auto_suffix}")
+                }
+                Some(rc) if rc.starts_with("crf") || rc.starts_with("qvbr") => {
+                    format!("≤{target_bitrate} kbps ({rc}{auto_suffix})")
+                }
+                Some(_) => format!("{target_bitrate} kbps (ABR{auto_suffix})"),
+                // Pre-header server: fall back to the plain number.
+                None => format!("{target_bitrate} kbps{auto_suffix}"),
+            };
             rsx! {
                 DebugRow { label: "Mode", value: format!("transcode ({encoder_label})") }
                 DebugRow { label: "Container", value: container_label }

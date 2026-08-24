@@ -131,7 +131,10 @@ async fn playback_sample(
     // session_id (or to a fabricated one) and pollute analytics. We pull the
     // delivery params in the same round-trip so we can attach authoritative
     // server-side transcode telemetry below.
-    let row: Option<(Option<String>, String, String, Option<i64>, Option<i64>)> =
+    /// `(user_sub, media_id, delivery_mode, audio_idx, target_bitrate_kbps)`
+    /// as selected from `playback_sessions`.
+    type SessionDeliveryRow = (Option<String>, String, String, Option<i64>, Option<i64>);
+    let row: Option<SessionDeliveryRow> =
         match sqlx::query_as(
             "SELECT user_sub, media_id, delivery_mode, audio_idx, target_bitrate_kbps
              FROM playback_sessions WHERE id = ?",
@@ -209,14 +212,15 @@ async fn server_transcode_telemetry(
     audio_idx: Option<i64>,
     target_bitrate: Option<i64>,
 ) -> Option<(i64, i64)> {
-    let mode_tag = match delivery_mode {
+    let mode_tag_prefix = match delivery_mode {
         "remux" => "remux".to_string(),
         "transcode" => {
-            // Reconstruct the same `tx{bitrate}h{height}` tag the HLS
-            // endpoint caches under (see `resolve_plan`).
+            // Rebuild as much of the `tx{bitrate}h{height}` tag the HLS
+            // endpoint caches under (see `resolve_plan`) as this row can
+            // support. Height isn't recorded and is no longer derivable
+            // from the bitrate under Auto, so we match on the prefix.
             let bitrate = u32::try_from(target_bitrate?).ok()?;
-            let height = super::hls::height_for_bitrate(bitrate);
-            format!("tx{bitrate}h{height}")
+            format!("tx{bitrate}h")
         }
         // "direct" (or anything else) doesn't spawn a producer.
         _ => return None,
@@ -224,7 +228,7 @@ async fn server_transcode_telemetry(
     let audio_idx = audio_idx.and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
     let snap = state
         .hls_producers
-        .snapshot(media_id, audio_idx, &mode_tag)
+        .snapshot_by_prefix(media_id, audio_idx, &mode_tag_prefix)
         .await?;
     let position_ms = i64::from(snap.head) * 6000;
     Some((position_ms, i64::from(snap.encode_rate_x100)))

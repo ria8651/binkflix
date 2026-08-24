@@ -50,7 +50,15 @@ use tokio::process::Command;
 ///          persisted plan still always describes the remux variant —
 ///          transcode plans use uniform 6s segments and are built on the
 ///          fly without DB caching.
-pub const PLAN_VERSION: u32 = 12;
+///   v13:   Rate control moved to quality-targeted modes where the encoder
+///          has one: capped CRF on libx264, `-q:v` on VideoToolbox under
+///          Auto (its quality mode is silently voided by `-maxrate`, so an
+///          explicit pick still gets ABR — see `Mode::Transcode::hard_cap`).
+///          VAAPI/QSV keep ABR. `max_height` is now resolved by the caller
+///          too, so Auto derives it from the source resolution instead of
+///          from the bitrate. All of these change segment bytes under tags
+///          that would otherwise collide with v12's.
+pub const PLAN_VERSION: u32 = 13;
 
 /// Target segment length. ffmpeg only cuts at source keyframes under
 /// `-c:v copy`, so real segments will land near this value but vary with
@@ -98,6 +106,15 @@ pub enum Mode {
     Transcode {
         bitrate_kbps: u32,
         max_height: u32,
+        /// `true` when `bitrate_kbps` came from an explicit menu pick — the
+        /// user asking for a hard ceiling, usually to fit a slow link. That
+        /// promise outranks picture quality, so encoders whose quality mode
+        /// can't be capped must fall back to rate control to honour it.
+        ///
+        /// `false` under Auto, where the number is only a budget. An encoder
+        /// with a real quality mode is then free to ignore it and target
+        /// quality instead (see `apply_video_args`).
+        hard_cap: bool,
     },
 }
 
@@ -155,6 +172,11 @@ pub fn is_copy_remux_viable(info: &MediaTechInfo) -> Result<(), String> {
 /// conservative — picking a height that the bitrate can sustain at a
 /// reasonable per-pixel rate avoids the "blocky 1080p at 1 Mbps" failure
 /// mode. Source resolution is the upper bound; we never upscale.
+///
+/// This is for *explicit* quality picks only. The menu labels a preset
+/// "2 Mbps · ~480p", so choosing it has to actually downscale — dropping a
+/// tier on a slow connection is the whole reason that menu exists. Auto
+/// goes the other way round; see `bitrate_for_height`.
 pub fn height_for_bitrate(bitrate_kbps: u32) -> u32 {
     match bitrate_kbps {
         b if b >= 6000 => 1080,
@@ -164,12 +186,33 @@ pub fn height_for_bitrate(bitrate_kbps: u32) -> u32 {
     }
 }
 
+/// Bitrate ceiling for an output height — the inverse ladder, used by Auto.
+///
+/// The direction matters. A source's bitrate is a property of its *codec's
+/// efficiency*, not of its resolution, so deriving height from bitrate
+/// punishes well-encoded files: a 1080p HEVC at 2 Mbps used to land on the
+/// 480p rung purely for being efficiently encoded. Auto now takes the height
+/// from the source and lets the budget follow from the height.
+///
+/// These are ceilings, not targets. The libx264 path runs capped CRF (see
+/// `apply_video_args`) and typically settles well under them.
+pub fn bitrate_for_height(height: u32) -> u32 {
+    match height {
+        h if h > 720 => 8000,
+        h if h > 480 => 4000,
+        h if h > 360 => 2000,
+        _ => 1000,
+    }
+}
+
 /// Build a transcode plan: uniform 6s segments derived from duration. No
 /// keyframe ffprobe pass — the producer's ffmpeg forces keyframes at
 /// segment boundaries via `-force_key_frames`.
 pub fn build_transcode_plan(
     info: &MediaTechInfo,
     bitrate_kbps: u32,
+    max_height: u32,
+    hard_cap: bool,
 ) -> anyhow::Result<StreamPlan> {
     let v = info.video.as_ref().ok_or_else(|| anyhow::anyhow!("no video stream"))?;
     let duration = info
@@ -179,13 +222,13 @@ pub fn build_transcode_plan(
     if duration < 0.5 {
         anyhow::bail!("duration too short to segment");
     }
-    let max_height = height_for_bitrate(bitrate_kbps);
     let segments = uniform_segments(duration, TARGET_SEGMENT_SECS);
     Ok(StreamPlan {
         version: PLAN_VERSION,
         mode: Mode::Transcode {
             bitrate_kbps,
             max_height,
+            hard_cap,
         },
         duration,
         video_codec: v.codec.clone(),

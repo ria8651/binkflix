@@ -859,6 +859,10 @@ function ensureStreamInfo(src) {
                 // Absent for remux. Reflects the server's view *after*
                 // any sticky runtime fallback from a hw-startup failure.
                 encoder: r.headers.get("x-stream-encoder"),
+                // Rate-control mode the encoder is actually running:
+                // "crf 21" / "q:v 70" / "abr". Resolved server-side since
+                // it depends on hw fallback and host arch.
+                ratecontrol: r.headers.get("x-stream-ratecontrol"),
                 status: r.status,
             });
         })

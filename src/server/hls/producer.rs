@@ -110,6 +110,41 @@ const PREROLL_SEGMENTS: u32 = 1;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SEGMENT_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Capped-CRF quality target for libx264. 21 at `veryfast` is visually
+/// transparent on most content while landing well under the bitrate
+/// ceiling on anything that isn't grain- or motion-heavy. Mirrored in
+/// `src/video_player.rs` for the debug panel's label.
+const TRANSCODE_CRF: u32 = 21;
+
+/// VideoToolbox constant-quality target, chosen to match `TRANSCODE_CRF`
+/// so a viewer sees the same picture whichever encoder the server has.
+/// Measured on a 1080p WEB-DL sample: CRF 21 scored VMAF 94.2, `-q:v 70`
+/// scored 94.5 (`-q:v 65` was 92.8, `-q:v 75` was 95.4).
+///
+/// VideoToolbox needs roughly 2.4x the bitrate of libx264 for that same
+/// score. That's the standing trade for using the hardware path, not
+/// something this constant can tune away.
+const VIDEOTOOLBOX_QUALITY: u32 = 70;
+
+/// VAAPI QVBR quality target (`-global_quality`), QP-like: lower is better.
+///
+/// Measured on the deployment target — Intel Gen9.5 / iHD 25.2.3, i5-8400T
+/// — against a 1080p WEB-DL sample, scored with VMAF:
+///
+/// | mode                | bitrate  | VMAF  |
+/// |---------------------|----------|-------|
+/// | ABR 8000k (was)     | 6591 kbps| 93.09 |
+/// | QVBR `-gq 18`       | 2577 kbps| 92.08 |
+/// | QVBR `-gq 20`       | 2456 kbps| 91.98 |
+/// | QVBR `-gq 22`       | 2052 kbps| 91.74 |
+/// | QVBR `-gq 26`       | 1177 kbps| 90.56 |
+///
+/// The curve is flat above ~20 — `gq18` buys 0.1 VMAF over `gq20` for
+/// another 120 kbps — so 20 sits at the top of the useful range without
+/// paying into the saturated part. Against the old ABR it gives up ~1.1
+/// VMAF for a 63% bitrate cut.
+const VAAPI_QUALITY: u32 = 20;
+
 /// How often a follower re-checks its leader while waiting on the shared
 /// cache, and how long the leader's `head` may stall short of the target
 /// before the follower gives up and spawns its own producer.
@@ -143,6 +178,32 @@ impl ProducerRegistry {
             .entry((media_id.to_string(), audio_idx, mode_tag.to_string()))
             .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
             .clone()
+    }
+
+    /// Snapshot the lead producer whose mode tag *starts with* `prefix`.
+    ///
+    /// The analytics row records the target bitrate but not the height, and
+    /// since Auto now derives height from the source resolution the two are
+    /// no longer a fixed pair — `tx{bitrate}h` is the most specific key the
+    /// telemetry endpoint can rebuild from what it stored. `remux` has no
+    /// suffix, so it round-trips through the same call unchanged.
+    pub async fn snapshot_by_prefix(
+        &self,
+        media_id: &str,
+        audio_idx: u32,
+        prefix: &str,
+    ) -> Option<crate::types::HlsProducerState> {
+        // Resolve to an owned tag first: holding a DashMap guard across the
+        // `.await` inside `snapshot` would risk deadlocking the shard.
+        let tag = self
+            .by_media
+            .iter()
+            .find(|e| {
+                let (m, a, tag) = e.key();
+                m == media_id && *a == audio_idx && tag.starts_with(prefix)
+            })
+            .map(|e| e.key().2.clone())?;
+        self.snapshot(media_id, audio_idx, &tag).await
     }
 
     pub async fn snapshot(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Option<crate::types::HlsProducerState> {
@@ -351,6 +412,20 @@ fn effective_hw(ctx_hw: HwEncoder) -> HwEncoder {
 /// given context — accounts for the sticky fallback flag.
 pub fn current_encoder_name(ctx_hw: HwEncoder) -> &'static str {
     effective_hw(ctx_hw).ffmpeg_name()
+}
+
+/// What the m3u8 endpoint should advertise as `X-Stream-Ratecontrol`.
+///
+/// Resolved server-side on purpose: the client can see neither the sticky
+/// hw-fallback flag nor the Apple-Silicon gate inside `select_rate_control`,
+/// so any client-side guess would misreport both.
+pub fn current_rate_control_name(ctx_hw: HwEncoder, hard_cap: bool) -> String {
+    match select_rate_control(effective_hw(ctx_hw), hard_cap) {
+        RateControl::CappedCrf => format!("crf {TRANSCODE_CRF}"),
+        RateControl::VideotoolboxQuality => format!("q:v {VIDEOTOOLBOX_QUALITY}"),
+        RateControl::VaapiQvbr => format!("qvbr {VAAPI_QUALITY}"),
+        RateControl::Abr => "abr".to_string(),
+    }
 }
 
 pub async fn ensure_segment(
@@ -854,12 +929,67 @@ fn format_argv(argv: &[String]) -> String {
     out
 }
 
+/// How a given encoder should be driven for one transcode request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RateControl {
+    /// Constant quality bounded by `maxrate`/`bufsize`. Best of both, but
+    /// only libx264 can actually do it.
+    CappedCrf,
+    /// VideoToolbox `-q:v`, with no bitrate ceiling at all.
+    VideotoolboxQuality,
+    /// VAAPI QVBR: a quality target *and* a real ceiling, the hardware
+    /// equivalent of capped CRF. Unlike VideoToolbox, `-global_quality`
+    /// keeps working with `-maxrate` present.
+    VaapiQvbr,
+    /// Single-pass average bitrate. The fallback whenever a quality mode
+    /// either doesn't exist or can't respect a ceiling we owe the user.
+    Abr,
+}
+
+/// Pick the rate-control mode for `hw`.
+///
+/// `hard_cap` is the deciding input for VideoToolbox. Its constant-quality
+/// mode is genuinely good — on a 1080p sample it beat its own ABR by a wide
+/// margin, VMAF 94.5 at 3.7 Mbps against 93.4 at 5.1 — but passing
+/// `-maxrate` alongside `-q:v` makes it *silently* ignore the quality
+/// setting and revert to rate control. Verified by measurement: `-q:v` 40,
+/// 60 and 80 all produced byte-identical bitrates once `-maxrate` was
+/// present. So the two are mutually exclusive, and when the user has asked
+/// for a specific ceiling that ceiling wins.
+///
+/// The mode is also Apple-Silicon-only, hence the `target_arch` gate — on an
+/// Intel Mac `-q:v` would be ignored and the encode would run with no
+/// target of any kind.
+///
+/// VAAPI needs no such compromise: QVBR honours `-global_quality` and
+/// `-maxrate` together, verified on the deployment target (Intel Gen9.5,
+/// iHD 25.2.3) — quality still moved the output with the cap in place
+/// (`gq` 18/20/22/24/26 gave 2577/2456/2052/1558/1177 kbps), and a 1500k
+/// cap held. So VAAPI gets quality mode for explicit picks too; the
+/// ceiling is still enforced, which is all an explicit pick asks for.
+///
+/// QSV is left on ABR. `h264_qsv` is present on the target but the auto
+/// detection prefers VAAPI whenever `/dev/dri/renderD*` exists, so nothing
+/// reaches it there and it has never been measured.
+fn select_rate_control(hw: HwEncoder, hard_cap: bool) -> RateControl {
+    match hw {
+        HwEncoder::None => RateControl::CappedCrf,
+        HwEncoder::Vaapi => RateControl::VaapiQvbr,
+        HwEncoder::VideoToolbox
+            if !hard_cap && cfg!(all(target_os = "macos", target_arch = "aarch64")) =>
+        {
+            RateControl::VideotoolboxQuality
+        }
+        _ => RateControl::Abr,
+    }
+}
+
 fn apply_video_args(cmd: &mut Command, mode: &Mode, hw: HwEncoder) {
     match mode {
         Mode::Remux => {
             cmd.arg("-c:v").arg("copy");
         }
-        Mode::Transcode { bitrate_kbps, max_height } => {
+        Mode::Transcode { bitrate_kbps, max_height, hard_cap } => {
             // `scale=-2:'min(H,ih)'` keeps source aspect, never
             // upscales, and the `-2` rounds width to the nearest even
             // multiple (libx264 + yuv420p require even dimensions).
@@ -880,7 +1010,22 @@ fn apply_video_args(cmd: &mut Command, mode: &Mode, hw: HwEncoder) {
                     "scale=-2:'min({max_height},ih)':flags=lanczos,format=yuv420p"
                 ),
             };
-            let maxrate = bitrate_kbps.saturating_mul(15) / 10; // 1.5×
+            // Which rate-control mode this encoder gets. Quality-targeted
+            // beats bitrate-targeted whenever it's available *and* able to
+            // respect the ceiling we owe the user.
+            let rc = select_rate_control(hw, *hard_cap);
+
+            // ABR treats `bitrate_kbps` as an average and needs headroom
+            // above it for peaks, hence 1.5x. Capped CRF has no average to
+            // aim at — whatever `maxrate` allows simply becomes the rate on
+            // hard content — so there the budget *is* the ceiling. Leaving
+            // it at 1.5x would let a grainy 1080p source sit at 12 Mbps
+            // under a preset the menu calls 8.
+            let maxrate = if matches!(rc, RateControl::CappedCrf | RateControl::VaapiQvbr) {
+                *bitrate_kbps
+            } else {
+                bitrate_kbps.saturating_mul(15) / 10
+            };
             let bufsize = bitrate_kbps.saturating_mul(2);
 
             cmd.arg("-vf").arg(vf).arg("-c:v").arg(hw.ffmpeg_name());
@@ -915,16 +1060,56 @@ fn apply_video_args(cmd: &mut Command, mode: &Mode, hw: HwEncoder) {
                 }
             }
 
-            // Bitrate ladder + IDR-on-segment-boundary work for every
-            // backend. `force_key_frames "expr:gte(t,n_forced*6)"`
-            // makes ffmpeg insert IDRs exactly at our 6s segment
-            // boundaries so each produced segment is independently
-            // decodable — which is what `independent_segments`
-            // advertises in the playlist.
-            cmd.arg("-b:v").arg(format!("{bitrate_kbps}k"))
-                .arg("-maxrate").arg(format!("{maxrate}k"))
-                .arg("-bufsize").arg(format!("{bufsize}k"))
-                .arg("-force_key_frames").arg("expr:gte(t,n_forced*6)");
+            // Rate control. libx264 runs *capped CRF*: constant quality
+            // with `maxrate`/`bufsize` as a hard ceiling, which is what
+            // modern VOD ladders use. Single-pass ABR has to chase an
+            // average with no view of the whole file, so it pads easy
+            // scenes and still starves hard ones; CRF spends what each
+            // scene needs and simply undershoots the budget on quiet
+            // content. Same peak bandwidth, better picture, smaller
+            // segments — which matters here because we're stuck on
+            // `veryfast` and a forced IDR every 6s, and both of those
+            // already cost efficiency we can't buy back.
+            //
+            // The hardware encoders have no real CRF equivalent
+            // (VAAPI/QSV/VideoToolbox quality modes are driver-dependent
+            // and routinely lose to their own ABR), so they keep the
+            // single-pass ABR they've always used.
+            //
+            // `force_key_frames "expr:gte(t,n_forced*6)"` applies to
+            // every backend: it puts IDRs exactly on our 6s segment
+            // boundaries so each segment is independently decodable —
+            // what `independent_segments` advertises in the playlist.
+            match rc {
+                RateControl::CappedCrf => {
+                    cmd.arg("-crf").arg(TRANSCODE_CRF.to_string())
+                        .arg("-maxrate").arg(format!("{maxrate}k"))
+                        .arg("-bufsize").arg(format!("{bufsize}k"));
+                }
+                RateControl::VideotoolboxQuality => {
+                    // Deliberately no `-b:v`/`-maxrate`/`-bufsize`: passing
+                    // any of them makes VideoToolbox silently discard the
+                    // quality setting and fall back to rate control, which
+                    // is measurably worse per bit than either mode alone.
+                    cmd.arg("-q:v").arg(VIDEOTOOLBOX_QUALITY.to_string());
+                }
+                RateControl::VaapiQvbr => {
+                    // `-rc_mode QVBR` must be explicit: with only a bitrate
+                    // present ffmpeg's `auto` picks VBR, which ignores
+                    // `-global_quality` entirely.
+                    cmd.arg("-rc_mode").arg("QVBR")
+                        .arg("-global_quality").arg(VAAPI_QUALITY.to_string())
+                        .arg("-b:v").arg(format!("{bitrate_kbps}k"))
+                        .arg("-maxrate").arg(format!("{maxrate}k"))
+                        .arg("-bufsize").arg(format!("{bufsize}k"));
+                }
+                RateControl::Abr => {
+                    cmd.arg("-b:v").arg(format!("{bitrate_kbps}k"))
+                        .arg("-maxrate").arg(format!("{maxrate}k"))
+                        .arg("-bufsize").arg(format!("{bufsize}k"));
+                }
+            }
+            cmd.arg("-force_key_frames").arg("expr:gte(t,n_forced*6)");
         }
     }
 }
@@ -1369,6 +1554,112 @@ mod tests {
         assert!(out.starts_with("ffmpeg -i "));
         assert!(out.contains(" -c:v libx264"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn software_always_gets_capped_crf() {
+        // libx264 is the one encoder that can honour a ceiling *and* target
+        // quality, so it uses CRF in both directions.
+        assert_eq!(select_rate_control(HwEncoder::None, true), RateControl::CappedCrf);
+        assert_eq!(select_rate_control(HwEncoder::None, false), RateControl::CappedCrf);
+    }
+
+    #[test]
+    fn explicit_pick_never_loses_its_ceiling() {
+        // VideoToolbox's quality mode can't be capped, so an explicit pick
+        // must fall back to ABR there even though quality mode looks better.
+        assert_eq!(select_rate_control(HwEncoder::VideoToolbox, true), RateControl::Abr);
+        assert_eq!(select_rate_control(HwEncoder::Qsv, true), RateControl::Abr);
+        // VAAPI keeps QVBR: it honours the ceiling, which is the only thing
+        // an explicit pick actually asks for.
+        assert_eq!(select_rate_control(HwEncoder::Vaapi, true), RateControl::VaapiQvbr);
+    }
+
+    #[test]
+    fn vaapi_uses_qvbr_in_both_directions() {
+        assert_eq!(select_rate_control(HwEncoder::Vaapi, false), RateControl::VaapiQvbr);
+        assert_eq!(select_rate_control(HwEncoder::Vaapi, true), RateControl::VaapiQvbr);
+    }
+
+    #[test]
+    fn qsv_stays_on_abr_until_measured() {
+        // Present on the target but never selected (auto-detect prefers
+        // VAAPI when a render node exists), so its quality modes are
+        // unverified.
+        assert_eq!(select_rate_control(HwEncoder::Qsv, false), RateControl::Abr);
+    }
+
+    #[test]
+    fn vaapi_qvbr_sets_the_mode_explicitly_and_caps_at_the_budget() {
+        let mode = Mode::Transcode { bitrate_kbps: 8000, max_height: 1080, hard_cap: false };
+        let argv = video_argv(&mode, HwEncoder::Vaapi);
+        let val = |f: &str| argv.iter().position(|a| a == f).map(|i| argv[i + 1].clone());
+        // Without an explicit `-rc_mode`, ffmpeg's `auto` picks VBR and
+        // silently ignores `-global_quality`.
+        assert_eq!(val("-rc_mode").as_deref(), Some("QVBR"));
+        assert_eq!(val("-global_quality").as_deref(), Some("20"));
+        // Quality-targeted, so the budget is the ceiling — not 1.5x it.
+        assert_eq!(val("-maxrate").as_deref(), Some("8000k"));
+    }
+
+    #[test]
+    fn videotoolbox_auto_uses_quality_mode_on_apple_silicon() {
+        let rc = select_rate_control(HwEncoder::VideoToolbox, false);
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(rc, RateControl::VideotoolboxQuality);
+        } else {
+            // `-q:v` is Apple-Silicon-only; anywhere else it would be
+            // ignored and leave the encode with no target at all.
+            assert_eq!(rc, RateControl::Abr);
+        }
+    }
+
+    fn video_argv(mode: &Mode, hw: HwEncoder) -> Vec<String> {
+        let mut cmd = Command::new("ffmpeg");
+        apply_video_args(&mut cmd, mode, hw);
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn videotoolbox_quality_mode_emits_no_bitrate_flags() {
+        // Measured footgun: passing any of `-b:v`/`-maxrate`/`-bufsize`
+        // alongside `-q:v` makes VideoToolbox silently discard the quality
+        // setting and revert to rate control (`-q:v` 40/60/80 all produced
+        // identical bitrates once `-maxrate` was present). Guard it.
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            return;
+        }
+        let mode = Mode::Transcode { bitrate_kbps: 8000, max_height: 1080, hard_cap: false };
+        let argv = video_argv(&mode, HwEncoder::VideoToolbox);
+        assert!(argv.iter().any(|a| a == "-q:v"), "expected quality mode: {argv:?}");
+        for flag in ["-b:v", "-maxrate", "-bufsize", "-crf"] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag} must not accompany -q:v: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn capped_crf_keeps_the_budget_as_a_hard_ceiling() {
+        let mode = Mode::Transcode { bitrate_kbps: 4000, max_height: 720, hard_cap: false };
+        let argv = video_argv(&mode, HwEncoder::None);
+        let val = |f: &str| {
+            argv.iter().position(|a| a == f).map(|i| argv[i + 1].clone())
+        };
+        assert_eq!(val("-crf").as_deref(), Some("21"));
+        // Not 1.5x: under CRF whatever maxrate allows becomes the rate on
+        // hard content, so the ceiling has to be the budget itself.
+        assert_eq!(val("-maxrate").as_deref(), Some("4000k"));
+        assert!(!argv.iter().any(|a| a == "-b:v"));
+    }
+
+    #[test]
+    fn explicit_pick_on_hardware_keeps_its_bitrate_target() {
+        let mode = Mode::Transcode { bitrate_kbps: 2000, max_height: 480, hard_cap: true };
+        let argv = video_argv(&mode, HwEncoder::VideoToolbox);
+        assert!(argv.iter().any(|a| a == "-b:v"), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "-q:v"), "{argv:?}");
     }
 
     #[test]

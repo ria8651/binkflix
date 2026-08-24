@@ -25,7 +25,6 @@ mod producer;
 pub use cache::{cache_root, id_is_safe, is_allowed_name, mime_for};
 pub use hwenc::{detect as detect_hwenc, HwEncoder};
 pub use plan::PLAN_VERSION;
-pub use plan::height_for_bitrate;
 pub use producer::{sweep_orphan_ffmpegs, ProducerRegistry};
 // SessionRegistry / spawn_session_sweeper are defined in this module.
 
@@ -167,14 +166,19 @@ const MAX_AUDIO_IDX: u32 = 64;
 /// reasonable display profits from.
 const MIN_BITRATE_KBPS: u32 = 200;
 const MAX_BITRATE_KBPS: u32 = 20_000;
-/// Fallback when the source has no probed bitrate and the user picked
-/// "Auto". Comfortable 720p territory; the height ladder downscales
-/// accordingly.
-const AUTO_BITRATE_FALLBACK_KBPS: u32 = 4000;
-/// Auto bitrate ceiling — never spend more than this even if the source
-/// is a 30 Mbps Blu-ray rip. Users wanting more detail can pick an
-/// explicit preset.
-const AUTO_BITRATE_CEILING_KBPS: u32 = 6000;
+/// Height Auto assumes when the probe reported no video height at all.
+/// Comfortable middle rung — better to guess 720p than to guess wrong in
+/// either extreme.
+const AUTO_FALLBACK_HEIGHT: u32 = 720;
+/// Auto never transcodes above 1080p, even from a 4K source. Encoding
+/// 2160p in real time is out of reach for the software path, and the
+/// explicit presets top out here too.
+const AUTO_MAX_HEIGHT: u32 = 1080;
+/// How far over the source's own bitrate Auto is allowed to spend. A soft
+/// 1080p rip doesn't get sharper for being handed 8 Mbps, so the source
+/// bitrate caps the budget — but h264 needs real headroom to re-encode an
+/// HEVC/AV1 source without visibly losing to it, hence 2x rather than 1x.
+const AUTO_SOURCE_HEADROOM: u32 = 2;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -339,14 +343,20 @@ async fn resolve_plan(
             })
         }
         RequestedMode::Transcode => {
-            let bitrate = resolve_bitrate(params.bitrate, info.bitrate_kbps);
-            let plan = plan::build_transcode_plan(&info, bitrate)
+            let (bitrate, max_height) = resolve_encode_target(params.bitrate, &info);
+            let hard_cap = params.bitrate.is_some();
+            let plan = plan::build_transcode_plan(&info, bitrate, max_height, hard_cap)
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-            let max_height = match plan.mode {
-                plan::Mode::Transcode { max_height, .. } => max_height,
-                plan::Mode::Remux => unreachable!("build_transcode_plan returns Transcode"),
+            // The `-auto` suffix keeps Auto's cache separate from an explicit
+            // pick that happens to resolve to the same numbers: on a
+            // quality-mode encoder the two produce different bytes. It's a
+            // *suffix* so `server_transcode_telemetry`'s `tx{bitrate}h`
+            // prefix lookup still matches either.
+            let mode_tag = if hard_cap {
+                format!("tx{bitrate}h{max_height}")
+            } else {
+                format!("tx{bitrate}h{max_height}-auto")
             };
-            let mode_tag = format!("tx{bitrate}h{max_height}");
             let plan_dir = cache::plan_dir(id, plan.version, mtime, size, audio_idx, &mode_tag);
             Ok(ResolvedPlan {
                 plan: Arc::new(plan),
@@ -365,14 +375,41 @@ enum RequestedMode {
     Transcode,
 }
 
-fn resolve_bitrate(explicit: Option<u32>, source_kbps: Option<u64>) -> u32 {
+/// Resolve a transcode request to its `(bitrate_kbps, max_height)` pair.
+///
+/// The two branches deliberately run the dependency in opposite
+/// directions:
+///
+/// * **Explicit** — the user picked a rung off the menu, and that menu
+///   promises a resolution ("2 Mbps · ~480p"). Bitrate leads, height
+///   follows, so dropping a tier genuinely downscales.
+/// * **Auto** — height comes from the source and the budget follows from
+///   the height. Deriving height from the source *bitrate* (as this used
+///   to) means the more efficiently a file is encoded the worse the
+///   picture we hand back, which is exactly backwards.
+///
+/// Keep in sync with `encode_target` in `src/video_player.rs`.
+fn resolve_encode_target(explicit: Option<u32>, info: &MediaTechInfo) -> (u32, u32) {
     if let Some(b) = explicit {
-        return b.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+        let bitrate = b.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+        return (bitrate, plan::height_for_bitrate(bitrate));
     }
-    let auto = source_kbps
+    let height = info
+        .video
+        .as_ref()
+        .and_then(|v| v.height)
+        .unwrap_or(AUTO_FALLBACK_HEIGHT)
+        .min(AUTO_MAX_HEIGHT);
+    let budget = plan::bitrate_for_height(height);
+    let source_cap = info
+        .bitrate_kbps
         .and_then(|b| u32::try_from(b).ok())
-        .unwrap_or(AUTO_BITRATE_FALLBACK_KBPS);
-    auto.clamp(MIN_BITRATE_KBPS, AUTO_BITRATE_CEILING_KBPS)
+        .and_then(|b| b.checked_mul(AUTO_SOURCE_HEADROOM))
+        .unwrap_or(u32::MAX);
+    (
+        budget.min(source_cap).max(MIN_BITRATE_KBPS),
+        height.max(1),
+    )
 }
 
 async fn serve(
@@ -496,10 +533,18 @@ async fn serve(
         // active. `current_encoder_name` honours the runtime-fallback
         // sticky flag, so a second playback after a hw-startup failure
         // already reads "libx264" here.
-        if matches!(plan.mode, plan::Mode::Transcode { .. }) {
+        if let plan::Mode::Transcode { hard_cap, .. } = plan.mode {
             let enc = producer::current_encoder_name(state.hwenc);
             if let Ok(v) = HeaderValue::from_str(enc) {
                 h.insert("X-Stream-Encoder", v);
+            }
+            // Which rate control that encoder ended up on. Without this the
+            // panel can't tell capped CRF from ABR from VideoToolbox's
+            // uncapped quality mode, and would report a bitrate ceiling
+            // that two of the three don't actually honour.
+            let rc = producer::current_rate_control_name(state.hwenc, hard_cap);
+            if let Ok(v) = HeaderValue::from_str(&rc) {
+                h.insert("X-Stream-Ratecontrol", v);
             }
         }
         return Ok(resp);
@@ -611,4 +656,93 @@ fn file_response(bytes: Vec<u8>, mime: &'static str, immutable: bool) -> Respons
         }),
     );
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{BrowserCompat, VideoTrackInfo};
+
+    fn info(height: Option<u32>, container_kbps: Option<u64>) -> MediaTechInfo {
+        MediaTechInfo {
+            container: Some("matroska".into()),
+            duration_seconds: Some(1200.0),
+            bitrate_kbps: container_kbps,
+            file_size: None,
+            video: height.map(|h| VideoTrackInfo {
+                codec: "hevc".into(),
+                profile: None,
+                width: Some(h * 16 / 9),
+                height: Some(h),
+                fps: Some(23.976),
+                bitrate_kbps: None,
+                pix_fmt: Some("yuv420p10le".into()),
+            }),
+            audio: vec![],
+            browser_compat: BrowserCompat::Transcode,
+            compat_reason: None,
+        }
+    }
+
+    #[test]
+    fn auto_keeps_source_height_on_efficient_encodes() {
+        // The regression this whole change exists for: a 1080p HEVC rip at
+        // 2 Mbps used to be read as "low bitrate → 480p". Height must now
+        // come from the source, and the budget from the height.
+        let (bitrate, height) = resolve_encode_target(None, &info(Some(1080), Some(2000)));
+        assert_eq!(height, 1080);
+        // 8000 budget for 1080p, capped by 2x the 2 Mbps source.
+        assert_eq!(bitrate, 4000);
+    }
+
+    #[test]
+    fn auto_budget_follows_height() {
+        assert_eq!(resolve_encode_target(None, &info(Some(1080), None)), (8000, 1080));
+        assert_eq!(resolve_encode_target(None, &info(Some(720), None)), (4000, 720));
+        assert_eq!(resolve_encode_target(None, &info(Some(480), None)), (2000, 480));
+        assert_eq!(resolve_encode_target(None, &info(Some(360), None)), (1000, 360));
+    }
+
+    #[test]
+    fn auto_never_upscales_and_caps_at_1080p() {
+        // 4K source is pulled down to the 1080p ceiling, not encoded at 2160p.
+        assert_eq!(resolve_encode_target(None, &info(Some(2160), None)), (8000, 1080));
+        // A genuinely small source stays small rather than being inflated.
+        assert_eq!(resolve_encode_target(None, &info(Some(240), None)).1, 240);
+    }
+
+    #[test]
+    fn auto_falls_back_when_probe_has_no_height() {
+        assert_eq!(resolve_encode_target(None, &info(None, None)), (4000, 720));
+    }
+
+    #[test]
+    fn auto_never_drops_below_the_floor() {
+        // A pathologically low source bitrate must not drive the budget to
+        // zero via the 2x headroom cap.
+        let (bitrate, _) = resolve_encode_target(None, &info(Some(1080), Some(10)));
+        assert_eq!(bitrate, MIN_BITRATE_KBPS);
+    }
+
+    #[test]
+    fn explicit_picks_still_downscale() {
+        // The menu labels promise a resolution, so an explicit low tier has
+        // to actually drop the height even on a 1080p source.
+        assert_eq!(resolve_encode_target(Some(2000), &info(Some(1080), Some(9000))), (2000, 480));
+        assert_eq!(resolve_encode_target(Some(1000), &info(Some(1080), Some(9000))), (1000, 360));
+        assert_eq!(resolve_encode_target(Some(8000), &info(Some(1080), Some(9000))), (8000, 1080));
+    }
+
+    #[test]
+    fn explicit_picks_ignore_the_source_bitrate_cap() {
+        // Auto's "don't outspend the source" guard must not silently
+        // undercut a bitrate the user asked for by name.
+        assert_eq!(resolve_encode_target(Some(8000), &info(Some(1080), Some(1500))), (8000, 1080));
+    }
+
+    #[test]
+    fn explicit_picks_are_clamped_to_the_allowed_range() {
+        assert_eq!(resolve_encode_target(Some(0), &info(Some(1080), None)).0, MIN_BITRATE_KBPS);
+        assert_eq!(resolve_encode_target(Some(999_999), &info(Some(1080), None)).0, MAX_BITRATE_KBPS);
+    }
 }
