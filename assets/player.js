@@ -947,7 +947,13 @@ function getDebugStats(videoId) {
 // source on the element — the Rust component renders the <video>
 // without a `src` attribute and calls `attach(videoId, url)` instead.
 
-const HLS_ESM = "https://cdn.jsdelivr.net/npm/hls.js@1/+esm";
+// Pinned to an exact version, never a `@1` range. The CDN resolves a range
+// at *fetch* time, so a floating major silently swaps the library under an
+// already-deployed build: hls.js 1.7.0 turned a previously-retried append
+// error into a fatal one (see the MEDIA_SOURCE_REQUIRES_RESET note in
+// attachInner) and broke playback for everyone without a deploy. Bump this
+// deliberately, with a test pass.
+const HLS_ESM = "https://cdn.jsdelivr.net/npm/hls.js@1.7.1/+esm";
 
 // How many times the same fragment SN may (re)load with no playback progress
 // before the reload-storm watchdog gives up (see attachInner). Safely above
@@ -955,6 +961,12 @@ const HLS_ESM = "https://cdn.jsdelivr.net/npm/hls.js@1/+esm";
 // SN, yet at the ~20 reloads/sec a storm runs at it trips in well under a
 // second.
 const STORM_THRESHOLD = 6;
+
+// How many times we'll resume playback after hls.js resets the MediaSource
+// out from under us (see the MEDIA_SOURCE_REQUIRES_RESET handling in
+// attachInner) before giving up and surfacing the error. Budget is per
+// stalled position, not per session: any forward progress refills it.
+const MS_RESET_MAX_RETRY = 3;
 
 let hlsPromise = null;
 function loadHlsJs() {
@@ -1105,9 +1117,9 @@ function startSampler(videoId, sessionId, audioIdx) {
 
 // Record an attachment plus start its metrics sampler in one place, so
 // every code path through `attachInner` wires the session consistently.
-function finalizeAttach(videoId, hls, url, sessionId) {
+function finalizeAttach(videoId, hls, url, sessionId, cleanup) {
     const sampler = startSampler(videoId, sessionId, audioIdxFromUrl(url));
-    attached.set(videoId, { hls, url, sessionId, sampler });
+    attached.set(videoId, { hls, url, sessionId, sampler, cleanup });
 }
 
 function attach(videoId, url, opts) {
@@ -1199,6 +1211,18 @@ async function attachInner(videoId, url, opts) {
         // WebViews that ignore EXT-X-START.
         startPosition: initialTime > 0 ? initialTime : -1,
     });
+    // Latch on the media element having errored. hls.js's own recovery
+    // detaches by calling `media.load()`, which clears `video.error` — so
+    // by the time our ERROR handler runs the element looks healthy even
+    // when a decode failure is what started the whole thing. Never
+    // cleared for the life of the attachment: one real decode error is
+    // enough to disqualify this source from the silent-recovery path
+    // below, which is the same call hls.js 1.6.x made when it gated its
+    // append retry on `!mediaError`.
+    let sawMediaError = false;
+    const onMediaErrorLatch = () => { sawMediaError = true; };
+    video.addEventListener("error", onMediaErrorLatch);
+
     // hls.js errors: non-fatal go to console (library handles them),
     // fatal surface to the overlay. We previously auto-retried MEDIA
     // errors via `recoverMediaError()`, but it didn't actually fix
@@ -1206,9 +1230,60 @@ async function attachInner(videoId, url, opts) {
     // error by a few segments. Better to fail loudly so the
     // underlying bug (typically: a malformed segment from the
     // server) gets fixed instead of papered over.
+    //
+    // `mediaSourceRequiresReset` (hls.js >= 1.7) is the one case we do
+    // recover, because it is fatal only by library accident. When
+    // `appendBuffer` throws while the MediaSource isn't open, 1.7 rewrites
+    // the detail from `bufferAppendError` to this one — and that rename
+    // walks straight past the library's own escape hatch, which still
+    // matches on the old name:
+    //
+    //     errorDetails === ErrorDetails.BUFFER_APPEND_ERROR &&
+    //       (error.name === 'QuotaExceededError' ||
+    //        error.name === 'InvalidStateError')
+    //
+    // so it never resolves the errorAction, and a single-variant playlist
+    // (ours: one SDR level, nothing to fail over to) is forced fatal on
+    // first sight instead of retried up to `appendErrorMaxRetry`. Nothing
+    // is actually wrong with the stream: WebKit reports MediaSource
+    // readyState "ended" on cold start (webkit.org/b/305712) and again
+    // after a bfcache restore. hls.js even runs the correct fix —
+    // `recoverMediaError()` detaches, re-attaches and calls
+    // `startLoad(currentTime)` — then immediately `stopLoad()`s it because
+    // the error is fatal, leaving a reset-but-idle player under a "Can't
+    // play this video" overlay. Our listener is registered after the
+    // library's internal `onErrorOut`, so resuming here is the last word.
+    //
+    // Two guards keep a genuinely broken stream failing loudly: we never
+    // recover once the media element itself has errored, and the retry
+    // budget only refills on forward progress, so a reset loop surfaces
+    // after MS_RESET_MAX_RETRY attempts at the same position.
+    const MS_RESET_DETAIL =
+        Hls.ErrorDetails?.MEDIA_SOURCE_REQUIRES_RESET ?? "mediaSourceRequiresReset";
+    const msr = { count: 0, lastPos: -1 };
     hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (!data?.fatal) return;
         const detail = data.details || data.type || "playback error";
+        if (detail === MS_RESET_DETAIL && !sawMediaError) {
+            // Resume where the failed append was, not `video.currentTime`
+            // — the detach's `media.load()` has already reset that to 0.
+            const pos = Number.isFinite(data.frag?.start) ? data.frag.start : -1;
+            if (pos > msr.lastPos + 0.25) msr.count = 0; // progressed; refill budget
+            msr.lastPos = Math.max(msr.lastPos, pos);
+            if (++msr.count <= MS_RESET_MAX_RETRY) {
+                const at = pos >= 0 ? `${pos.toFixed(3)}s` : "current position";
+                console.warn(
+                    `[binkflix] ${detail} at ${at} — resuming after hls.js `
+                    + `MediaSource reset (${msr.count}/${MS_RESET_MAX_RETRY})`
+                );
+                try {
+                    hls.startLoad(pos > 0 ? pos : -1);
+                    return;
+                } catch (e) {
+                    console.error("[binkflix] startLoad after MediaSource reset failed", e);
+                }
+            }
+        }
         let msg;
         const status = data.response?.code;
         if (status) {
@@ -1261,13 +1336,16 @@ async function attachInner(videoId, url, opts) {
     if (initialTime > 0) {
         try { hls.startLoad(initialTime); } catch (_) { /* ignore */ }
     }
-    finalizeAttach(videoId, hls, url, sessionId);
+    finalizeAttach(videoId, hls, url, sessionId, () => {
+        video.removeEventListener("error", onMediaErrorLatch);
+    });
 }
 
 function detachSource(videoId) {
     const entry = attached.get(videoId);
     if (!entry) return;
     if (entry.sampler) clearInterval(entry.sampler);
+    try { entry.cleanup?.(); } catch (_) { /* ignore */ }
     try { entry.hls?.destroy(); } catch (_) { /* ignore */ }
     const video = getVideo(videoId);
     if (video) {
