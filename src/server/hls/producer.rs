@@ -151,7 +151,7 @@ const VAAPI_QUALITY: u32 = 20;
 const FOLLOWER_POLL: Duration = Duration::from_millis(200);
 const FOLLOWER_STALL_GRACE: Duration = Duration::from_millis(1500);
 
-/// Registry key: `(media_id, audio_idx, mode_tag)`. Each key maps to a
+/// Registry key: `(file_id, audio_idx, mode_tag)`. Each key maps to a
 /// *pool* of producers, not a single one. A segment request follows a
 /// pooled producer already covering its region (so synced viewers
 /// coalesce onto one ffmpeg); a request for a genuinely different region
@@ -173,9 +173,9 @@ impl ProducerRegistry {
         Arc::new(Self::default())
     }
 
-    fn pool(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Arc<Mutex<Vec<ProducerHandle>>> {
+    fn pool(&self, file_id: &str, audio_idx: u32, mode_tag: &str) -> Arc<Mutex<Vec<ProducerHandle>>> {
         self.by_media
-            .entry((media_id.to_string(), audio_idx, mode_tag.to_string()))
+            .entry((file_id.to_string(), audio_idx, mode_tag.to_string()))
             .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
             .clone()
     }
@@ -189,7 +189,7 @@ impl ProducerRegistry {
     /// suffix, so it round-trips through the same call unchanged.
     pub async fn snapshot_by_prefix(
         &self,
-        media_id: &str,
+        file_id: &str,
         audio_idx: u32,
         prefix: &str,
     ) -> Option<crate::types::HlsProducerState> {
@@ -200,14 +200,14 @@ impl ProducerRegistry {
             .iter()
             .find(|e| {
                 let (m, a, tag) = e.key();
-                m == media_id && *a == audio_idx && tag.starts_with(prefix)
+                m == file_id && *a == audio_idx && tag.starts_with(prefix)
             })
             .map(|e| e.key().2.clone())?;
-        self.snapshot(media_id, audio_idx, &tag).await
+        self.snapshot(file_id, audio_idx, &tag).await
     }
 
-    pub async fn snapshot(&self, media_id: &str, audio_idx: u32, mode_tag: &str) -> Option<crate::types::HlsProducerState> {
-        let pool = self.by_media.get(&(media_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone())?;
+    pub async fn snapshot(&self, file_id: &str, audio_idx: u32, mode_tag: &str) -> Option<crate::types::HlsProducerState> {
+        let pool = self.by_media.get(&(file_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone())?;
         let guard = pool.lock().await;
         // Report the lead producer (furthest along). The debug panel
         // shows one row; the pool is usually size 1 anyway.
@@ -329,12 +329,16 @@ impl ProducerHandle {
 
 #[derive(Clone)]
 pub struct ProducerCtx {
+    /// The item being played — what telemetry events and logs name.
     pub media_id: String,
+    /// The file `source` belongs to — what the registry and on-disk cache
+    /// are keyed by, since segments are only interchangeable within a file.
+    pub file_id: String,
     pub source: PathBuf,
     pub plan: Arc<StreamPlan>,
     pub plan_dir: PathBuf,
     pub audio_idx: u32,
-    /// Cache key for the registry — the same `(media_id, audio_idx)`
+    /// Cache key for the registry — the same `(file_id, audio_idx)`
     /// running with different `mode_tag`s are independent producers so a
     /// remux client and a transcode client can coexist without one
     /// killing the other's ffmpeg.
@@ -432,11 +436,11 @@ pub async fn ensure_segment(
     // Fast path: cached on disk. Still nudge a covering producer so it
     // keeps its read-ahead window aligned with where the client is.
     if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
-        bump_covering(registry, &ctx.media_id, ctx.audio_idx, &ctx.mode_tag, idx, total).await;
+        bump_covering(registry, &ctx.file_id, ctx.audio_idx, &ctx.mode_tag, idx, total).await;
         return Ok(seg_path);
     }
 
-    let pool = registry.pool(&ctx.media_id, ctx.audio_idx, &ctx.mode_tag);
+    let pool = registry.pool(&ctx.file_id, ctx.audio_idx, &ctx.mode_tag);
     let overall_deadline = Instant::now() + SEGMENT_WAIT_TIMEOUT;
     // Producers we tried to follow but found stalled — don't re-follow
     // them on the next loop, spawn our own instead.
@@ -549,7 +553,7 @@ async fn follow_wait(
 /// (no-op if none does — the segment is already on disk).
 async fn bump_covering(
     registry: &ProducerRegistry,
-    media_id: &str,
+    file_id: &str,
     audio_idx: u32,
     mode_tag: &str,
     idx: u32,
@@ -557,7 +561,7 @@ async fn bump_covering(
 ) {
     if let Some(pool) = registry
         .by_media
-        .get(&(media_id.to_string(), audio_idx, mode_tag.to_string()))
+        .get(&(file_id.to_string(), audio_idx, mode_tag.to_string()))
         .map(|e| e.clone())
     {
         let guard = pool.lock().await;

@@ -53,14 +53,10 @@ pub async fn media_stream(
     Query(q): Query<StreamQuery>,
     req: axum::extract::Request,
 ) -> Result<Response> {
-    let path: (String,) = sqlx::query_as(
-        "SELECT path FROM media WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(&id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(Error::NotFound)?;
-    let path = path.0;
+    let file = super::files::primary(&state.pool, &id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let (file_id, path) = (file.id, file.path);
 
     // Explicit override wins — useful for debugging or forcing remux on a
     // file that would otherwise be served direct.
@@ -78,13 +74,13 @@ pub async fn media_stream(
     // subsequent plays hit the cache.
     let mode = match explicit {
         Some(m) => m,
-        None => verdict_for(&state, &id, &path).await,
+        None => verdict_for(&state, &file_id, &path).await,
     };
 
     // Snapshot enough source detail to make later analysis self-contained
     // (codecs may change if the user replaces a file). Probe-on-miss so
     // freshly-added files still record real codecs rather than NULL.
-    let info = load_or_probe_info(&state, &id, &path).await;
+    let info = load_or_probe_info(&state, &file_id, &path).await;
     // Pull request-scoped data out into owned values *before* the next
     // `.await` so the handler future stays `Send` — borrowing through
     // `&req` across an await trips axum's Handler trait inference.
@@ -97,6 +93,7 @@ pub async fn media_stream(
     let session_id = open_playback_session(
         &state.pool,
         &id,
+        &file_id,
         mode,
         q.mode.is_some(),
         &info,
@@ -107,7 +104,7 @@ pub async fn media_stream(
 
     match mode {
         BrowserCompat::Direct => direct_stream(&path, req).await,
-        BrowserCompat::Remux => remux_stream(&state, &id, &path, session_id).await,
+        BrowserCompat::Remux => remux_stream(&state, &file_id, &path, session_id).await,
         // Transcode is delivered via the HLS pipeline (`-c:v libx264`
         // segmented into fMP4). The client picks that URL directly when
         // the compat verdict is Transcode; this branch only fires for
@@ -124,10 +121,10 @@ pub async fn media_stream(
     }
 }
 
-async fn load_or_probe_info(state: &AppState, id: &str, path: &str) -> Option<MediaTechInfo> {
+async fn load_or_probe_info(state: &AppState, file_id: &str, path: &str) -> Option<MediaTechInfo> {
     // Validate-on-read so the audio-codec branch below picks the *current*
     // default track rather than what was on disk at last scan time.
-    if let Ok(fresh) = super::media_info::load_fresh(state, id).await {
+    if let Ok(fresh) = super::media_info::load_fresh(state, file_id).await {
         if let Some(info) = fresh.info {
             return Some(info);
         }
@@ -149,6 +146,7 @@ fn delivery_mode_str(m: BrowserCompat) -> &'static str {
 async fn open_playback_session(
     pool: &SqlitePool,
     media_id: &str,
+    file_id: &str,
     mode: BrowserCompat,
     forced_via_query: bool,
     info: &Option<MediaTechInfo>,
@@ -179,6 +177,7 @@ async fn open_playback_session(
             id: &session_id,
             user_sub: user_sub.as_deref(),
             media_id,
+            file_id,
             delivery_mode: delivery_mode_str(mode),
             chosen_reason: chosen_reason.as_deref(),
             src_video_codec: src_video_codec.as_deref(),
@@ -201,11 +200,11 @@ async fn open_playback_session(
     session_id
 }
 
-async fn verdict_for(state: &AppState, id: &str, path: &str) -> BrowserCompat {
+async fn verdict_for(state: &AppState, file_id: &str, path: &str) -> BrowserCompat {
     // Validate-on-read: a swapped file might have crossed the Direct↔Remux
     // line (e.g. AC3 → AAC means we could now stream direct). Refreshing
     // here keeps the delivery mode honest.
-    if let Ok(fresh) = super::media_info::load_fresh(state, id).await {
+    if let Ok(fresh) = super::media_info::load_fresh(state, file_id).await {
         if let Some(info) = fresh.info {
             return info.browser_compat;
         }
@@ -213,7 +212,7 @@ async fn verdict_for(state: &AppState, id: &str, path: &str) -> BrowserCompat {
     match super::media_info::probe(std::path::Path::new(path)).await {
         Ok(info) => {
             let verdict = info.browser_compat;
-            let _ = super::media_info::store(&state.pool, id, &info).await;
+            let _ = super::media_info::store(&state.pool, file_id, &info).await;
             verdict
         }
         // If we can't even probe, direct is the least-bad default — the
@@ -251,19 +250,19 @@ enum OutputFamily {
 
 async fn remux_stream(
     state: &AppState,
-    id: &str,
+    file_id: &str,
     path: &str,
     session_id: String,
 ) -> Result<Response> {
     // Cached probe carries both the duration (for mvhd) and the video
     // codec (which decides MP4 vs WebM output). Cache miss = live probe
     // so freshly-added files still work.
-    let info = match super::media_info::load(&state.pool, id).await.ok().flatten() {
+    let info = match super::media_info::load(&state.pool, file_id).await.ok().flatten() {
         Some(info) => Some(info),
         None => {
             let probed = super::media_info::probe(std::path::Path::new(path)).await.ok();
             if let Some(ref info) = probed {
-                let _ = super::media_info::store(&state.pool, id, info).await;
+                let _ = super::media_info::store(&state.pool, file_id, info).await;
             }
             probed
         }

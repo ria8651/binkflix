@@ -203,7 +203,7 @@ async fn state(
     let cached_segments = scan_cached_segments(&resolved.plan_dir, resolved.plan.segments.len() as u32).await;
     let producer = state
         .hls_producers
-        .snapshot(&id, audio_idx, &resolved.mode_tag)
+        .snapshot(&resolved.file_id, audio_idx, &resolved.mode_tag)
         .await;
     Ok(axum::Json(crate::types::HlsState {
         duration: resolved.plan.duration,
@@ -242,6 +242,8 @@ fn validate_audio_idx(idx: u32) -> Result<u32> {
 }
 
 struct ResolvedPlan {
+    /// The item's primary file — everything below was derived from it.
+    file_id: String,
     plan: Arc<plan::StreamPlan>,
     plan_dir: PathBuf,
     src: PathBuf,
@@ -251,7 +253,8 @@ struct ResolvedPlan {
     mode_tag: String,
 }
 
-/// Resolve the plan + on-disk plan dir + tech info for a media. Builds +
+/// Resolve the plan + on-disk plan dir + tech info for the file item `id`
+/// currently plays from. Builds +
 /// persists the remux plan on cache miss; transcode plans are built on
 /// demand without DB caching (cheap — duration only). Sweeps stale
 /// sibling dirs after a rebuild. The remux plan timeline is shared
@@ -266,20 +269,17 @@ async fn resolve_plan(
     if !id_is_safe(id) {
         return Err(Error::BadRequest("invalid media id".into()));
     }
-    let row: (String,) = sqlx::query_as(
-        "SELECT path FROM media WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(Error::NotFound)?;
-    let src = PathBuf::from(row.0);
+    let file = super::files::primary(&state.pool, id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let file_id = file.id;
+    let src = PathBuf::from(file.path);
 
     // Validate-on-read: if the file changed since we last derived its
     // probe_json, run the essential pass first so `derive_audio_plan`
     // indexes the current track list (a stale 1-track list would map a
     // chosen higher index to nothing → audio dropped).
-    let info = match super::media_info::load_fresh(state, id)
+    let info = match super::media_info::load_fresh(state, &file_id)
         .await
         .ok()
         .and_then(|f| f.info)
@@ -289,7 +289,7 @@ async fn resolve_plan(
             let probed = super::media_info::probe(&src)
                 .await
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-            let _ = super::media_info::store(&state.pool, id, &probed).await;
+            let _ = super::media_info::store(&state.pool, &file_id, &probed).await;
             probed
         }
     };
@@ -310,7 +310,7 @@ async fn resolve_plan(
 
     match chosen_mode {
         RequestedMode::Remux => {
-            let plan = match plan::load_if_fresh(&state.pool, id, &src)
+            let plan = match plan::load_if_fresh(&state.pool, &file_id, &src)
                 .await
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
             {
@@ -321,20 +321,21 @@ async fn resolve_plan(
                     let p = plan::build_remux_plan(&src, &info)
                         .await
                         .map_err(|e| {
-                            tracing::error!(media_id = %id, %e, "failed to build HLS plan");
+                            tracing::error!(media_id = %id, %file_id, %e, "failed to build HLS plan");
                             Error::NotImplemented("hls plan unavailable".into())
                         })?;
-                    plan::store(&state.pool, id, &p, mtime, size)
+                    plan::store(&state.pool, &file_id, &p, mtime, size)
                         .await
                         .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
                     let keep_prefix = cache::plan_dir_prefix(p.version, mtime, size);
-                    cache::sweep_stale_plan_dirs(id, &keep_prefix).await;
+                    cache::sweep_stale_plan_dirs(&file_id, &keep_prefix).await;
                     p
                 }
             };
             let mode_tag = "remux".to_string();
-            let plan_dir = cache::plan_dir(id, plan.version, mtime, size, audio_idx, &mode_tag);
+            let plan_dir = cache::plan_dir(&file_id, plan.version, mtime, size, audio_idx, &mode_tag);
             Ok(ResolvedPlan {
+                file_id,
                 plan: Arc::new(plan),
                 plan_dir,
                 src,
@@ -357,8 +358,9 @@ async fn resolve_plan(
             } else {
                 format!("tx{bitrate}h{max_height}-auto")
             };
-            let plan_dir = cache::plan_dir(id, plan.version, mtime, size, audio_idx, &mode_tag);
+            let plan_dir = cache::plan_dir(&file_id, plan.version, mtime, size, audio_idx, &mode_tag);
             Ok(ResolvedPlan {
+                file_id,
                 plan: Arc::new(plan),
                 plan_dir,
                 src,
@@ -425,7 +427,7 @@ async fn serve(
 
     let audio_idx = validate_audio_idx(params.idx())?;
     let resolved = resolve_plan(&state, &id, audio_idx, &params).await?;
-    let ResolvedPlan { plan, plan_dir, src, info, mode_tag } = resolved;
+    let ResolvedPlan { file_id, plan, plan_dir, src, info, mode_tag } = resolved;
     let path = plan_dir.join(&file);
 
     // Strict mode with an unsatisfiable request (encoder missing from this
@@ -475,6 +477,7 @@ async fn serve(
                 id: &session_id,
                 user_sub: Some(&session.user_sub),
                 media_id: &id,
+                file_id: &file_id,
                 delivery_mode,
                 chosen_reason: None,
                 src_video_codec: src_video,
@@ -564,6 +567,7 @@ async fn serve(
 
     let ctx = producer::ProducerCtx {
         media_id: id.clone(),
+        file_id,
         source: src,
         plan: plan.clone(),
         plan_dir: plan_dir.clone(),

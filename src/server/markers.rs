@@ -9,7 +9,7 @@
 //! path: chapters fit the scanner's per-file essential pass, while audio
 //! matching is a season-scoped pass that needs every episode first.
 //!
-//! Markers are per-media. A shared intro that only some episodes of a season
+//! Markers are per-file. A shared intro that only some episodes of a season
 //! carry produces rows only on the episodes that actually contain it.
 
 use super::AppState;
@@ -87,15 +87,15 @@ fn kind_from_str(s: &str) -> Option<MarkerKind> {
     })
 }
 
-/// All markers for a media, ordered by start time. An unknown `kind` string
+/// All markers for a file, ordered by start time. An unknown `kind` string
 /// (e.g. left by a since-removed producer) is skipped rather than failing the
 /// read — same defensive stance as `media_info::load` on bad `probe_json`.
-pub async fn load(pool: &SqlitePool, media_id: &str) -> anyhow::Result<MarkersResponse> {
+pub async fn load(pool: &SqlitePool, file_id: &str) -> anyhow::Result<MarkersResponse> {
     let rows: Vec<(String, f64, f64, Option<String>, String, f64)> = sqlx::query_as(
         "SELECT kind, start_secs, end_secs, title, source, confidence
-         FROM media_markers WHERE media_id = ? ORDER BY start_secs",
+         FROM media_markers WHERE file_id = ? ORDER BY start_secs",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_all(pool)
     .await?;
     let markers = rows
@@ -122,34 +122,34 @@ pub async fn load(pool: &SqlitePool, media_id: &str) -> anyhow::Result<MarkersRe
 /// result here — only the side effect of refreshing stale rows — then we read
 /// markers back. Audio-detected markers are season-scoped and are *not*
 /// refreshed here (they're re-derived by the scanner's audio-match phase).
-pub async fn load_fresh(state: &AppState, media_id: &str) -> anyhow::Result<MarkersResponse> {
-    let _ = super::media_info::load_fresh(state, media_id).await?;
-    load(&state.pool, media_id).await
+pub async fn load_fresh(state: &AppState, file_id: &str) -> anyhow::Result<MarkersResponse> {
+    let _ = super::media_info::load_fresh(state, file_id).await?;
+    load(&state.pool, file_id).await
 }
 
-/// Replace all markers for `media_id` that came from a single `source`,
+/// Replace all markers for `file_id` that came from a single `source`,
 /// atomically. Rows from other sources (and `manual` edits) are left
 /// untouched, so a chapter re-derive never wipes audio-detected markers and a
 /// season re-analysis never wipes chapter ticks.
 pub async fn store_markers(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     source: &str,
     markers: &[Marker],
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM media_markers WHERE media_id = ? AND source = ?")
-        .bind(media_id)
+    sqlx::query("DELETE FROM media_markers WHERE file_id = ? AND source = ?")
+        .bind(file_id)
         .bind(source)
         .execute(&mut *tx)
         .await?;
     for m in markers {
         sqlx::query(
             "INSERT OR REPLACE INTO media_markers
-                (media_id, kind, start_secs, end_secs, title, source, confidence)
+                (file_id, kind, start_secs, end_secs, title, source, confidence)
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(media_id)
+        .bind(file_id)
         .bind(m.kind.as_str())
         .bind(m.start_secs)
         .bind(m.end_secs)
@@ -313,20 +313,20 @@ async fn fingerprint(video: &Path) -> anyhow::Result<Vec<u32>> {
     Ok(parsed.fingerprint)
 }
 
-/// Fingerprint for `media_id`, reusing the cached `media_fingerprints` row when
+/// Fingerprint for `file_id`, reusing the cached `media_fingerprints` row when
 /// its `(mtime, size, algo)` still match the live file — so a season re-run
 /// only pays fpcalc on the file(s) that actually changed or are new.
 pub async fn ensure_fingerprint(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     video: &Path,
     sig: (i64, i64),
 ) -> anyhow::Result<Vec<u32>> {
     let row: Option<(Option<i64>, Option<i64>, i64, Vec<u8>)> = sqlx::query_as(
         "SELECT content_mtime, content_size, fp_algo_version, raw
-         FROM media_fingerprints WHERE media_id = ?",
+         FROM media_fingerprints WHERE file_id = ?",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_optional(pool)
     .await?;
     if let Some((Some(m), Some(s), ver, raw)) = row {
@@ -344,10 +344,10 @@ pub async fn ensure_fingerprint(
     };
     sqlx::query(
         "INSERT OR REPLACE INTO media_fingerprints
-            (media_id, content_mtime, content_size, fp_algo_version, raw)
+            (file_id, content_mtime, content_size, fp_algo_version, raw)
          VALUES (?, ?, ?, ?, ?)",
     )
-    .bind(media_id)
+    .bind(file_id)
     .bind(sig.0)
     .bind(sig.1)
     .bind(FP_ALGO_VERSION)
@@ -359,7 +359,7 @@ pub async fn ensure_fingerprint(
 
 /// One episode's fingerprint + runtime, fed to [`analyze_season`].
 pub struct SeasonEpisode {
-    pub media_id: String,
+    pub file_id: String,
     pub duration: f64,
     pub fp: Vec<u32>,
 }
@@ -507,7 +507,7 @@ pub fn analyze_season(eps: &[SeasonEpisode]) -> Vec<(String, Vec<Marker>)> {
                 confidence: (partners.len() as f64 / denom).clamp(0.0, 1.0),
             });
         }
-        out.push((ep.media_id.clone(), markers));
+        out.push((ep.file_id.clone(), markers));
     }
     out
 }
@@ -538,10 +538,10 @@ mod tests {
             fp
         };
         let eps = vec![
-            SeasonEpisode { media_id: "a".into(), duration: 1500.0, fp: with_intro(7) },
-            SeasonEpisode { media_id: "b".into(), duration: 1500.0, fp: with_intro(99) },
+            SeasonEpisode { file_id: "a".into(), duration: 1500.0, fp: with_intro(7) },
+            SeasonEpisode { file_id: "b".into(), duration: 1500.0, fp: with_intro(99) },
             // No shared content with anyone.
-            SeasonEpisode { media_id: "c".into(), duration: 1500.0, fp: lcg_stream(500, 2200) },
+            SeasonEpisode { file_id: "c".into(), duration: 1500.0, fp: lcg_stream(500, 2200) },
         ];
         let by_id: HashMap<String, Vec<Marker>> = analyze_season(&eps).into_iter().collect();
 
@@ -572,9 +572,9 @@ mod tests {
         };
         let dur = dup.len() as f64 * FP_ITEM_SECS;
         let eps = vec![
-            SeasonEpisode { media_id: "a".into(), duration: dur, fp: dup.clone() },
-            SeasonEpisode { media_id: "b".into(), duration: dur, fp: dup },
-            SeasonEpisode { media_id: "c".into(), duration: dur, fp: with_intro(99) },
+            SeasonEpisode { file_id: "a".into(), duration: dur, fp: dup.clone() },
+            SeasonEpisode { file_id: "b".into(), duration: dur, fp: dup },
+            SeasonEpisode { file_id: "c".into(), duration: dur, fp: with_intro(99) },
         ];
         let by_id: HashMap<String, Vec<Marker>> = analyze_season(&eps).into_iter().collect();
 
@@ -657,8 +657,8 @@ mod tests {
         assert!(!fp1.is_empty() && !fp2.is_empty(), "fpcalc produced fingerprints");
 
         let eps = vec![
-            SeasonEpisode { media_id: "ep1".into(), duration: 45.0, fp: fp1 },
-            SeasonEpisode { media_id: "ep2".into(), duration: 45.0, fp: fp2 },
+            SeasonEpisode { file_id: "ep1".into(), duration: 45.0, fp: fp1 },
+            SeasonEpisode { file_id: "ep2".into(), duration: 45.0, fp: fp2 },
         ];
         let by_id: HashMap<String, Vec<Marker>> = analyze_season(&eps).into_iter().collect();
         for id in ["ep1", "ep2"] {

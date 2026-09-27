@@ -9,6 +9,7 @@ pub mod cli;
 pub mod db;
 pub mod error;
 pub mod filename;
+pub mod files;
 pub mod hls;
 pub mod markers;
 pub mod media_info;

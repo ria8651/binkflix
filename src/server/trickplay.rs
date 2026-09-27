@@ -37,20 +37,26 @@ pub struct TrickplayManifest {
     pub cols: u32,
     pub rows: u32,
     pub count: u32,
+    /// Changes whenever the sprite does — a different file behind the item,
+    /// or a rebuild of the same one. The sprite URL is addressed by *item*,
+    /// so the player appends this to it to keep an `immutable` cache honest.
+    pub version: String,
 }
 
 pub async fn get_manifest(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
 ) -> anyhow::Result<Option<TrickplayManifest>> {
-    let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT interval_s, tile_w, tile_h, padding, cols, rows, count
-         FROM media_trickplay WHERE media_id = ?",
+    type Row = (i64, i64, i64, i64, i64, i64, i64, i64);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT interval_s, tile_w, tile_h, padding, cols, rows, count,
+                CAST(strftime('%s', created_at) AS INTEGER)
+         FROM media_trickplay WHERE file_id = ?",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(interval, tw, th, p, c, r, n)| TrickplayManifest {
+    Ok(row.map(|(interval, tw, th, p, c, r, n, built)| TrickplayManifest {
         interval: interval as u32,
         tile_w: tw as u32,
         tile_h: th as u32,
@@ -58,22 +64,23 @@ pub async fn get_manifest(
         cols: c as u32,
         rows: r as u32,
         count: n as u32,
+        version: format!("{file_id}-{built}"),
     }))
 }
 
 pub async fn get_sprite(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
 ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
     let row: Option<(Vec<u8>, String)> =
-        sqlx::query_as("SELECT content, mime FROM media_trickplay WHERE media_id = ?")
-            .bind(media_id)
+        sqlx::query_as("SELECT content, mime FROM media_trickplay WHERE file_id = ?")
+            .bind(file_id)
             .fetch_optional(pool)
             .await?;
     Ok(row)
 }
 
-/// Build (or rebuild) the sprite for `media_id`. Idempotent UPSERT.
+/// Build (or rebuild) the sprite for `file_id`. Idempotent UPSERT.
 /// Logs and swallows failures so a missing ffmpeg or weird container
 /// can't fail a library scan. On success, returns the number of source
 /// keyframes the ffmpeg call processed (useful for analytics correlation
@@ -82,12 +89,12 @@ pub async fn get_sprite(
 /// that as "no signal," not zero.
 pub async fn scan_for_media(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     video: &Path,
     duration_secs: Option<f64>,
 ) -> Option<u32> {
     let Some(duration) = duration_secs else {
-        tracing::debug!(media_id, "trickplay skipped: no duration");
+        tracing::debug!(file_id, "trickplay skipped: no duration");
         return None;
     };
     if duration < MIN_DURATION_S {
@@ -112,9 +119,9 @@ pub async fn scan_for_media(
         Ok((bytes, keyframe_count)) => {
             if let Err(e) = sqlx::query(
                 "INSERT INTO media_trickplay
-                    (media_id, content, mime, interval_s, tile_w, tile_h, padding, cols, rows, count)
+                    (file_id, content, mime, interval_s, tile_w, tile_h, padding, cols, rows, count)
                  VALUES (?, ?, 'image/jpeg', ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(media_id) DO UPDATE SET
+                 ON CONFLICT(file_id) DO UPDATE SET
                     content    = excluded.content,
                     mime       = excluded.mime,
                     interval_s = excluded.interval_s,
@@ -126,7 +133,7 @@ pub async fn scan_for_media(
                     count      = excluded.count,
                     created_at = datetime('now')",
             )
-            .bind(media_id)
+            .bind(file_id)
             .bind(&bytes)
             .bind(interval as i64)
             .bind(TILE_W as i64)
@@ -138,11 +145,11 @@ pub async fn scan_for_media(
             .execute(pool)
             .await
             {
-                tracing::warn!(media_id, %e, "failed to persist trickplay sprite");
+                tracing::warn!(file_id, %e, "failed to persist trickplay sprite");
                 None
             } else {
                 tracing::debug!(
-                    media_id,
+                    file_id,
                     interval,
                     cols,
                     rows,
@@ -155,7 +162,7 @@ pub async fn scan_for_media(
             }
         }
         Err(e) => {
-            tracing::debug!(media_id, video = %video.display(), %e, "trickplay extract failed");
+            tracing::debug!(file_id, video = %video.display(), %e, "trickplay extract failed");
             None
         }
     }

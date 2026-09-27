@@ -2,7 +2,7 @@
 //!
 //! Layout:
 //! ```
-//! ./data/hls/{media_id}/{plan_dir}/
+//! ./data/hls/{file_id}/{plan_dir}/
 //!     init.mp4
 //!     seg-00001.m4s
 //!     seg-00002.m4s
@@ -24,19 +24,20 @@ pub fn id_is_safe(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Root of the HLS cache. One subdirectory per media id, then one per plan
-/// invalidation key (mtime/size/version).
+/// Root of the HLS cache. One subdirectory per file id (`media_files.id` —
+/// the bytes, not the item, so an item whose file is replaced starts a fresh
+/// cache), then one per plan invalidation key (mtime/size/version).
 pub fn cache_root() -> PathBuf {
     std::env::var("BINKFLIX_HLS_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./data/hls"))
 }
 
-pub fn media_dir(id: &str) -> PathBuf {
+pub fn file_dir(id: &str) -> PathBuf {
     cache_root().join(id)
 }
 
-/// Subdirectory within `media_dir` whose name encodes the plan's invalidation
+/// Subdirectory within `file_dir` whose name encodes the plan's invalidation
 /// keys. Changes if the source file changes (mtime/size), the plan algorithm
 /// is bumped (`PLAN_VERSION`), the user picks a different audio track, or
 /// the encode mode/quality differs. Audio index is part of the key because
@@ -61,7 +62,7 @@ pub fn plan_dir(
     audio_idx: u32,
     mode_tag: &str,
 ) -> PathBuf {
-    media_dir(id).join(plan_dir_name(
+    file_dir(id).join(plan_dir_name(
         plan_version,
         source_mtime,
         source_size,
@@ -70,7 +71,7 @@ pub fn plan_dir(
     ))
 }
 
-/// Remove every subdirectory of `media_dir(id)` whose name doesn't share
+/// Remove every subdirectory of `file_dir(id)` whose name doesn't share
 /// the given `keep_prefix`. Per-audio-index variants of the *current*
 /// (version,mtime,size) are kept so switching tracks doesn't repeatedly
 /// blow away each other's caches; only genuinely stale dirs (old plan
@@ -78,7 +79,7 @@ pub fn plan_dir(
 /// errors are logged and swallowed because a stale dir is harmless
 /// beyond wasted disk.
 pub async fn sweep_stale_plan_dirs(id: &str, keep_prefix: &str) {
-    let dir = media_dir(id);
+    let dir = file_dir(id);
     let mut rd = match tokio::fs::read_dir(&dir).await {
         Ok(rd) => rd,
         Err(_) => return,

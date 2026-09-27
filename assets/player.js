@@ -573,13 +573,15 @@ function initControls(videoId) {
             const r = await fetch(`/api/media/${encodeURIComponent(mediaId)}/trickplay.json`);
             if (!r.ok) { previewState = "unavailable"; return; }
             previewManifest = await r.json();
-            const { cols, rows, tile_w, tile_h, padding = 0 } = previewManifest;
+            const { cols, rows, tile_w, tile_h, padding = 0, version = "" } = previewManifest;
             // Sprite dims include `padding` px between cells (no margin).
             // Stride is tile + padding; total = cols*stride - padding.
             const sw = cols * (tile_w + padding) - padding;
             const sh = rows * (tile_h + padding) - padding;
+            // The sprite is cached `immutable` but addressed by item, so
+            // `version` (which changes with the file behind it) busts it.
             previewImg.style.backgroundImage =
-                `url(/api/media/${encodeURIComponent(mediaId)}/trickplay.jpg)`;
+                `url(/api/media/${encodeURIComponent(mediaId)}/trickplay.jpg?v=${encodeURIComponent(version)})`;
             previewImg.style.backgroundSize = `${sw}px ${sh}px`;
             previewImg.style.width = `${tile_w}px`;
             previewImg.style.height = `${tile_h}px`;

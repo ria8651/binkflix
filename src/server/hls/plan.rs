@@ -71,7 +71,7 @@ const TARGET_SEGMENT_SECS: f64 = 6.0;
 /// transcode for better seeking.
 const MAX_SEGMENT_WARN_SECS: f64 = 30.0;
 
-/// Top-level plan persisted as JSON in `media.stream_plan_json`.
+/// Top-level plan persisted as JSON in `media_files.stream_plan_json`.
 ///
 /// Audio is intentionally absent: the per-request `audio_idx` decides
 /// which source stream to mux, and `derive_audio_plan` builds the
@@ -437,13 +437,13 @@ fn group_segments(keyframes: &[f64], duration: f64) -> Vec<Segment> {
 /// mtime+size. Returns `Ok(None)` for cache miss (caller should rebuild).
 pub async fn load_if_fresh(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     src: &Path,
 ) -> anyhow::Result<Option<StreamPlan>> {
     let row: Option<(Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT stream_plan_json, source_mtime, source_size FROM media WHERE id = ?",
+        "SELECT stream_plan_json, source_mtime, source_size FROM media_files WHERE id = ?",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_optional(pool)
     .await?;
     let Some((Some(json), Some(mtime), Some(size))) = row else {
@@ -470,19 +470,19 @@ pub async fn load_if_fresh(
 
 pub async fn store(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     plan: &StreamPlan,
     source_mtime: i64,
     source_size: i64,
 ) -> anyhow::Result<()> {
     let json = serde_json::to_string(plan)?;
     sqlx::query(
-        "UPDATE media SET stream_plan_json = ?, source_mtime = ?, source_size = ? WHERE id = ?",
+        "UPDATE media_files SET stream_plan_json = ?, source_mtime = ?, source_size = ? WHERE id = ?",
     )
     .bind(json)
     .bind(source_mtime)
     .bind(source_size)
-    .bind(media_id)
+    .bind(file_id)
     .execute(pool)
     .await?;
     Ok(())

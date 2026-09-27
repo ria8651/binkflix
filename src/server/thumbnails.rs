@@ -1,6 +1,6 @@
 //! Generated-thumbnail extraction + DB caching.
 //!
-//! If a media row has no sidecar image, we grab a single frame from the
+//! If an item has no sidecar image, we grab a single frame from the
 //! video at scan time and cache it as JPEG in `media_thumbnails`. The
 //! API's image endpoint prefers the sidecar path and falls back to this
 //! cache — so after the initial scan we never hit the source drive for
@@ -18,44 +18,44 @@ const SEEK_SECONDS: u32 = 60;
 /// Target width in pixels; aspect ratio preserved by ffmpeg's `-1`.
 const THUMB_WIDTH: u32 = 480;
 
-/// Fetch the cached thumbnail blob for a media id, if any.
+/// Fetch the cached thumbnail blob for a file, if any.
 pub async fn get_from_db(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
 ) -> anyhow::Result<Option<(Vec<u8>, String)>> {
     let row: Option<(Vec<u8>, String)> = sqlx::query_as(
-        "SELECT content, mime FROM media_thumbnails WHERE media_id = ?",
+        "SELECT content, mime FROM media_thumbnails WHERE file_id = ?",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_optional(pool)
     .await?;
     Ok(row)
 }
 
-/// Generate (or regenerate) the cached thumbnail for `media_id` from `video`.
+/// Generate (or regenerate) the cached thumbnail for `file_id` from `video`.
 /// Idempotent — UPSERT. Logs and swallows failures so a missing ffmpeg or
 /// a weird container can't fail a library scan.
-pub async fn scan_for_media(pool: &SqlitePool, media_id: &str, video: &Path) {
+pub async fn scan_for_media(pool: &SqlitePool, file_id: &str, video: &Path) {
     match extract_frame(video).await {
         Ok(bytes) => {
             if let Err(e) = sqlx::query(
-                "INSERT INTO media_thumbnails (media_id, content, mime)
+                "INSERT INTO media_thumbnails (file_id, content, mime)
                  VALUES (?, ?, 'image/jpeg')
-                 ON CONFLICT(media_id) DO UPDATE SET
+                 ON CONFLICT(file_id) DO UPDATE SET
                     content = excluded.content,
                     mime = excluded.mime,
                     created_at = datetime('now')",
             )
-            .bind(media_id)
+            .bind(file_id)
             .bind(&bytes)
             .execute(pool)
             .await
             {
-                tracing::warn!(media_id, %e, "failed to persist thumbnail");
+                tracing::warn!(file_id, %e, "failed to persist thumbnail");
             }
         }
         Err(e) => {
-            tracing::debug!(media_id, video = %video.display(), %e, "thumbnail extract failed");
+            tracing::debug!(file_id, video = %video.display(), %e, "thumbnail extract failed");
         }
     }
 }

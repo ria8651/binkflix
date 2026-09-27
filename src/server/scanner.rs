@@ -75,9 +75,11 @@ async fn set_progress(handle: &ProgressHandle, f: impl FnOnce(&mut ScanProgress)
     f(&mut p);
 }
 
-async fn add_active(handle: &ProgressHandle, media_id: &str, title: &str, stage: Stage) {
+/// `key` identifies the job for later removal: a file id for per-file
+/// passes, a show id for season analysis.
+async fn add_active(handle: &ProgressHandle, key: &str, title: &str, stage: Stage) {
     handle.write().await.active.push(ActiveJob {
-        media_id: media_id.into(),
+        media_id: key.into(),
         title: title.into(),
         stage,
     });
@@ -286,7 +288,7 @@ pub async fn ensure_library(pool: &SqlitePool, name: &str, path: &Path) -> anyho
         .await?
     {
         // Resurrect a previously-soft-deleted library and any of its
-        // shows/media that were soft-deleted by the same library-prune.
+        // shows/items/files that were soft-deleted by the same library-prune.
         // Per-file prunes are re-applied later in prune_missing.
         if deleted_at.is_some() {
             sqlx::query("UPDATE libraries SET deleted_at = NULL WHERE id = ?")
@@ -298,6 +300,10 @@ pub async fn ensure_library(pool: &SqlitePool, name: &str, path: &Path) -> anyho
                 .execute(pool)
                 .await?;
             sqlx::query("UPDATE media SET deleted_at = NULL WHERE library_id = ?")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            sqlx::query("UPDATE media_files SET deleted_at = NULL WHERE library_id = ?")
                 .bind(id)
                 .execute(pool)
                 .await?;
@@ -320,9 +326,10 @@ pub async fn ensure_library(pool: &SqlitePool, name: &str, path: &Path) -> anyho
 /// Work item carried from the index pass into the asset pass. Each
 /// `needs_*` flag gates its own pass — a job can need just one asset
 /// re-extracted, not all three. `needs_essential` covers probe +
-/// probe_json + subtitles + content-signature stamp.
+/// probe_json + subtitles + content-signature stamp. Assets belong to the
+/// file, so a job is addressed by file id.
 struct AssetJob {
-    media_id: String,
+    file_id: String,
     video: PathBuf,
     title: String,
     has_sidecar_image: bool,
@@ -356,10 +363,15 @@ async fn backfill_added_at(pool: &SqlitePool) -> anyhow::Result<()> {
             .await?;
     }
 
-    let media: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT id, path, scanned_at FROM media WHERE added_at IS NULL")
-            .fetch_all(pool)
-            .await?;
+    // Items carry no path of their own; any of their files will do.
+    let media: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT m.id, MIN(f.path), m.scanned_at
+         FROM media m JOIN media_files f ON f.media_id = m.id
+         WHERE m.added_at IS NULL
+         GROUP BY m.id",
+    )
+    .fetch_all(pool)
+    .await?;
     for (id, path, scanned_at) in media {
         let added = std::fs::metadata(&path)
             .and_then(|m| m.modified())
@@ -499,7 +511,7 @@ pub async fn scan_library_with_progress(
                 }
             }
             Classification::Movie => {
-                match upsert_movie(pool, library_id, &abs, file_size).await {
+                match upsert_movie(pool, library_id, &root, &abs, file_size).await {
                     Ok(Some(out)) => {
                         if out.re_indexed { stats.movies_indexed += 1; } else { stats.movies_skipped += 1; }
                         Some(out)
@@ -518,7 +530,7 @@ pub async fn scan_library_with_progress(
                     .unwrap_or("")
                     .to_string();
                 asset_jobs.push(AssetJob {
-                    media_id: out.id,
+                    file_id: out.file_id,
                     video: abs,
                     title,
                     has_sidecar_image: out.has_sidecar_image,
@@ -611,22 +623,22 @@ pub async fn scan_library_with_progress(
                         return PerFile { job, tech_info: None };
                     }
                     if let Some(p) = &progress {
-                        add_active(p, &job.media_id, &job.title, Stage::Subtitles).await;
+                        add_active(p, &job.file_id, &job.title, Stage::Subtitles).await;
                     }
                     let started = std::time::Instant::now();
-                    let outcome = run_essential(&pool, &job.media_id, &job.video).await;
+                    let outcome = run_essential(&pool, &job.file_id, &job.video).await;
                     let total_ms = started.elapsed().as_millis() as u64;
 
-                    record_essential_timing(&pool, &job.media_id, &outcome, total_ms).await;
+                    record_essential_timing(&pool, &job.file_id, &outcome, total_ms).await;
 
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = job.title.clone();
-                        let media_id = job.media_id.clone();
+                        let file_id = job.file_id.clone();
                         set_progress(p, |s| {
                             s.done = n;
                             s.current = Some(title);
-                            s.active.retain(|j| j.media_id != media_id);
+                            s.active.retain(|j| j.media_id != file_id);
                         })
                         .await;
                     }
@@ -680,25 +692,25 @@ pub async fn scan_library_with_progress(
                         0
                     } else {
                         if let Some(p) = &progress {
-                            add_active(p, &f.job.media_id, &f.job.title, Stage::Thumbnail).await;
+                            add_active(p, &f.job.file_id, &f.job.title, Stage::Thumbnail).await;
                         }
                         let t = std::time::Instant::now();
-                        thumbnails::scan_for_media(&pool, &f.job.media_id, &f.job.video).await;
+                        thumbnails::scan_for_media(&pool, &f.job.file_id, &f.job.video).await;
                         t.elapsed().as_millis() as u64
                     };
                     if let Err(e) = sqlx::query(
-                        "UPDATE media SET thumbnails_version = ? WHERE id = ?",
+                        "UPDATE media_files SET thumbnails_version = ? WHERE id = ?",
                     )
                     .bind(THUMBNAILS_VERSION)
-                    .bind(&f.job.media_id)
+                    .bind(&f.job.file_id)
                     .execute(&pool)
                     .await
                     {
-                        warn!(media_id = %f.job.media_id, %e, "failed to update thumbnails_version");
+                        warn!(file_id = %f.job.file_id, %e, "failed to update thumbnails_version");
                     }
                     record_thumbnail_timing(
                         &pool,
-                        &f.job.media_id,
+                        &f.job.file_id,
                         f.tech_info.as_ref(),
                         thumbnail_ms,
                     )
@@ -706,11 +718,11 @@ pub async fn scan_library_with_progress(
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = f.job.title.clone();
-                        let media_id = f.job.media_id.clone();
+                        let file_id = f.job.file_id.clone();
                         set_progress(p, |s| {
                             s.done = n;
                             s.current = Some(title);
-                            s.active.retain(|j| j.media_id != media_id);
+                            s.active.retain(|j| j.media_id != file_id);
                         })
                         .await;
                     }
@@ -751,7 +763,7 @@ pub async fn scan_library_with_progress(
                         return;
                     }
                     if let Some(p) = &progress {
-                        add_active(p, &f.job.media_id, &f.job.title, Stage::Trickplay).await;
+                        add_active(p, &f.job.file_id, &f.job.title, Stage::Trickplay).await;
                     }
                     // Duration normally comes from pass-1's probe. When only
                     // trickplay is stale (pass 1 was skipped), fall back to
@@ -759,7 +771,7 @@ pub async fn scan_library_with_progress(
                     // definition, so the stored value is authoritative.
                     let duration = match f.tech_info.as_ref().and_then(|i| i.duration_seconds) {
                         Some(d) => Some(d),
-                        None => match super::media_info::load(&pool, &f.job.media_id).await {
+                        None => match super::media_info::load(&pool, &f.job.file_id).await {
                             Ok(Some(info)) => info.duration_seconds,
                             _ => None,
                         },
@@ -767,25 +779,25 @@ pub async fn scan_library_with_progress(
                     let t = std::time::Instant::now();
                     let keyframe_count = trickplay::scan_for_media(
                         &pool,
-                        &f.job.media_id,
+                        &f.job.file_id,
                         &f.job.video,
                         duration,
                     )
                     .await;
                     let trickplay_ms = t.elapsed().as_millis() as u64;
                     if let Err(e) = sqlx::query(
-                        "UPDATE media SET trickplay_version = ? WHERE id = ?",
+                        "UPDATE media_files SET trickplay_version = ? WHERE id = ?",
                     )
                     .bind(TRICKPLAY_VERSION)
-                    .bind(&f.job.media_id)
+                    .bind(&f.job.file_id)
                     .execute(&pool)
                     .await
                     {
-                        warn!(media_id = %f.job.media_id, %e, "failed to update trickplay_version");
+                        warn!(file_id = %f.job.file_id, %e, "failed to update trickplay_version");
                     }
                     record_trickplay_timing(
                         &pool,
-                        &f.job.media_id,
+                        &f.job.file_id,
                         f.tech_info.as_ref(),
                         trickplay_ms,
                         keyframe_count,
@@ -794,11 +806,11 @@ pub async fn scan_library_with_progress(
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(p) = &progress {
                         let title = f.job.title.clone();
-                        let media_id = f.job.media_id.clone();
+                        let file_id = f.job.file_id.clone();
                         set_progress(p, |s| {
                             s.done = n;
                             s.current = Some(title);
-                            s.active.retain(|j| j.media_id != media_id);
+                            s.active.retain(|j| j.media_id != file_id);
                         })
                         .await;
                     }
@@ -931,24 +943,29 @@ async fn analyze_one_season(
     cancel: &Option<CancelToken>,
 ) -> anyhow::Result<()> {
     type Row = (
-        String,      // media id
+        String,      // file id
         String,      // path
-        Option<i64>, // media.content_mtime
-        Option<i64>, // media.content_size
-        i64,         // media.audio_markers_version
+        Option<i64>, // media_files.content_mtime
+        Option<i64>, // media_files.content_size
+        i64,         // media_files.audio_markers_version
         Option<i64>, // fingerprint.content_mtime
         Option<i64>, // fingerprint.content_size
         Option<i64>, // fingerprint.fp_algo_version
     );
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT m.id, m.path, m.content_mtime, m.content_size, m.audio_markers_version,
-                f.content_mtime, f.content_size, f.fp_algo_version
+    // One file per episode — its primary. A second copy of the same episode
+    // would "share" its entire runtime with the first and swamp detection.
+    let sql = format!(
+        "SELECT f.id, f.path, f.content_mtime, f.content_size, f.audio_markers_version,
+                fp.content_mtime, fp.content_size, fp.fp_algo_version
          FROM media m
-         LEFT JOIN media_fingerprints f ON f.media_id = m.id
+         JOIN media_files f ON f.id = {}
+         LEFT JOIN media_fingerprints fp ON fp.file_id = f.id
          WHERE m.show_id = ? AND m.season_number = ? AND m.kind = 'episode'
                AND m.deleted_at IS NULL
          ORDER BY m.episode_number",
-    )
+        super::files::primary_file_id("m.id"),
+    );
+    let rows: Vec<Row> = sqlx::query_as(&sql)
     .bind(show_id)
     .bind(season)
     .fetch_all(pool)
@@ -1000,7 +1017,7 @@ async fn analyze_one_season(
             Ok(Some(info)) => info.duration_seconds.unwrap_or(0.0),
             _ => 0.0,
         };
-        eps.push(super::markers::SeasonEpisode { media_id: id.clone(), duration, fp });
+        eps.push(super::markers::SeasonEpisode { file_id: id.clone(), duration, fp });
     }
     if eps.len() < 2 {
         return Ok(());
@@ -1010,10 +1027,10 @@ async fn analyze_one_season(
     let analyzed_ids: std::collections::HashSet<&str> =
         analyzed.iter().map(|(id, _)| id.as_str()).collect();
     let mut total_markers = 0usize;
-    for (media_id, markers) in &analyzed {
+    for (file_id, markers) in &analyzed {
         total_markers += markers.len();
-        if let Err(e) = super::markers::store_markers(pool, media_id, "audio", markers).await {
-            warn!(%media_id, %e, "audio-match: failed to store markers");
+        if let Err(e) = super::markers::store_markers(pool, file_id, "audio", markers).await {
+            warn!(%file_id, %e, "audio-match: failed to store markers");
         }
     }
 
@@ -1033,7 +1050,7 @@ async fn analyze_one_season(
     // for members that failed to fingerprint — they'll re-trip via the
     // fingerprint-freshness check (no row) on the next run anyway.
     for (id, ..) in &rows {
-        let _ = sqlx::query("UPDATE media SET audio_markers_version = ? WHERE id = ?")
+        let _ = sqlx::query("UPDATE media_files SET audio_markers_version = ? WHERE id = ?")
             .bind(AUDIO_MARKERS_VERSION)
             .bind(id.as_str())
             .execute(pool)
@@ -1092,14 +1109,23 @@ pub async fn prune_libraries(pool: &SqlitePool, active_ids: &[i64]) -> anyhow::R
         .bind(id)
         .execute(pool)
         .await?;
+        sqlx::query(
+            "UPDATE media_files SET deleted_at = ? WHERE library_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
         debug!(library_id = id, "soft-deleted library");
     }
     Ok(removed)
 }
 
 
-/// Soft-delete media rows in this library whose path wasn't seen during the
-/// walk, then soft-delete any show whose entire episode set has vanished.
+/// Soft-delete files in this library whose path wasn't seen during the walk,
+/// merge items that turn out to be the same episode or movie, then
+/// soft-delete items left without a live file and shows left without a live
+/// item.
 ///
 /// Returns the total number of rows soft-deleted. Watch history and other
 /// related rows are preserved; rows can be resurrected by the upsert path
@@ -1110,7 +1136,7 @@ async fn prune_missing(
     seen: &HashSet<String>,
 ) -> anyhow::Result<u64> {
     let existing: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, path FROM media WHERE library_id = ? AND deleted_at IS NULL",
+        "SELECT id, path FROM media_files WHERE library_id = ? AND deleted_at IS NULL",
     )
     .bind(library_id)
     .fetch_all(pool)
@@ -1126,15 +1152,33 @@ async fn prune_missing(
     let mut removed: u64 = 0;
     for id in &to_delete {
         let res = sqlx::query(
-            "UPDATE media SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+            "UPDATE media_files SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(&now)
         .bind(id)
         .execute(pool)
         .await?;
         removed += res.rows_affected();
-        debug!(media_id = %id, "soft-deleted media");
+        debug!(file_id = %id, "soft-deleted file");
     }
+
+    reconcile_duplicates(pool, library_id).await?;
+
+    // Items with no live file: every file was deleted above, or moved to
+    // another item during the walk (an NFO now naming a different episode).
+    let res = sqlx::query(
+        "UPDATE media SET deleted_at = ?
+         WHERE library_id = ? AND deleted_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM media_files f
+                WHERE f.media_id = media.id AND f.deleted_at IS NULL
+           )",
+    )
+    .bind(&now)
+    .bind(library_id)
+    .execute(pool)
+    .await?;
+    removed += res.rows_affected();
 
     // Shows whose every non-soft-deleted episode is gone. A show with zero
     // live episodes is the case we want to act on; previously-soft-deleted
@@ -1167,6 +1211,212 @@ async fn prune_missing(
     Ok(removed)
 }
 
+/// Merge items in this library that are the same episode or movie.
+///
+/// The upserts already attach a new file to the existing item it belongs to,
+/// so this only has work where that couldn't happen: duplicates minted before
+/// items and files were split (migration 0028) — each replaced file used to
+/// strand its watch history on a soft-deleted row — and movies whose tmdb/imdb
+/// id only appeared after both copies were indexed. Cheap when there's
+/// nothing to do: three GROUP BYs over the library.
+async fn reconcile_duplicates(pool: &SqlitePool, library_id: i64) -> anyhow::Result<()> {
+    // The survivor is the oldest item: the one existing links, bookmarks and
+    // history most likely point at. Same order `episode_item` / `movie_item`
+    // pick by, so a scan and a reconcile never disagree about which it is.
+    let episodes: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT show_id, season_number, episode_number FROM media
+         WHERE library_id = ? AND kind = 'episode' AND show_id IS NOT NULL
+           AND season_number IS NOT NULL AND episode_number IS NOT NULL
+         GROUP BY show_id, season_number, episode_number
+         HAVING COUNT(*) > 1",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+    for (show_id, season, episode) in episodes {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM media
+             WHERE kind = 'episode' AND show_id = ? AND season_number = ? AND episode_number = ?
+             ORDER BY added_at, id",
+        )
+        .bind(&show_id)
+        .bind(season)
+        .bind(episode)
+        .fetch_all(pool)
+        .await?;
+        merge_items(pool, &ids).await?;
+    }
+
+    for col in ["tmdb_id", "imdb_id"] {
+        let keys: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT {col} FROM media
+             WHERE library_id = ? AND kind = 'movie' AND COALESCE({col}, '') != ''
+             GROUP BY {col}
+             HAVING COUNT(*) > 1"
+        ))
+        .bind(library_id)
+        .fetch_all(pool)
+        .await?;
+        for key in keys {
+            let ids: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT id FROM media
+                 WHERE library_id = ? AND kind = 'movie' AND {col} = ?
+                 ORDER BY added_at, id"
+            ))
+            .bind(library_id)
+            .bind(&key)
+            .fetch_all(pool)
+            .await?;
+            merge_items(pool, &ids).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Fold `ids[1..]` into `ids[0]`: files, watch history, per-scope state and
+/// analytics move over, then the extras are deleted.
+///
+/// Metadata comes from the most recently scanned member that still has a
+/// live file, since the survivor's may describe a file that's gone (an
+/// episode `-thumb.jpg` deleted along with it, say).
+async fn merge_items(pool: &SqlitePool, ids: &[String]) -> anyhow::Result<()> {
+    let Some((survivor, victims)) = ids.split_first() else {
+        return Ok(());
+    };
+    if victims.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+
+    let mut donor: Option<(&str, String)> = None;
+    for id in ids {
+        let row: Option<(String, bool)> = sqlx::query_as(
+            "SELECT scanned_at,
+                    EXISTS (SELECT 1 FROM media_files f
+                             WHERE f.media_id = media.id AND f.deleted_at IS NULL)
+             FROM media WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((scanned_at, true)) = row {
+            if donor.as_ref().map_or(true, |(_, best)| scanned_at > *best) {
+                donor = Some((id.as_str(), scanned_at));
+            }
+        }
+    }
+    if let Some((donor, _)) = donor.filter(|(d, _)| *d != survivor.as_str()) {
+        sqlx::query(
+            "UPDATE media SET
+                (title, sort_title, original_title, year, plot, runtime_minutes,
+                 imdb_id, tmdb_id, image_path, fanart_path,
+                 rating, rating_votes, rating_source, mpaa, studio, tagline,
+                 release_date, director, writers, scan_version, scanned_at)
+              = (SELECT title, sort_title, original_title, year, plot, runtime_minutes,
+                        imdb_id, tmdb_id, image_path, fanart_path,
+                        rating, rating_votes, rating_source, mpaa, studio, tagline,
+                        release_date, director, writers, scan_version, scanned_at
+                   FROM media WHERE id = ?)
+             WHERE id = ?",
+        )
+        .bind(donor)
+        .bind(survivor)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM media_genres WHERE media_id = ?")
+            .bind(survivor)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE media_genres SET media_id = ? WHERE media_id = ?")
+            .bind(survivor)
+            .bind(donor)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    let survivor_scope = format!("media:{survivor}");
+    for victim in victims {
+        // Per user, keep the newer position and the union of "finished":
+        // `completed` and `last_completed_at` are monotonic by design (see
+        // watch.rs), so a merge must never lose one. SET expressions read the
+        // pre-update row, so every CASE compares against the old timestamp.
+        sqlx::query(
+            "INSERT INTO watch_progress
+                (user_sub, media_id, position_secs, duration_secs, completed,
+                 updated_at, last_completed_at)
+             SELECT user_sub, ?, position_secs, duration_secs, completed,
+                    updated_at, last_completed_at
+               FROM watch_progress WHERE media_id = ?
+             ON CONFLICT(user_sub, media_id) DO UPDATE SET
+                position_secs = CASE WHEN excluded.updated_at > watch_progress.updated_at
+                                     THEN excluded.position_secs
+                                     ELSE watch_progress.position_secs END,
+                duration_secs = CASE WHEN excluded.updated_at > watch_progress.updated_at
+                                     THEN excluded.duration_secs
+                                     ELSE watch_progress.duration_secs END,
+                updated_at    = MAX(excluded.updated_at, watch_progress.updated_at),
+                completed     = MAX(excluded.completed, watch_progress.completed),
+                last_completed_at = NULLIF(MAX(COALESCE(excluded.last_completed_at, 0),
+                                               COALESCE(watch_progress.last_completed_at, 0)), 0)",
+        )
+        .bind(survivor)
+        .bind(victim)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM watch_progress WHERE media_id = ?")
+            .bind(victim)
+            .execute(&mut *tx)
+            .await?;
+
+        // Movie-scoped prefs and rewatch/hide state (`media:<id>`). Episodes
+        // scope by show, which a merge within one show doesn't touch. Where
+        // both have a row, the survivor's stands.
+        let victim_scope = format!("media:{victim}");
+        for table in ["media_preferences", "watch_scope_state"] {
+            sqlx::query(&format!(
+                "UPDATE OR IGNORE {table} SET scope_key = ? WHERE scope_key = ?"
+            ))
+            .bind(&survivor_scope)
+            .bind(&victim_scope)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(&format!("DELETE FROM {table} WHERE scope_key = ?"))
+                .bind(&victim_scope)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        for sql in [
+            "UPDATE media_files       SET media_id = ? WHERE media_id = ?",
+            "UPDATE playback_sessions SET media_id = ? WHERE media_id = ?",
+            "UPDATE events            SET media_id = ? WHERE media_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(survivor)
+                .bind(victim)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM media WHERE id = ?")
+            .bind(victim)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    sqlx::query(
+        "UPDATE media SET deleted_at = NULL
+         WHERE id = ? AND EXISTS (SELECT 1 FROM media_files f
+                                   WHERE f.media_id = media.id AND f.deleted_at IS NULL)",
+    )
+    .bind(survivor)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    info!(%survivor, merged = ?victims, "merged duplicate items");
+    Ok(())
+}
+
 // --- single-file essential + cosmetic refresh (shared by scan + validate-on-read) ---
 
 /// Result of a single-file essential-pass derivation — i.e. the things we
@@ -1190,22 +1440,22 @@ pub struct EssentialOutcome {
 /// during the probe naturally re-triggers on the next read. Logs but
 /// doesn't return individual extractor errors — failure to extract
 /// subtitles still produces an outcome (the audio button will still work).
-async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> EssentialOutcome {
+async fn run_essential(pool: &SqlitePool, file_id: &str, video: &Path) -> EssentialOutcome {
     let signature = stat_signature(video);
 
     let t = std::time::Instant::now();
     let (tech_info, embedded_subs, chapters) = match super::media_info::probe_full(video).await {
         Ok((info, subs, chapters)) => (Some(info), subs, chapters),
         Err(e) => {
-            warn!(%media_id, %e, "ffprobe failed");
+            warn!(%file_id, %e, "ffprobe failed");
             (None, Vec::new(), Vec::new())
         }
     };
     let probe_ms = t.elapsed().as_millis() as u64;
 
     if let Some(info) = tech_info.as_ref() {
-        if let Err(e) = super::media_info::store(pool, media_id, info).await {
-            warn!(%media_id, %e, "failed to cache tech info");
+        if let Err(e) = super::media_info::store(pool, file_id, info).await {
+            warn!(%file_id, %e, "failed to cache tech info");
         }
     }
 
@@ -1214,14 +1464,14 @@ async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> Essen
     // scoped producer) survive an essential re-run.
     let duration = tech_info.as_ref().and_then(|t| t.duration_seconds).unwrap_or(0.0);
     let chapter_markers = super::markers::chapters_to_markers(&chapters, duration);
-    if let Err(e) = super::markers::store_markers(pool, media_id, "chapter", &chapter_markers).await
+    if let Err(e) = super::markers::store_markers(pool, file_id, "chapter", &chapter_markers).await
     {
-        warn!(%media_id, %e, "failed to store chapter markers");
+        warn!(%file_id, %e, "failed to store chapter markers");
     }
 
     let t = std::time::Instant::now();
-    if let Err(e) = subtitles::scan_for_media(pool, media_id, video, &embedded_subs).await {
-        warn!(%media_id, %e, "subtitle scan failed");
+    if let Err(e) = subtitles::scan_for_media(pool, file_id, video, &embedded_subs).await {
+        warn!(%file_id, %e, "subtitle scan failed");
     }
     let subtitles_ms = t.elapsed().as_millis() as u64;
 
@@ -1230,7 +1480,7 @@ async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> Essen
     // extraction succeeded. Failures don't auto-retry; the user re-triggers
     // with a version bump.
     if let Err(e) = sqlx::query(
-        "UPDATE media SET subtitles_version = ?,
+        "UPDATE media_files SET subtitles_version = ?,
                           markers_version  = ?,
                           content_mtime    = ?,
                           content_size     = ?
@@ -1240,11 +1490,11 @@ async fn run_essential(pool: &SqlitePool, media_id: &str, video: &Path) -> Essen
     .bind(MARKERS_VERSION)
     .bind(signature.0)
     .bind(signature.1)
-    .bind(media_id)
+    .bind(file_id)
     .execute(pool)
     .await
     {
-        warn!(%media_id, %e, "failed to stamp content signature / subtitles_version");
+        warn!(%file_id, %e, "failed to stamp content signature / subtitles_version");
     }
 
     EssentialOutcome {
@@ -1329,14 +1579,14 @@ fn source_fields(info: Option<&crate::types::MediaTechInfo>) -> SourceFields {
 /// pass; non-applicable timing columns are 0.
 async fn record_essential_timing(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     outcome: &EssentialOutcome,
     total_ms: u64,
 ) {
     let s = source_fields(outcome.tech_info.as_ref());
     analytics::record_scan_timing(
         pool,
-        media_id,
+        file_id,
         ScanTiming {
             probe_ms: outcome.probe_ms,
             subtitles_ms: outcome.subtitles_ms,
@@ -1362,14 +1612,14 @@ async fn record_essential_timing(
 
 async fn record_thumbnail_timing(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     info: Option<&crate::types::MediaTechInfo>,
     thumbnail_ms: u64,
 ) {
     let s = source_fields(info);
     analytics::record_scan_timing(
         pool,
-        media_id,
+        file_id,
         ScanTiming {
             probe_ms: 0,
             subtitles_ms: 0,
@@ -1395,7 +1645,7 @@ async fn record_thumbnail_timing(
 
 async fn record_trickplay_timing(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     info: Option<&crate::types::MediaTechInfo>,
     trickplay_ms: u64,
     keyframe_count: Option<u32>,
@@ -1403,7 +1653,7 @@ async fn record_trickplay_timing(
     let s = source_fields(info);
     analytics::record_scan_timing(
         pool,
-        media_id,
+        file_id,
         ScanTiming {
             probe_ms: 0,
             subtitles_ms: 0,
@@ -1428,24 +1678,25 @@ async fn record_trickplay_timing(
 }
 
 /// Access-triggered single-file refresh: re-runs the essential pass on
-/// `media_id`'s current path, stamps the content signature, and records
+/// file `file_id`, stamps the content signature, and records
 /// a `scan_timings` row with `trigger='stale_read'`. Updates the global
 /// scan-status channel briefly so the UI surfaces the refresh as a
 /// mini-scan.
 ///
 /// Caller is responsible for de-duplicating concurrent refreshes for the
-/// same `media_id` (see `AppState::refresh_locks`). Returns `Ok(false)` if
-/// the media row is missing or soft-deleted.
+/// same `file_id` (see `AppState::refresh_locks`). Returns `Ok(false)` if
+/// the file row is missing or soft-deleted.
 pub async fn refresh_media_file(
     pool: &SqlitePool,
     progress: Option<&ProgressHandle>,
-    media_id: &str,
+    file_id: &str,
 ) -> anyhow::Result<bool> {
     let row: Option<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT path, title, content_mtime, content_size
-         FROM media WHERE id = ? AND deleted_at IS NULL",
+        "SELECT f.path, m.title, f.content_mtime, f.content_size
+         FROM media_files f JOIN media m ON m.id = f.file_id
+         WHERE f.id = ? AND f.deleted_at IS NULL",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_optional(pool)
     .await?;
     let Some((path, title, old_m, old_s)) = row else {
@@ -1454,15 +1705,15 @@ pub async fn refresh_media_file(
     let video = PathBuf::from(&path);
 
     if let Some(p) = progress {
-        add_active(p, media_id, &title, Stage::Refreshing).await;
+        add_active(p, file_id, &title, Stage::Refreshing).await;
     }
 
     let started = std::time::Instant::now();
-    let outcome = run_essential(pool, media_id, &video).await;
+    let outcome = run_essential(pool, file_id, &video).await;
     let total_ms = started.elapsed().as_millis() as u64;
 
     info!(
-        %media_id,
+        %file_id,
         title,
         old_mtime = ?old_m,
         old_size = ?old_s,
@@ -1475,7 +1726,7 @@ pub async fn refresh_media_file(
     let s = source_fields(outcome.tech_info.as_ref());
     analytics::record_scan_timing(
         pool,
-        media_id,
+        file_id,
         ScanTiming {
             probe_ms: outcome.probe_ms,
             subtitles_ms: outcome.subtitles_ms,
@@ -1499,7 +1750,7 @@ pub async fn refresh_media_file(
     .await;
 
     if let Some(p) = progress {
-        let mid = media_id.to_string();
+        let mid = file_id.to_string();
         set_progress(p, |s| {
             s.active.retain(|j| j.media_id != mid);
         })
@@ -1510,15 +1761,17 @@ pub async fn refresh_media_file(
 }
 
 /// Background companion to [`refresh_media_file`]: regenerate the
-/// cosmetic assets (thumbnail + trickplay sprite) for a single media row.
+/// cosmetic assets (thumbnail + trickplay sprite) for a single file.
 /// Run after a stale-read refresh has updated the essential data so the
 /// in-flight read could return immediately. Best-effort: failures are
 /// logged and swallowed.
-pub async fn refresh_media_assets(pool: &SqlitePool, media_id: &str) {
+pub async fn refresh_media_assets(pool: &SqlitePool, file_id: &str) {
     let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT path, image_path FROM media WHERE id = ? AND deleted_at IS NULL",
+        "SELECT f.path, m.image_path
+         FROM media_files f JOIN media m ON m.id = f.file_id
+         WHERE f.id = ? AND f.deleted_at IS NULL",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_optional(pool)
     .await
     .ok()
@@ -1529,22 +1782,22 @@ pub async fn refresh_media_assets(pool: &SqlitePool, media_id: &str) {
     let video = PathBuf::from(&path);
 
     if image_path.is_none() {
-        thumbnails::scan_for_media(pool, media_id, &video).await;
+        thumbnails::scan_for_media(pool, file_id, &video).await;
     }
-    let _ = sqlx::query("UPDATE media SET thumbnails_version = ? WHERE id = ?")
+    let _ = sqlx::query("UPDATE media_files SET thumbnails_version = ? WHERE id = ?")
         .bind(THUMBNAILS_VERSION)
-        .bind(media_id)
+        .bind(file_id)
         .execute(pool)
         .await;
 
-    let duration = match super::media_info::load(pool, media_id).await {
+    let duration = match super::media_info::load(pool, file_id).await {
         Ok(Some(info)) => info.duration_seconds,
         _ => None,
     };
-    trickplay::scan_for_media(pool, media_id, &video, duration).await;
-    let _ = sqlx::query("UPDATE media SET trickplay_version = ? WHERE id = ?")
+    trickplay::scan_for_media(pool, file_id, &video, duration).await;
+    let _ = sqlx::query("UPDATE media_files SET trickplay_version = ? WHERE id = ?")
         .bind(TRICKPLAY_VERSION)
-        .bind(media_id)
+        .bind(file_id)
         .execute(pool)
         .await;
 }
@@ -1707,12 +1960,275 @@ async fn upsert_show(
 /// library already supplies one (but the version is still bumped, so the
 /// row doesn't permanently re-trip).
 pub struct UpsertOutcome {
-    pub id: String,
+    pub file_id: String,
     pub has_sidecar_image: bool,
     pub re_indexed: bool,
     pub needs_essential: bool,
     pub needs_thumbnails: bool,
     pub needs_trickplay: bool,
+}
+
+impl UpsertOutcome {
+    fn unchanged(file_id: String, has_sidecar_image: bool) -> Self {
+        Self {
+            file_id,
+            has_sidecar_image,
+            re_indexed: false,
+            needs_essential: false,
+            needs_thumbnails: false,
+            needs_trickplay: false,
+        }
+    }
+}
+
+/// The file row at a path, plus what staleness and re-linking need to know
+/// about the item it currently belongs to.
+#[derive(sqlx::FromRow)]
+struct ExistingFile {
+    id: String,
+    media_id: String,
+    scanned_at: String,
+    deleted_at: Option<String>,
+    subtitles_version: i64,
+    markers_version: i64,
+    thumbnails_version: i64,
+    trickplay_version: i64,
+    content_mtime: Option<i64>,
+    content_size: Option<i64>,
+    item_kind: String,
+    item_scan_version: i64,
+    item_deleted_at: Option<String>,
+}
+
+async fn existing_file(pool: &SqlitePool, path: &str) -> anyhow::Result<Option<ExistingFile>> {
+    Ok(sqlx::query_as(
+        "SELECT f.id, f.media_id, f.scanned_at, f.deleted_at,
+                f.subtitles_version, f.markers_version, f.thumbnails_version, f.trickplay_version,
+                f.content_mtime, f.content_size,
+                m.kind AS item_kind, m.scan_version AS item_scan_version,
+                m.deleted_at AS item_deleted_at
+         FROM media_files f
+         JOIN media m ON m.id = f.media_id
+         WHERE f.path = ?",
+    )
+    .bind(path)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Which parts of an upsert a file needs. See [`UpsertOutcome`] for what
+/// each asset flag gates.
+struct Staleness {
+    reindex: bool,
+    needs_essential: bool,
+    needs_thumbnails: bool,
+    needs_trickplay: bool,
+}
+
+impl Staleness {
+    /// A path never seen before: every pass runs.
+    const NEW_FILE: Self = Self {
+        reindex: true,
+        needs_essential: true,
+        needs_thumbnails: true,
+        needs_trickplay: true,
+    };
+
+    fn any(&self) -> bool {
+        self.reindex || self.needs_essential || self.needs_thumbnails || self.needs_trickplay
+    }
+}
+
+/// Staleness via the content signature (mtime,size) — bidirectional so an
+/// in-place file swap with a preserved/backdated mtime is detected.
+/// `content_unknown` covers pre-fix rows: the essential pass runs to backfill
+/// the signature, but the heavier cosmetic passes don't fire (forward-only
+/// repair — avoids a library-wide trickplay storm after the migration).
+/// Sidecar-only sources (`nfo` + parent dir mtime) still force a metadata
+/// re-upsert through `any_newer_than`; the video itself is covered by the
+/// signature. A soft-deleted file or item coming back re-runs everything.
+fn staleness(f: &ExistingFile, video: &Path, file_size: i64, nfo: Option<&Path>) -> Staleness {
+    let mut sidecar_sources: Vec<&Path> = Vec::new();
+    if let Some(n) = nfo {
+        sidecar_sources.push(n);
+    }
+    if let Some(parent) = video.parent() {
+        sidecar_sources.push(parent);
+    }
+    let stored_sig = match (f.content_mtime, f.content_size) {
+        (Some(m), Some(s)) => Some((m, s)),
+        _ => None,
+    };
+    let cur_sig = (mtime_secs(video), file_size);
+    let content_changed = stored_sig.is_some() && stored_sig != Some(cur_sig);
+    let content_unknown = stored_sig.is_none();
+    let returned = f.deleted_at.is_some() || f.item_deleted_at.is_some();
+    let sidecars_changed = any_newer_than(&sidecar_sources, &f.scanned_at);
+    Staleness {
+        reindex: returned
+            || content_changed
+            || sidecars_changed
+            || f.item_scan_version != MEDIA_SCAN_VERSION,
+        needs_essential: returned
+            || content_changed
+            || content_unknown
+            || f.subtitles_version < SUBTITLES_VERSION
+            || f.markers_version < MARKERS_VERSION,
+        needs_thumbnails: returned || content_changed || f.thumbnails_version < THUMBNAILS_VERSION,
+        needs_trickplay: returned || content_changed || f.trickplay_version < TRICKPLAY_VERSION,
+    }
+}
+
+/// Point the file row at `path` at item `media_id`, creating it on first
+/// sight. Keeps the file's id when it moves between items, so everything
+/// derived from its bytes (subtitles, trickplay, markers, HLS cache) moves
+/// with it rather than being rebuilt. Returns the file id.
+async fn upsert_file(
+    pool: &SqlitePool,
+    existing: Option<&ExistingFile>,
+    media_id: &str,
+    library_id: i64,
+    path: &str,
+    file_size: i64,
+    added_at: &str,
+) -> anyhow::Result<String> {
+    let id = existing
+        .map(|f| f.id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    sqlx::query(
+        "INSERT INTO media_files (id, media_id, library_id, path, file_size, added_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(path) DO UPDATE SET
+             media_id   = excluded.media_id,
+             file_size  = excluded.file_size,
+             deleted_at = NULL,
+             scanned_at = datetime('now')",
+    )
+    .bind(&id)
+    .bind(media_id)
+    .bind(library_id)
+    .bind(path)
+    .bind(file_size)
+    .bind(added_at)
+    .execute(pool)
+    .await?;
+    if let Some(f) = existing.filter(|f| f.media_id != media_id) {
+        info!(path, from = %f.media_id, to = %media_id, "file moved to another item");
+    }
+    Ok(id)
+}
+
+/// The item for episode `(show_id, season, episode)`. This is the lookup
+/// that makes a replaced file keep its history: the new path finds the
+/// episode's existing item — soft-deleted or not — instead of minting one.
+/// `current` (the file's item, if it has one) wins while it still *is* this
+/// episode; otherwise the oldest match, the survivor `reconcile_duplicates`
+/// would pick. A new id only for an episode never seen before.
+async fn episode_item(
+    pool: &SqlitePool,
+    current: Option<&str>,
+    show_id: &str,
+    season: i64,
+    episode: i64,
+) -> anyhow::Result<String> {
+    let found: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM media
+         WHERE kind = 'episode' AND show_id = ? AND season_number = ? AND episode_number = ?
+         ORDER BY (id = ?) DESC, added_at, id
+         LIMIT 1",
+    )
+    .bind(show_id)
+    .bind(season)
+    .bind(episode)
+    .bind(current.unwrap_or(""))
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.unwrap_or_else(|| Uuid::new_v4().to_string()))
+}
+
+/// The item for a movie file. Movies have no key as intrinsic as an
+/// episode's, so in order: the item the file already belongs to; an item
+/// with the same tmdb/imdb id; an item in the same folder whose every file
+/// has vanished from disk (Radarr's upgrade-in-place, NFO or not); otherwise
+/// a new one. The folder rule is skipped at the library root, where
+/// unrelated movies sit side by side.
+async fn movie_item(
+    pool: &SqlitePool,
+    library_id: i64,
+    library_root: &Path,
+    current: Option<&ExistingFile>,
+    tmdb_id: Option<&str>,
+    imdb_id: Option<&str>,
+    video: &Path,
+) -> anyhow::Result<String> {
+    if let Some(f) = current.filter(|f| f.item_kind == "movie") {
+        return Ok(f.media_id.clone());
+    }
+    let tmdb_id = tmdb_id.filter(|s| !s.is_empty());
+    let imdb_id = imdb_id.filter(|s| !s.is_empty());
+    if tmdb_id.is_some() || imdb_id.is_some() {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM media
+             WHERE kind = 'movie' AND library_id = ?
+               AND (tmdb_id = ? OR imdb_id = ?)
+             ORDER BY added_at, id
+             LIMIT 1",
+        )
+        .bind(library_id)
+        .bind(tmdb_id)
+        .bind(imdb_id)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(id) = found {
+            return Ok(id);
+        }
+    }
+    if let Some(dir) = video.parent().filter(|d| *d != library_root) {
+        if let Some(id) = orphaned_movie_in(pool, library_id, dir).await? {
+            return Ok(id);
+        }
+    }
+    Ok(Uuid::new_v4().to_string())
+}
+
+/// A movie item with a file directly in `dir` and no file left on disk
+/// anywhere — the old half of a replacement the walk hasn't pruned yet.
+async fn orphaned_movie_in(
+    pool: &SqlitePool,
+    library_id: i64,
+    dir: &Path,
+) -> anyhow::Result<Option<String>> {
+    let escaped = dir
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r"SELECT f.media_id, f.path FROM media_files f
+          JOIN media m ON m.id = f.media_id
+          WHERE m.kind = 'movie' AND m.library_id = ? AND f.path LIKE ? ESCAPE '\'
+          ORDER BY m.added_at, m.id",
+    )
+    .bind(library_id)
+    .bind(format!("{escaped}/%"))
+    .fetch_all(pool)
+    .await?;
+
+    let mut checked: HashSet<String> = HashSet::new();
+    for (media_id, path) in rows {
+        if Path::new(&path).parent() != Some(dir) || !checked.insert(media_id.clone()) {
+            continue;
+        }
+        let paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM media_files WHERE media_id = ?")
+                .bind(&media_id)
+                .fetch_all(pool)
+                .await?;
+        if !paths.iter().any(|p| Path::new(p).is_file()) {
+            return Ok(Some(media_id));
+        }
+    }
+    Ok(None)
 }
 
 /// First contiguous run of ASCII digits parsed as i64. Used by the
@@ -1774,97 +2290,14 @@ async fn upsert_episode(
     let nfo_path = video.with_extension("nfo");
     let nfo_opt = nfo_path.is_file().then_some(nfo_path);
 
-    type ExistingRow = (
-        String,
-        String,
-        i64,
-        i64,
-        Option<String>,
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-        Option<i64>,
-    );
-    let existing: Option<ExistingRow> = sqlx::query_as(
-        "SELECT id, scanned_at, file_size, scan_version, deleted_at,
-                subtitles_version, markers_version, thumbnails_version, trickplay_version,
-                content_mtime, content_size
-         FROM media WHERE path = ?",
-    )
-    .bind(&path_str)
-    .fetch_optional(pool)
-    .await?;
-
-    // Compute staleness via the content signature (mtime,size) — bidirectional
-    // so an in-place file swap with a preserved/backdated mtime is detected.
-    // `content_unknown` covers pre-fix rows: the essential pass runs to backfill the
-    // signature, but the heavier cosmetic passes don't fire (forward-only
-    // repair — avoids a library-wide trickplay storm after the migration).
-    // Sidecar-only sources (NFO + parent dir mtime) still force a metadata
-    // re-upsert through the existing `any_newer_than` path; the video itself
-    // is covered by the signature.
-    let (file_changed, metadata_stale, needs_essential, needs_thumbnails, needs_trickplay) =
-        if let Some((
-            _,
-            scanned_at,
-            _existing_size,
-            scan_version,
-            deleted_at,
-            sv,
-            mv,
-            tv,
-            pv,
-            cm,
-            cs,
-        )) = &existing
-        {
-            let mut sidecar_sources: Vec<&Path> = Vec::new();
-            if let Some(n) = nfo_opt.as_ref() {
-                sidecar_sources.push(n);
-            }
-            if let Some(parent) = video.parent() {
-                sidecar_sources.push(parent);
-            }
-            let stored_sig: Option<(i64, i64)> = match (cm, cs) {
-                (Some(m), Some(s)) => Some((*m, *s)),
-                _ => None,
-            };
-            let cur_sig = (mtime_secs(video), file_size);
-            let content_changed =
-                stored_sig.is_some() && stored_sig != Some(cur_sig);
-            let content_unknown = stored_sig.is_none();
-            let sidecars_changed = any_newer_than(&sidecar_sources, scanned_at);
-            let file_changed =
-                deleted_at.is_some() || content_changed || sidecars_changed;
-            let metadata_stale = *scan_version != MEDIA_SCAN_VERSION;
-            (
-                file_changed,
-                metadata_stale,
-                deleted_at.is_some()
-                    || content_changed
-                    || content_unknown
-                    || *sv < SUBTITLES_VERSION
-                    || *mv < MARKERS_VERSION,
-                deleted_at.is_some() || content_changed || *tv < THUMBNAILS_VERSION,
-                deleted_at.is_some() || content_changed || *pv < TRICKPLAY_VERSION,
-            )
-        } else {
-            // New row — treat as fully stale so every pass runs.
-            (true, true, true, true, true)
-        };
-
-    if !file_changed && !metadata_stale && !needs_essential && !needs_thumbnails && !needs_trickplay {
-        let id = existing.as_ref().map(|r| r.0.clone()).unwrap_or_default();
-        return Ok(Some(UpsertOutcome {
-            id,
-            has_sidecar_image: find_episode_thumb(video).is_some(),
-            re_indexed: false,
-            needs_essential: false,
-            needs_thumbnails: false,
-            needs_trickplay: false,
-        }));
+    let existing = existing_file(pool, &path_str).await?;
+    let stale = match &existing {
+        Some(f) => staleness(f, video, file_size, nfo_opt.as_deref()),
+        None => Staleness::NEW_FILE,
+    };
+    if !stale.any() {
+        let id = existing.map(|f| f.id).unwrap_or_default();
+        return Ok(Some(UpsertOutcome::unchanged(id, find_episode_thumb(video).is_some())));
     }
 
     let nfo: EpisodeNfo = nfo_opt
@@ -1893,55 +2326,41 @@ async fn upsert_episode(
     let sort_title = filename::sort_title(&title);
     let thumb = find_episode_thumb(video).map(|p| p.to_string_lossy().into_owned());
 
-    let id = existing
-        .map(|r| r.0)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let media_id = episode_item(
+        pool,
+        existing.as_ref().map(|f| f.media_id.as_str()),
+        show_id,
+        season,
+        episode,
+    )
+    .await?;
 
+    // `added_at` is only written on insert: an item's "added" is when the
+    // episode first appeared, which a replacement file shouldn't reset.
     let added_at = file_added_at(video);
     sqlx::query(
         r#"
         INSERT INTO media (
-            id, library_id, kind, path, file_size,
+            id, library_id, kind,
             title, sort_title, plot, runtime_minutes, image_path,
             show_id, season_number, episode_number, added_at, scan_version,
             release_date
         )
-        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(path) DO UPDATE SET
-            kind            = 'episode',
+        VALUES (?, ?, 'episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
             title           = excluded.title,
             sort_title      = excluded.sort_title,
             plot            = excluded.plot,
             runtime_minutes = excluded.runtime_minutes,
             image_path      = excluded.image_path,
-            show_id         = excluded.show_id,
-            season_number   = excluded.season_number,
-            episode_number  = excluded.episode_number,
-            file_size       = excluded.file_size,
             scan_version    = excluded.scan_version,
             release_date    = excluded.release_date,
             deleted_at      = NULL,
-            -- clear movie-only fields in case this row was previously a movie
-            original_title  = NULL,
-            year            = NULL,
-            imdb_id         = NULL,
-            tmdb_id         = NULL,
-            fanart_path     = NULL,
-            rating          = NULL,
-            rating_votes    = NULL,
-            rating_source   = NULL,
-            mpaa            = NULL,
-            studio          = NULL,
-            tagline         = NULL,
-            director        = NULL,
-            writers         = NULL,
             scanned_at      = datetime('now')
         "#,
     )
-    .bind(&id)
+    .bind(&media_id)
     .bind(library_id)
-    .bind(&path_str)
-    .bind(file_size)
     .bind(&title)
     .bind(&sort_title)
     .bind(&nfo.plot)
@@ -1956,26 +2375,38 @@ async fn upsert_episode(
     .execute(pool)
     .await?;
 
+    let file_id = upsert_file(
+        pool,
+        existing.as_ref(),
+        &media_id,
+        library_id,
+        &path_str,
+        file_size,
+        &added_at,
+    )
+    .await?;
+
     // Episodes inherit genres from their show; no per-episode genre table needed.
     sqlx::query("DELETE FROM media_genres WHERE media_id = ?")
-        .bind(&id)
+        .bind(&media_id)
         .execute(pool)
         .await?;
 
     debug!(title, season, episode, "indexed episode");
     Ok(Some(UpsertOutcome {
-        id,
+        file_id,
         has_sidecar_image: thumb.is_some(),
         re_indexed: true,
-        needs_essential,
-        needs_thumbnails,
-        needs_trickplay,
+        needs_essential: stale.needs_essential,
+        needs_thumbnails: stale.needs_thumbnails,
+        needs_trickplay: stale.needs_trickplay,
     }))
 }
 
 async fn upsert_movie(
     pool: &SqlitePool,
     library_id: i64,
+    library_root: &Path,
     video: &Path,
     file_size: i64,
 ) -> anyhow::Result<Option<UpsertOutcome>> {
@@ -1983,92 +2414,17 @@ async fn upsert_movie(
     let base = video.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled");
     let nfo_path = matching_nfo(video);
 
-    type ExistingRow = (
-        String,
-        String,
-        i64,
-        i64,
-        Option<String>,
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-        Option<i64>,
-    );
-    let existing: Option<ExistingRow> = sqlx::query_as(
-        "SELECT id, scanned_at, file_size, scan_version, deleted_at,
-                subtitles_version, markers_version, thumbnails_version, trickplay_version,
-                content_mtime, content_size
-         FROM media WHERE path = ?",
-    )
-    .bind(&path_str)
-    .fetch_optional(pool)
-    .await?;
-
-    // Same logic as upsert_episode: bidirectional (mtime,size) signature for
-    // the video, sidecar mtime check for NFO / poster / fanart / thumb (the
-    // parent dir's mtime bumps when any sidecar is added or removed on most
-    // filesystems).
-    let (file_changed, metadata_stale, needs_essential, needs_thumbnails, needs_trickplay) =
-        if let Some((
-            _,
-            scanned_at,
-            _existing_size,
-            scan_version,
-            deleted_at,
-            sv,
-            mv,
-            tv,
-            pv,
-            cm,
-            cs,
-        )) = &existing
-        {
-            let mut sidecar_sources: Vec<&Path> = Vec::new();
-            if let Some(n) = nfo_path.as_ref() {
-                sidecar_sources.push(n);
-            }
-            if let Some(parent) = video.parent() {
-                sidecar_sources.push(parent);
-            }
-            let stored_sig: Option<(i64, i64)> = match (cm, cs) {
-                (Some(m), Some(s)) => Some((*m, *s)),
-                _ => None,
-            };
-            let cur_sig = (mtime_secs(video), file_size);
-            let content_changed =
-                stored_sig.is_some() && stored_sig != Some(cur_sig);
-            let content_unknown = stored_sig.is_none();
-            let sidecars_changed = any_newer_than(&sidecar_sources, scanned_at);
-            let file_changed =
-                deleted_at.is_some() || content_changed || sidecars_changed;
-            let metadata_stale = *scan_version != MEDIA_SCAN_VERSION;
-            (
-                file_changed,
-                metadata_stale,
-                deleted_at.is_some()
-                    || content_changed
-                    || content_unknown
-                    || *sv < SUBTITLES_VERSION
-                    || *mv < MARKERS_VERSION,
-                deleted_at.is_some() || content_changed || *tv < THUMBNAILS_VERSION,
-                deleted_at.is_some() || content_changed || *pv < TRICKPLAY_VERSION,
-            )
-        } else {
-            (true, true, true, true, true)
-        };
-
-    if !file_changed && !metadata_stale && !needs_essential && !needs_thumbnails && !needs_trickplay {
-        let id = existing.as_ref().map(|r| r.0.clone()).unwrap_or_default();
-        return Ok(Some(UpsertOutcome {
-            id,
-            has_sidecar_image: find_movie_image(video).is_some(),
-            re_indexed: false,
-            needs_essential: false,
-            needs_thumbnails: false,
-            needs_trickplay: false,
-        }));
+    // Same staleness as episodes: the parent dir's mtime bumps when any
+    // sidecar (poster / fanart / thumb) is added or removed on most
+    // filesystems.
+    let existing = existing_file(pool, &path_str).await?;
+    let stale = match &existing {
+        Some(f) => staleness(f, video, file_size, nfo_path.as_deref()),
+        None => Staleness::NEW_FILE,
+    };
+    if !stale.any() {
+        let id = existing.map(|f| f.id).unwrap_or_default();
+        return Ok(Some(UpsertOutcome::unchanged(id, find_movie_image(video).is_some())));
     }
 
     let nfo: MovieNfo = nfo_path
@@ -2085,9 +2441,16 @@ async fn upsert_movie(
     let image = find_movie_image(video).map(|p| p.to_string_lossy().into_owned());
     let fanart = find_movie_fanart(video).map(|p| p.to_string_lossy().into_owned());
 
-    let id = existing
-        .map(|r| r.0)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let media_id = movie_item(
+        pool,
+        library_id,
+        library_root,
+        existing.as_ref(),
+        nfo.tmdb_id(),
+        nfo.imdb_id(),
+        video,
+    )
+    .await?;
 
     let (rating, rating_votes, rating_source) = match nfo.primary_rating() {
         Some((v, votes, src)) => (Some(v), votes, Some(src)),
@@ -2101,15 +2464,14 @@ async fn upsert_movie(
     sqlx::query(
         r#"
         INSERT INTO media (
-            id, library_id, kind, path, file_size,
+            id, library_id, kind,
             title, sort_title, original_title, year, plot, runtime_minutes,
             imdb_id, tmdb_id, image_path, fanart_path, added_at, scan_version,
             rating, rating_votes, rating_source, mpaa, studio,
             tagline, release_date, director, writers
         )
-        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(path) DO UPDATE SET
-            kind            = 'movie',
+        VALUES (?, ?, 'movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
             title           = excluded.title,
             sort_title      = excluded.sort_title,
             original_title  = excluded.original_title,
@@ -2120,7 +2482,6 @@ async fn upsert_movie(
             tmdb_id         = excluded.tmdb_id,
             image_path      = excluded.image_path,
             fanart_path     = excluded.fanart_path,
-            file_size       = excluded.file_size,
             scan_version    = excluded.scan_version,
             rating          = excluded.rating,
             rating_votes    = excluded.rating_votes,
@@ -2132,17 +2493,11 @@ async fn upsert_movie(
             director        = excluded.director,
             writers         = excluded.writers,
             deleted_at      = NULL,
-            -- clear episode-only fields in case this was previously an episode
-            show_id         = NULL,
-            season_number   = NULL,
-            episode_number  = NULL,
             scanned_at      = datetime('now')
         "#,
     )
-    .bind(&id)
+    .bind(&media_id)
     .bind(library_id)
-    .bind(&path_str)
-    .bind(file_size)
     .bind(&title)
     .bind(&sort_title)
     .bind(&nfo.original_title)
@@ -2167,13 +2522,24 @@ async fn upsert_movie(
     .execute(pool)
     .await?;
 
+    let file_id = upsert_file(
+        pool,
+        existing.as_ref(),
+        &media_id,
+        library_id,
+        &path_str,
+        file_size,
+        &added_at,
+    )
+    .await?;
+
     sqlx::query("DELETE FROM media_genres WHERE media_id = ?")
-        .bind(&id)
+        .bind(&media_id)
         .execute(pool)
         .await?;
     for g in &nfo.genre {
         sqlx::query("INSERT OR IGNORE INTO media_genres (media_id, genre) VALUES (?, ?)")
-            .bind(&id)
+            .bind(&media_id)
             .bind(g)
             .execute(pool)
             .await?;
@@ -2181,11 +2547,260 @@ async fn upsert_movie(
 
     debug!(title, "indexed movie");
     Ok(Some(UpsertOutcome {
-        id,
+        file_id,
         has_sidecar_image: image.is_some(),
         re_indexed: true,
-        needs_essential,
-        needs_thumbnails,
-        needs_trickplay,
+        needs_essential: stale.needs_essential,
+        needs_thumbnails: stale.needs_thumbnails,
+        needs_trickplay: stale.needs_trickplay,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Item identity across file churn, end to end: a real migrated DB, real
+    //! files on disk, full scans. The files are junk bytes, so the probe and
+    //! asset passes fail softly — only indexing and pruning matter here.
+    use super::*;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        pool: SqlitePool,
+        library_id: i64,
+    }
+
+    async fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = super::super::db::connect(&dir.path().join("test.db")).await.unwrap();
+        let library_id = ensure_library(&pool, "test", &root).await.unwrap();
+        Fixture { root: root.canonicalize().unwrap(), _dir: dir, pool, library_id }
+    }
+
+    impl Fixture {
+        fn write(&self, rel: &str, body: &[u8]) -> PathBuf {
+            let p = self.root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+            p
+        }
+
+        async fn scan(&self) {
+            scan_library_with_progress(&self.pool, self.library_id, &self.root, None, None)
+                .await
+                .unwrap();
+        }
+
+        /// Live item ids for an episode.
+        async fn episode_ids(&self, season: i64, episode: i64) -> Vec<String> {
+            sqlx::query_scalar(
+                "SELECT id FROM media WHERE kind = 'episode' AND deleted_at IS NULL
+                   AND season_number = ? AND episode_number = ?",
+            )
+            .bind(season)
+            .bind(episode)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn live_movie_ids(&self) -> Vec<String> {
+            sqlx::query_scalar("SELECT id FROM media WHERE kind = 'movie' AND deleted_at IS NULL")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap()
+        }
+
+        async fn set_progress(&self, media_id: &str, position: f64, updated_at: i64) {
+            sqlx::query(
+                "INSERT INTO watch_progress (user_sub, media_id, position_secs, duration_secs, completed, updated_at)
+                 VALUES ('u', ?, ?, 1400.0, 0, ?)",
+            )
+            .bind(media_id)
+            .bind(position)
+            .bind(updated_at)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        async fn progress(&self, media_id: &str) -> Option<f64> {
+            sqlx::query_scalar(
+                "SELECT position_secs FROM watch_progress WHERE user_sub = 'u' AND media_id = ?",
+            )
+            .bind(media_id)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn primary_path(&self, media_id: &str) -> Option<String> {
+            super::super::files::primary(&self.pool, media_id)
+                .await
+                .unwrap()
+                .map(|f| f.path)
+        }
+    }
+
+    const TVSHOW_NFO: &[u8] = b"<tvshow><title>Show</title></tvshow>";
+
+    #[tokio::test]
+    async fn replacing_an_episode_file_keeps_its_item() {
+        let fx = fixture().await;
+        fx.write("Show/tvshow.nfo", TVSHOW_NFO);
+        let old = fx.write("Show/Season 01/Show - S01E02 - WEBDL-720p.mkv", b"old");
+        fx.scan().await;
+        let ids = fx.episode_ids(1, 2).await;
+        assert_eq!(ids.len(), 1);
+        let item = ids[0].clone();
+        fx.set_progress(&item, 600.0, 100).await;
+
+        // Sonarr-style upgrade: new name, new bytes, old file gone.
+        std::fs::remove_file(&old).unwrap();
+        let new = fx.write("Show/Season 01/Show - S01E02 - Bluray-1080p.mkv", b"new and bigger");
+        fx.scan().await;
+
+        assert_eq!(fx.episode_ids(1, 2).await, vec![item.clone()]);
+        assert_eq!(fx.progress(&item).await, Some(600.0));
+        assert_eq!(
+            fx.primary_path(&item).await.as_deref(),
+            Some(new.canonicalize().unwrap().to_str().unwrap())
+        );
+        let retired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_files WHERE media_id = ? AND deleted_at IS NOT NULL",
+        )
+        .bind(&item)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(retired, 1, "the old file is retired, not re-parented elsewhere");
+    }
+
+    #[tokio::test]
+    async fn two_copies_of_an_episode_are_one_item_playing_the_larger() {
+        let fx = fixture().await;
+        fx.write("Show/tvshow.nfo", TVSHOW_NFO);
+        fx.write("Show/Season 01/Show - S01E03 - 720p.mkv", b"small");
+        let big = fx.write("Show/Season 01/Show - S01E03 - 1080p.mkv", b"considerably larger");
+        fx.scan().await;
+
+        let ids = fx.episode_ids(1, 3).await;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            fx.primary_path(&ids[0]).await.as_deref(),
+            Some(big.canonicalize().unwrap().to_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_folds_a_stranded_pre_split_duplicate_into_the_oldest() {
+        let fx = fixture().await;
+        fx.write("Show/tvshow.nfo", TVSHOW_NFO);
+        fx.write("Show/Season 01/Show - S01E04.mkv", b"current");
+        fx.scan().await;
+        let live = fx.episode_ids(1, 4).await.remove(0);
+        fx.set_progress(&live, 30.0, 200).await;
+
+        // What the old path-keyed schema left behind after a rename: an older,
+        // soft-deleted item for the same episode holding the real history.
+        let show_id: String = sqlx::query_scalar("SELECT show_id FROM media WHERE id = ?")
+            .bind(&live)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO media (id, library_id, kind, title, show_id, season_number, episode_number,
+                                added_at, deleted_at)
+             VALUES ('stranded', ?, 'episode', 'Old', ?, 1, 4, '2020-01-01 00:00:00', '2021-01-01 00:00:00')",
+        )
+        .bind(fx.library_id)
+        .bind(&show_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO media_files (id, media_id, library_id, path, file_size, deleted_at)
+             VALUES ('stranded-file', 'stranded', ?, '/gone/Show - S01E04 - old.mkv', 1, '2021-01-01 00:00:00')",
+        )
+        .bind(fx.library_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO watch_progress (user_sub, media_id, position_secs, duration_secs, completed,
+                                         updated_at, last_completed_at)
+             VALUES ('u', 'stranded', 1350.0, 1400.0, 1, 100, 100)",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+
+        fx.scan().await;
+
+        // The oldest item survives, now live and backed by the current file…
+        assert_eq!(fx.episode_ids(1, 4).await, vec!["stranded".to_string()]);
+        assert!(fx.primary_path("stranded").await.unwrap().ends_with("Show - S01E04.mkv"));
+        // …with the newer position, and "finished" kept even though the
+        // newer row wasn't.
+        let (position, completed, last): (f64, i64, Option<i64>) = sqlx::query_as(
+            "SELECT position_secs, completed, last_completed_at FROM watch_progress
+             WHERE user_sub = 'u' AND media_id = 'stranded'",
+        )
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        assert_eq!((position, completed, last), (30.0, 1, Some(100)));
+        // …and metadata from the member that actually has the file.
+        let title: String = sqlx::query_scalar("SELECT title FROM media WHERE id = 'stranded'")
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        assert_ne!(title, "Old");
+        assert_eq!(fx.progress(&live).await, None);
+    }
+
+    #[tokio::test]
+    async fn upgrading_a_movie_in_its_folder_keeps_its_item() {
+        let fx = fixture().await;
+        let old = fx.write("Film (2020)/Film.2020.720p.mkv", b"old");
+        fx.scan().await;
+        let ids = fx.live_movie_ids().await;
+        assert_eq!(ids.len(), 1);
+        fx.set_progress(&ids[0], 1200.0, 100).await;
+
+        std::fs::remove_file(&old).unwrap();
+        fx.write("Film (2020)/Film.2020.1080p.mkv", b"new");
+        fx.scan().await;
+
+        assert_eq!(fx.live_movie_ids().await, ids);
+        assert_eq!(fx.progress(&ids[0]).await, Some(1200.0));
+    }
+
+    #[tokio::test]
+    async fn movies_side_by_side_at_the_root_stay_separate() {
+        let fx = fixture().await;
+        let a = fx.write("Alpha.2001.mkv", b"a");
+        fx.scan().await;
+        std::fs::remove_file(&a).unwrap();
+        fx.write("Beta.2002.mkv", b"b");
+        fx.scan().await;
+
+        // No folder of its own, no shared id: Beta is a different movie.
+        let ids = fx.live_movie_ids().await;
+        assert_eq!(ids.len(), 1);
+        let title: String = sqlx::query_scalar("SELECT title FROM media WHERE id = ?")
+            .bind(&ids[0])
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "Beta");
+        let alpha_live: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media WHERE title = 'Alpha' AND deleted_at IS NULL")
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(alpha_live, 0);
+    }
 }

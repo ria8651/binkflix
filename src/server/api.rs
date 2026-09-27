@@ -131,12 +131,12 @@ async fn playback_sample(
     // session_id (or to a fabricated one) and pollute analytics. We pull the
     // delivery params in the same round-trip so we can attach authoritative
     // server-side transcode telemetry below.
-    /// `(user_sub, media_id, delivery_mode, audio_idx, target_bitrate_kbps)`
+    /// `(user_sub, file_id, delivery_mode, audio_idx, target_bitrate_kbps)`
     /// as selected from `playback_sessions`.
-    type SessionDeliveryRow = (Option<String>, String, String, Option<i64>, Option<i64>);
+    type SessionDeliveryRow = (Option<String>, Option<String>, String, Option<i64>, Option<i64>);
     let row: Option<SessionDeliveryRow> =
         match sqlx::query_as(
-            "SELECT user_sub, media_id, delivery_mode, audio_idx, target_bitrate_kbps
+            "SELECT user_sub, file_id, delivery_mode, audio_idx, target_bitrate_kbps
              FROM playback_sessions WHERE id = ?",
         )
         .bind(&body.session_id)
@@ -146,7 +146,7 @@ async fn playback_sample(
             Ok(r) => r,
             Err(_) => return StatusCode::NO_CONTENT,
         };
-    let Some((owner, media_id, delivery_mode, audio_idx, target_bitrate)) = row else {
+    let Some((owner, file_id, delivery_mode, audio_idx, target_bitrate)) = row else {
         // Unknown session.
         return StatusCode::FORBIDDEN;
     };
@@ -162,15 +162,20 @@ async fn playback_sample(
     // progress, which only the server can see — fill them from the live
     // producer rather than trusting the client (which leaves them None).
     // `observed_kbps` stays whatever the client reports: it's the viewer's
-    // own network throughput. Resolve the same `(audio_idx, mode_tag)` key
-    // the HLS endpoint cached under so we snapshot the right producer.
-    let (transcode_position_ms, transcode_rate_x100) =
-        match server_transcode_telemetry(&state, &media_id, &delivery_mode, audio_idx, target_bitrate)
-            .await
-        {
-            Some((pos, rate)) => (Some(pos), Some(rate)),
-            None => (None, None),
-        };
+    // own network throughput. Resolve the same `(file_id, audio_idx,
+    // mode_tag)` key the HLS endpoint cached under so we snapshot the right
+    // producer.
+    let telemetry = match file_id.as_deref() {
+        Some(file_id) => {
+            server_transcode_telemetry(&state, file_id, &delivery_mode, audio_idx, target_bitrate)
+                .await
+        }
+        None => None,
+    };
+    let (transcode_position_ms, transcode_rate_x100) = match telemetry {
+        Some((pos, rate)) => (Some(pos), Some(rate)),
+        None => (None, None),
+    };
 
     analytics::record_playback_sample(
         &state.pool,
@@ -207,7 +212,7 @@ async fn playback_sample(
 /// encoder's leading edge in media time is `head × 6000ms`.
 async fn server_transcode_telemetry(
     state: &AppState,
-    media_id: &str,
+    file_id: &str,
     delivery_mode: &str,
     audio_idx: Option<i64>,
     target_bitrate: Option<i64>,
@@ -228,7 +233,7 @@ async fn server_transcode_telemetry(
     let audio_idx = audio_idx.and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
     let snap = state
         .hls_producers
-        .snapshot_by_prefix(media_id, audio_idx, &mode_tag_prefix)
+        .snapshot_by_prefix(file_id, audio_idx, &mode_tag_prefix)
         .await?;
     let position_ms = i64::from(snap.head) * 6000;
     Some((position_ms, i64::from(snap.encode_rate_x100)))
@@ -479,16 +484,21 @@ async fn media(State(state): State<AppState>, Path(id): Path<String>) -> Result<
     // own fanart_path; episodes inherit the parent show's. That way one client
     // check (`m.has_fanart`) governs whether to paint the hero backdrop for
     // *any* detail view, matching how `ShowDetail` works.
-    let mut row = sqlx::query_as::<_, Media>(
+    // `file_size` is the file it would play from right now.
+    let sql = format!(
         "SELECT m.id, m.kind, m.title, m.original_title, m.year, m.plot, m.runtime_minutes,
-                m.imdb_id, m.tmdb_id, m.file_size, m.show_id, m.season_number, m.episode_number,
+                m.imdb_id, m.tmdb_id,
+                COALESCE((SELECT f.file_size FROM media_files f WHERE f.id = {}), 0) AS file_size,
+                m.show_id, m.season_number, m.episode_number,
                 (m.fanart_path IS NOT NULL OR s.fanart_path IS NOT NULL) AS has_fanart,
                 m.rating, m.rating_votes, m.rating_source, m.mpaa, m.studio,
                 m.tagline, m.release_date, m.director, m.writers
          FROM media m
          LEFT JOIN shows s ON s.id = m.show_id AND s.deleted_at IS NULL
          WHERE m.id = ? AND m.deleted_at IS NULL",
-    )
+        super::files::primary_file_id("m.id"),
+    );
+    let mut row = sqlx::query_as::<_, Media>(&sql)
     .bind(&id)
     .fetch_optional(&state.pool)
     .await?
@@ -736,11 +746,20 @@ async fn lookup(state: &AppState, sql: &str, id: &str) -> Result<String> {
     row.and_then(|(p,)| p).ok_or(Error::NotFound)
 }
 
+/// The file item `id` plays from. Every endpoint serving something derived
+/// from the bytes goes through here; 404 when the item has no live file.
+async fn primary_file(state: &AppState, id: &str) -> Result<super::files::FileRef> {
+    super::files::primary(&state.pool, id)
+        .await?
+        .ok_or(Error::NotFound)
+}
+
 async fn media_subtitles(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<crate::types::SubtitleTrack>>> {
-    let tracks = subtitles::list_from_db(&state.pool, &id).await.map_err(Error::Other)?;
+    let file = primary_file(&state, &id).await?;
+    let tracks = subtitles::list_from_db(&state.pool, &file.id).await.map_err(Error::Other)?;
     Ok(Json(tracks))
 }
 
@@ -748,18 +767,19 @@ async fn media_subtitle(
     State(state): State<AppState>,
     Path((id, track_id)): Path<(String, String)>,
 ) -> Result<axum::response::Response> {
-    let (body, content_type) = subtitles::get_from_db(&state.pool, &id, &track_id)
+    let file = primary_file(&state, &id).await?;
+    let (body, content_type) = subtitles::get_from_db(&state.pool, &file.id, &track_id)
         .await
         .map_err(Error::Other)?
         .ok_or(Error::NotFound)?;
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    // Subtitle content is immutable for a given media row + track_id;
-    // safe to let browsers cache for a while.
+    // Addressed by item, so a replaced file can put different content
+    // behind the same track id — keep the cache short.
     headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=3600"),
+        HeaderValue::from_static("private, max-age=60"),
     );
     Ok((StatusCode::OK, headers, body).into_response())
 }
@@ -776,7 +796,8 @@ async fn media_tech(
     // (scan hasn't reached this row yet, or first probe failed) falls
     // through to a live probe — same shape as the validated path so the
     // freshly-stored result also gets a signature stamp on the next scan.
-    let fresh = media_info::load_fresh(&state, &id).await.map_err(Error::Other)?;
+    let file = primary_file(&state, &id).await?;
+    let fresh = media_info::load_fresh(&state, &file.id).await.map_err(Error::Other)?;
     if let Some(info) = fresh.info {
         let mut resp = Json(info).into_response();
         if fresh.refreshed {
@@ -789,16 +810,10 @@ async fn media_tech(
         }
         return Ok(resp);
     }
-    let path = lookup(
-        &state,
-        "SELECT path FROM media WHERE id = ? AND deleted_at IS NULL",
-        &id,
-    )
-    .await?;
-    let info = media_info::probe(std::path::Path::new(&path))
+    let info = media_info::probe(std::path::Path::new(&file.path))
         .await
         .map_err(Error::Other)?;
-    let _ = media_info::store(&state.pool, &id, &info).await;
+    let _ = media_info::store(&state.pool, &file.id, &info).await;
     Ok(Json(info).into_response())
 }
 
@@ -808,8 +823,9 @@ async fn media_image(
     req: Request,
 ) -> Result<axum::response::Response> {
     // Prefer the sidecar image the library ships — it's authoritative
-    // (posters, episode thumbnails). Fall back to the DB-cached generated
-    // thumbnail so we don't hit the source drive on every grid render.
+    // (posters, episode thumbnails). Fall back to the DB-cached thumbnail
+    // generated from the item's primary file so we don't hit the source
+    // drive on every grid render.
     let sidecar: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT image_path FROM media WHERE id = ? AND deleted_at IS NULL",
     )
@@ -820,7 +836,10 @@ async fn media_image(
         return serve(path, req).await;
     }
 
-    if let Some((bytes, mime)) = thumbnails::get_from_db(&state.pool, &id)
+    let Some(file) = super::files::primary(&state.pool, &id).await? else {
+        return Err(Error::NotFound);
+    };
+    if let Some((bytes, mime)) = thumbnails::get_from_db(&state.pool, &file.id)
         .await
         .map_err(Error::Other)?
     {
@@ -843,15 +862,19 @@ async fn media_trickplay_manifest(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response> {
-    match trickplay::get_manifest(&state.pool, &id)
+    let file = primary_file(&state, &id).await?;
+    match trickplay::get_manifest(&state.pool, &file.id)
         .await
         .map_err(Error::Other)?
     {
         Some(m) => {
+            // Short-lived: the manifest's `version` is what tells the player
+            // the file behind this item changed, so it can't be immutable
+            // the way the versioned sprite URL is.
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400, immutable"),
+                HeaderValue::from_static("private, max-age=60"),
             );
             Ok((StatusCode::OK, headers, Json(m)).into_response())
         }
@@ -863,7 +886,10 @@ async fn media_trickplay_sprite(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::response::Response> {
-    match trickplay::get_sprite(&state.pool, &id)
+    // Cached `immutable` because the player requests it with the manifest's
+    // `?v=` version, which changes whenever the sprite does.
+    let file = primary_file(&state, &id).await?;
+    match trickplay::get_sprite(&state.pool, &file.id)
         .await
         .map_err(Error::Other)?
     {
@@ -890,7 +916,8 @@ async fn media_markers(
     // Validate-on-read for chapter markers: a file swap re-derives them via
     // the shared single-file refresh (see `markers::load_fresh`). Audio
     // markers are season-scoped and refreshed by the scanner, not here.
-    let resp = markers::load_fresh(&state, &id).await.map_err(Error::Other)?;
+    let file = primary_file(&state, &id).await?;
+    let resp = markers::load_fresh(&state, &file.id).await.map_err(Error::Other)?;
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CACHE_CONTROL,

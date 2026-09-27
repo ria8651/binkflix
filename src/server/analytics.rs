@@ -58,16 +58,16 @@ pub struct ScanTiming {
     pub trigger: &'static str,
 }
 
-pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming) {
+pub async fn record_scan_timing(pool: &SqlitePool, file_id: &str, t: ScanTiming) {
     let res = sqlx::query(
         "INSERT INTO scan_timings
-            (media_id, scanned_at, probe_ms, subtitles_ms, subtitle_tracks,
+            (file_id, scanned_at, probe_ms, subtitles_ms, subtitle_tracks,
              thumbnail_ms, trickplay_ms, save_ms, total_ms,
              video_codec, audio_codec, container, width, height,
              duration_ms, bitrate_kbps, pixel_format, keyframe_count, trigger)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(media_id)
+    .bind(file_id)
     .bind(now_secs())
     .bind(t.probe_ms as i64)
     .bind(t.subtitles_ms as i64)
@@ -89,7 +89,7 @@ pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming
     .execute(pool)
     .await;
     if let Err(e) = res {
-        tracing::warn!(%media_id, %e, "failed to record scan_timings row");
+        tracing::warn!(%file_id, %e, "failed to record scan_timings row");
     }
 }
 
@@ -99,7 +99,10 @@ pub async fn record_scan_timing(pool: &SqlitePool, media_id: &str, t: ScanTiming
 pub struct PlaybackSessionStart<'a> {
     pub id: &'a str,
     pub user_sub: Option<&'a str>,
+    /// The item watched.
     pub media_id: &'a str,
+    /// The file served for it.
+    pub file_id: &'a str,
     pub delivery_mode: &'a str,
     pub chosen_reason: Option<&'a str>,
     pub src_video_codec: Option<&'a str>,
@@ -118,16 +121,17 @@ pub struct PlaybackSessionStart<'a> {
 pub async fn open_playback_session(pool: &SqlitePool, s: PlaybackSessionStart<'_>) {
     let res = sqlx::query(
         "INSERT INTO playback_sessions
-            (id, user_sub, media_id, started_at, delivery_mode, chosen_reason,
+            (id, user_sub, media_id, file_id, started_at, delivery_mode, chosen_reason,
              src_video_codec, src_audio_codec, src_container,
              out_video_codec, out_audio_codec, out_container,
              target_bitrate_kbps, browser, room_id, audio_idx, forced_via_query,
              server_build_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(s.id)
     .bind(s.user_sub)
     .bind(s.media_id)
+    .bind(s.file_id)
     .bind(now_secs())
     .bind(s.delivery_mode)
     .bind(s.chosen_reason)

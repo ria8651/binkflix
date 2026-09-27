@@ -30,14 +30,14 @@ fn is_text_codec(codec: &str) -> bool {
 
 // ---- public: API-facing DB queries ----
 
-/// List the subtitle tracks previously extracted for a media row.
-pub async fn list_from_db(pool: &SqlitePool, media_id: &str) -> anyhow::Result<Vec<SubtitleTrack>> {
+/// List the subtitle tracks previously extracted for a file.
+pub async fn list_from_db(pool: &SqlitePool, file_id: &str) -> anyhow::Result<Vec<SubtitleTrack>> {
     let rows = sqlx::query_as::<_, (String, String, String, String, i64, i64)>(
         "SELECT track_id, format, language, label, is_default, is_forced
-         FROM subtitles WHERE media_id = ?
+         FROM subtitles WHERE file_id = ?
          ORDER BY is_default DESC, track_id",
     )
-    .bind(media_id)
+    .bind(file_id)
     .fetch_all(pool)
     .await?;
 
@@ -57,13 +57,13 @@ pub async fn list_from_db(pool: &SqlitePool, media_id: &str) -> anyhow::Result<V
 /// Fetch a single track's content + content-type from the DB.
 pub async fn get_from_db(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     track_id: &str,
 ) -> anyhow::Result<Option<(Vec<u8>, &'static str)>> {
     let row: Option<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT format, content FROM subtitles WHERE media_id = ? AND track_id = ?",
+        "SELECT format, content FROM subtitles WHERE file_id = ? AND track_id = ?",
     )
-    .bind(media_id)
+    .bind(file_id)
     .bind(track_id)
     .fetch_optional(pool)
     .await?;
@@ -80,7 +80,7 @@ pub async fn get_from_db(
 // ---- public: scan-time population ----
 
 /// Extract every usable subtitle track for `video` (sidecars + embedded) and
-/// (re)populate the `subtitles` rows for `media_id`.
+/// (re)populate the `subtitles` rows for `file_id`.
 ///
 /// Called from the scanner when a video is first indexed or when its
 /// mtime/size change. Idempotent — wipes+re-inserts under a single tx.
@@ -89,7 +89,7 @@ pub async fn get_from_db(
 /// call, so we don't re-spawn ffprobe just to enumerate text tracks.
 pub async fn scan_for_media(
     pool: &SqlitePool,
-    media_id: &str,
+    file_id: &str,
     video: &Path,
     embedded: &[EmbeddedSubtitleStream],
 ) -> anyhow::Result<usize> {
@@ -142,17 +142,17 @@ pub async fn scan_for_media(
 
     let count = tracks.len();
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM subtitles WHERE media_id = ?")
-        .bind(media_id)
+    sqlx::query("DELETE FROM subtitles WHERE file_id = ?")
+        .bind(file_id)
         .execute(&mut *tx)
         .await?;
     for t in tracks {
         sqlx::query(
             "INSERT INTO subtitles
-                (media_id, track_id, format, language, label, is_default, is_forced, content)
+                (file_id, track_id, format, language, label, is_default, is_forced, content)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(media_id)
+        .bind(file_id)
         .bind(&t.track_id)
         .bind(t.format)
         .bind(&t.language)
