@@ -7,6 +7,7 @@ pub mod auth;
 pub mod bastion_registration;
 pub mod cli;
 pub mod db;
+pub mod devices;
 pub mod error;
 pub mod filename;
 pub mod files;
@@ -446,7 +447,7 @@ async fn run_async() -> anyhow::Result<()> {
     let mut my_routes: Router<AppState> =
         Router::new().merge(api::router()).merge(syncplay::router()).merge(hls::router());
     if auth_state.is_some() {
-        my_routes = my_routes.merge(auth::router());
+        my_routes = my_routes.merge(auth::router()).merge(devices::router());
     }
     let my_routes = my_routes.with_state(state.clone());
 

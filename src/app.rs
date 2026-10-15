@@ -27,6 +27,8 @@ pub enum Route {
         MediaPlay { id: String },
         #[route("/show/:id")]
         ShowDetail { id: String },
+        #[route("/link?:code")]
+        LinkDevice { code: String },
 }
 
 #[component]
@@ -1958,3 +1960,100 @@ fn MediaPlay(id: String) -> Element {
     }
 }
 
+
+/// Approve a device-pairing code (the Apple TV app shows one, or a QR code
+/// pointing here with `?code=` filled in) and manage already-linked devices.
+#[component]
+fn LinkDevice(code: String) -> Element {
+    let mut input = use_signal(|| code.clone());
+    let mut status = use_signal::<Option<Result<String, String>>>(|| None);
+    let mut busy = use_signal(|| false);
+    let mut devices = use_resource(get_devices);
+
+    let submit = move |_| async move {
+        let code = input.read().trim().to_string();
+        if code.is_empty() || *busy.read() {
+            return;
+        }
+        busy.set(true);
+        let res = link_device(&code).await;
+        busy.set(false);
+        if res.is_ok() {
+            input.set(String::new());
+            devices.restart();
+        }
+        status.set(Some(res.map(|d| d.name)));
+    };
+
+    rsx! {
+        document::Title { "Link a device — Binkflix" }
+        section { class: "link-page",
+            h1 { "Link a device" }
+            p { class: "muted", "Enter the code shown on your TV." }
+            form {
+                class: "link-form",
+                onsubmit: submit,
+                input {
+                    class: "search-input link-code",
+                    placeholder: "XXXX-XXXX",
+                    autocomplete: "off",
+                    autocapitalize: "characters",
+                    spellcheck: "false",
+                    value: "{input.read()}",
+                    oninput: move |e| input.set(e.value()),
+                }
+                button { class: "btn", r#type: "submit", disabled: *busy.read(), "Link" }
+            }
+            match status.read().as_ref() {
+                Some(Ok(name)) => rsx! { p { class: "link-status", "Linked {name}." } },
+                Some(Err(e)) => rsx! { p { class: "link-status error", "{e}" } },
+                None => rsx! {},
+            }
+            h2 { "Your devices" }
+            match devices.read().as_ref() {
+                Some(Ok(list)) if list.is_empty() => rsx! { p { class: "muted", "No linked devices." } },
+                Some(Ok(list)) => rsx! {
+                    ul { class: "device-list",
+                        for d in list.iter().cloned() {
+                            li { key: "{d.id}",
+                                div {
+                                    div { class: "device-name", "{d.name}" }
+                                    div { class: "muted", "Last used {format_date(d.last_used_at)}" }
+                                }
+                                button {
+                                    class: "btn ghost",
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        let id = d.id.clone();
+                                        async move {
+                                            if revoke_device(&id).await.is_ok() {
+                                                devices.restart();
+                                            }
+                                        }
+                                    },
+                                    "Remove"
+                                }
+                            }
+                        }
+                    }
+                },
+                Some(Err(e)) => rsx! { p { class: "link-status error", "{e}" } },
+                None => rsx! {},
+            }
+        }
+    }
+}
+
+/// Unix seconds → the browser's locale date.
+fn format_date(secs: i64) -> String {
+    #[cfg(feature = "web")]
+    {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0));
+        String::from(d.to_locale_date_string("default", &wasm_bindgen::JsValue::UNDEFINED))
+    }
+    #[cfg(not(feature = "web"))]
+    {
+        let _ = secs;
+        String::new()
+    }
+}

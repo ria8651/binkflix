@@ -2418,3 +2418,39 @@ a.player-topbar-primary-link:hover { text-decoration: underline; }
     background: transparent;
     z-index: 9;
 }
+
+/* ── Device linking (/link) ────────────────────────────────── */
+
+.link-page {
+    max-width: 32rem;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+}
+.link-form {
+    display: flex;
+    gap: var(--space-4);
+}
+.link-code {
+    padding-left: var(--space-5);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    font-family: var(--font-mono, monospace);
+}
+.link-status.error { color: var(--danger); }
+.device-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+.device-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-4);
+}
+.device-name { font-weight: var(--weight-semibold); }

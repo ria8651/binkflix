@@ -24,6 +24,21 @@ pub struct Me {
     pub perms: Vec<String>,
 }
 
+/// A paired device (Apple TV app) as listed by `/api/devices`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
+/// Returned by `POST /api/devices/link`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkedDevice {
+    pub name: String,
+}
+
 impl Me {
     pub fn has_perm(&self, perm: &str) -> bool {
         self.perms.iter().any(|p| p == perm)

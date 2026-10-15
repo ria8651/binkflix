@@ -18,6 +18,7 @@ use tower_http::services::ServeFile;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/info", get(info))
         .route("/api/me", get(me))
         .route("/api/library", get(library))
         .route("/api/media/{id}", get(media))
@@ -336,6 +337,34 @@ async fn create_room(
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Version of the API native clients (the Apple TV app) are written against.
+/// The web client ships with the server so it never cares; a native build
+/// outlives server deploys, so bump this on any change an already-installed
+/// client would trip over (removed/renamed fields or routes, changed
+/// semantics). Additive changes don't need a bump.
+pub const API_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct ServerInfo {
+    name: &'static str,
+    api_version: u32,
+    build: &'static str,
+    /// `false` when bastion auth is off: every request is served as the
+    /// shared dev identity, so clients skip device pairing.
+    auth: bool,
+}
+
+/// Public (no session needed) so a client can check compatibility and
+/// whether to pair before it has credentials.
+async fn info(State(state): State<AppState>) -> Json<ServerInfo> {
+    Json(ServerInfo {
+        name: "binkflix",
+        api_version: API_VERSION,
+        build: crate::types::BUILD_ID,
+        auth: state.auth.is_some(),
+    })
 }
 
 async fn me(Extension(session): Extension<super::auth::Session>) -> Json<crate::types::Me> {

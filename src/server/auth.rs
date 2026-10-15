@@ -88,6 +88,7 @@ struct JwksCache {
 pub struct AuthState {
     pub cfg: AuthConfig,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
+    pub devices: super::devices::Devices,
     jwks: Arc<RwLock<JwksCache>>,
     http: reqwest::Client,
 }
@@ -97,6 +98,7 @@ impl AuthState {
         Self {
             cfg,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            devices: super::devices::Devices::default(),
             jwks: Arc::new(RwLock::new(JwksCache::default())),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -307,6 +309,19 @@ pub async fn require_session(
         return next.run(req).await;
     };
 
+    // Paired devices (see `devices.rs`) authenticate with a bearer token
+    // instead of the cookie. A bad token is a hard 401 — never a redirect
+    // into a browser login the device can't follow.
+    if let Some(token) = bearer_token(&req) {
+        let Some(session) = auth.devices.session_for(&state.pool, token).await else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        super::users::touch(&state.pool, &session.user_sub, &session.login).await;
+        let mut req = req;
+        req.extensions_mut().insert(session);
+        return next.run(req).await;
+    }
+
     if let Some(session) = auth.session_of(&jar).await {
         super::users::touch(&state.pool, &session.user_sub, &session.login).await;
         let mut req = req;
@@ -326,9 +341,20 @@ pub async fn require_session(
     Redirect::to("/auth/login").into_response()
 }
 
+fn bearer_token(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 fn is_public_path(uri: &Uri) -> bool {
     let p = uri.path();
     p.starts_with("/auth/")
+        || p == "/api/info"
         || p.starts_with("/jassub/")
         || p.starts_with("/static/")
         || p == "/favicon.ico"
