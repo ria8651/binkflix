@@ -448,3 +448,148 @@ fn srt_to_vtt(srt: &str) -> String {
     }
     out
 }
+
+/// Flatten ASS/SSA to WebVTT for clients without an ASS renderer (the
+/// native Apple TV app). Positioning, styling, karaoke and drawings are
+/// lost — what's left is each dialogue line's plain text on its timing.
+pub fn ass_to_vtt(ass: &str) -> String {
+    // Field order comes from the `[Events]` `Format:` line; this is the
+    // spec default for files that omit it.
+    let mut fields: Vec<String> = ["layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut in_events = false;
+    let mut cues: Vec<(u64, u64, String)> = Vec::new();
+
+    for line in ass.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.starts_with('[') {
+            in_events = line.eq_ignore_ascii_case("[events]");
+            continue;
+        }
+        if !in_events {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Format:") {
+            fields = rest.split(',').map(|f| f.trim().to_ascii_lowercase()).collect();
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("Dialogue:") else { continue };
+        let parts: Vec<&str> = rest.splitn(fields.len(), ',').collect();
+        let field = |name: &str| {
+            fields.iter().position(|f| f == name).and_then(|i| parts.get(i)).map(|s| s.trim())
+        };
+        let (Some(start), Some(end), Some(text)) = (
+            field("start").and_then(parse_ass_time),
+            field("end").and_then(parse_ass_time),
+            field("text"),
+        ) else {
+            continue;
+        };
+        if let Some(text) = ass_text_to_plain(text) {
+            if end > start {
+                cues.push((start, end, text));
+            }
+        }
+    }
+
+    cues.sort_by_key(|c| c.0);
+    let mut out = String::from("WEBVTT\n\n");
+    for (start, end, text) in cues {
+        out.push_str(&format!("{} --> {}\n{}\n\n", vtt_time(start), vtt_time(end), text));
+    }
+    out
+}
+
+/// `H:MM:SS.cc` → milliseconds.
+fn parse_ass_time(s: &str) -> Option<u64> {
+    let mut it = s.splitn(3, ':');
+    let h: u64 = it.next()?.trim().parse().ok()?;
+    let m: u64 = it.next()?.parse().ok()?;
+    let secs = it.next()?;
+    let (sec, frac) = secs.split_once('.').unwrap_or((secs, "0"));
+    let sec: u64 = sec.parse().ok()?;
+    // Centiseconds by spec, but tolerate any number of fractional digits.
+    let frac_ms = format!("{frac:0<3}").get(..3)?.parse::<u64>().ok()?;
+    Some(((h * 60 + m) * 60 + sec) * 1000 + frac_ms)
+}
+
+fn vtt_time(ms: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        ms / 60_000 % 60,
+        ms / 1000 % 60,
+        ms % 1000
+    )
+}
+
+/// Strip `{…}` override blocks and ASS escapes; HTML-escape for VTT.
+/// `None` for lines that are empty or vector drawings (`\p1`…).
+fn ass_text_to_plain(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut drawing = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                let mut tag = String::new();
+                for t in chars.by_ref() {
+                    if t == '}' {
+                        break;
+                    }
+                    tag.push(t);
+                }
+                // `\p0` ends drawing mode; any other `\pN` starts it.
+                for cmd in tag.split('\\') {
+                    if let Some(n) = cmd.strip_prefix('p').and_then(|n| n.trim().parse::<u32>().ok()) {
+                        drawing = n != 0;
+                    }
+                }
+            }
+            _ if drawing => {}
+            '\\' => match chars.peek() {
+                Some('N') | Some('n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some('h') => {
+                    chars.next();
+                    out.push('\u{a0}');
+                }
+                _ => out.push('\\'),
+            },
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "\u{feff}[Script Info]\nTitle: x\n\n[V4+ Styles]\nFormat: Name, Fontname\nStyle: Default,Arial\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:05.50,0:00:07.00,Default,,0,0,0,,{\\i1}Second{\\i0}, with a comma\\Nline two\nDialogue: 0,0:00:01.00,0:00:02.25,Default,,0,0,0,,First <b> & co\nComment: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,ignored\nDialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\\p1}m 0 0 l 100 0 100 100{\\p0}\n";
+
+    #[test]
+    fn ass_to_vtt_flattens_dialogue_in_time_order() {
+        assert_eq!(
+            ass_to_vtt(SAMPLE),
+            "WEBVTT\n\n\
+             00:00:01.000 --> 00:00:02.250\nFirst &lt;b&gt; &amp; co\n\n\
+             00:00:05.500 --> 00:00:07.000\nSecond, with a comma\nline two\n\n"
+        );
+    }
+
+    #[test]
+    fn parse_ass_time_handles_hours_and_centiseconds() {
+        assert_eq!(parse_ass_time("1:02:03.45"), Some(3_723_450));
+        assert_eq!(parse_ass_time("0:00:00.00"), Some(0));
+        assert_eq!(parse_ass_time("nope"), None);
+    }
+}

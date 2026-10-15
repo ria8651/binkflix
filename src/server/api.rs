@@ -763,15 +763,27 @@ async fn media_subtitles(
     Ok(Json(tracks))
 }
 
+#[derive(Deserialize)]
+struct SubtitleParams {
+    /// `vtt` flattens ASS tracks to WebVTT, for clients that can't render
+    /// ASS. Other tracks are already VTT.
+    format: Option<String>,
+}
+
 async fn media_subtitle(
     State(state): State<AppState>,
     Path((id, track_id)): Path<(String, String)>,
+    Query(params): Query<SubtitleParams>,
 ) -> Result<axum::response::Response> {
     let file = primary_file(&state, &id).await?;
-    let (body, content_type) = subtitles::get_from_db(&state.pool, &file.id, &track_id)
+    let (mut body, mut content_type) = subtitles::get_from_db(&state.pool, &file.id, &track_id)
         .await
         .map_err(Error::Other)?
         .ok_or(Error::NotFound)?;
+    if params.format.as_deref() == Some("vtt") && content_type.starts_with("text/x-ssa") {
+        body = subtitles::ass_to_vtt(&String::from_utf8_lossy(&body)).into_bytes();
+        content_type = "text/vtt; charset=utf-8";
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
