@@ -58,7 +58,10 @@ use tokio::process::Command;
 ///          too, so Auto derives it from the source resolution instead of
 ///          from the bitrate. All of these change segment bytes under tags
 ///          that would otherwise collide with v12's.
-pub const PLAN_VERSION: u32 = 13;
+///   v14:   HEVC remux tagged `hvc1` instead of ffmpeg's default `hev1` —
+///          Apple's HLS stack (AVPlayer, Safari) only accepts `hvc1` in
+///          fMP4. Changes init.mp4 bytes for every HEVC remux.
+pub const PLAN_VERSION: u32 = 14;
 
 /// Target segment length. ffmpeg only cuts at source keyframes under
 /// `-c:v copy`, so real segments will land near this value but vary with

@@ -251,6 +251,7 @@ struct ResolvedPlan {
     /// Cache-key tag derived from the chosen mode + bitrate. Same shape
     /// as `mode_tag` in `cache::plan_dir_name`.
     mode_tag: String,
+    audio: Option<plan::AudioPlan>,
 }
 
 /// Resolve the plan + on-disk plan dir + tech info for the file item `id`
@@ -332,6 +333,7 @@ async fn resolve_plan(
                     p
                 }
             };
+            let audio = plan::derive_audio_plan(&info, audio_idx);
             let mode_tag = "remux".to_string();
             let plan_dir = cache::plan_dir(&file_id, plan.version, mtime, size, audio_idx, &mode_tag);
             Ok(ResolvedPlan {
@@ -341,6 +343,7 @@ async fn resolve_plan(
                 src,
                 info,
                 mode_tag,
+                audio,
             })
         }
         RequestedMode::Transcode => {
@@ -359,6 +362,7 @@ async fn resolve_plan(
                 format!("tx{bitrate}h{max_height}-auto")
             };
             let plan_dir = cache::plan_dir(&file_id, plan.version, mtime, size, audio_idx, &mode_tag);
+            let audio = plan::derive_audio_plan(&info, audio_idx);
             Ok(ResolvedPlan {
                 file_id,
                 plan: Arc::new(plan),
@@ -366,6 +370,7 @@ async fn resolve_plan(
                 src,
                 info,
                 mode_tag,
+                audio,
             })
         }
     }
@@ -427,7 +432,7 @@ async fn serve(
 
     let audio_idx = validate_audio_idx(params.idx())?;
     let resolved = resolve_plan(&state, &id, audio_idx, &params).await?;
-    let ResolvedPlan { file_id, plan, plan_dir, src, info, mode_tag } = resolved;
+    let ResolvedPlan { file_id, plan, plan_dir, src, info, mode_tag, audio } = resolved;
     let path = plan_dir.join(&file);
 
     // Strict mode with an unsatisfiable request (encoder missing from this
@@ -461,7 +466,13 @@ async fn serve(
         let src_audio = info.audio.get(audio_idx as usize).map(|a| a.codec.as_str());
         let (out_video, out_audio, bitrate): (Option<&str>, Option<&str>, Option<u32>) =
             match &plan.mode {
-                plan::Mode::Remux => (src_video, src_audio, None),
+                plan::Mode::Remux => {
+                    let out_audio = audio.as_ref().map(|a| match a.out_codec.as_str() {
+                        "copy" => a.src_codec.as_deref().unwrap_or_default(),
+                        other => other,
+                    });
+                    (src_video, out_audio, None)
+                }
                 plan::Mode::Transcode { bitrate_kbps, .. } => {
                     (Some("h264"), Some("aac"), Some(*bitrate_kbps))
                 }
@@ -573,7 +584,7 @@ async fn serve(
         plan_dir: plan_dir.clone(),
         audio_idx,
         mode_tag,
-        audio: plan::derive_audio_plan(&info, audio_idx),
+        audio,
         hw: state.hwenc,
         pool: state.pool.clone(),
     };

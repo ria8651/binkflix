@@ -928,7 +928,7 @@ fn spawn_ffmpeg(
         .arg("-map").arg("0:v:0")
         .arg("-map").arg(format!("0:a:{}?", ctx.audio_idx))
         .arg("-avoid_negative_ts").arg("disabled");
-    apply_video_args(&mut cmd, &ctx.plan.mode, hw);
+    apply_video_args(&mut cmd, &ctx.plan.mode, &ctx.plan.video_codec, hw);
     apply_audio_args(&mut cmd, ctx.audio.as_ref(), &ctx.plan.mode);
     cmd.arg("-sn").arg("-dn")
         .arg("-f").arg("hls")
@@ -1052,10 +1052,15 @@ fn select_rate_control(hw: HwEncoder, hard_cap: bool) -> RateControl {
     }
 }
 
-fn apply_video_args(cmd: &mut Command, mode: &Mode, hw: HwEncoder) {
+fn apply_video_args(cmd: &mut Command, mode: &Mode, src_codec: &str, hw: HwEncoder) {
     match mode {
         Mode::Remux => {
             cmd.arg("-c:v").arg("copy");
+            // ffmpeg tags HEVC in MP4 as `hev1` by default; Apple's HLS
+            // stack (AVPlayer, Safari) only accepts `hvc1`.
+            if src_codec == "hevc" {
+                cmd.arg("-tag:v").arg("hvc1");
+            }
         }
         Mode::Transcode { bitrate_kbps, max_height, hard_cap } => {
             // `scale=-2:'min(H,ih)'` keeps source aspect, never
@@ -1723,12 +1728,24 @@ mod tests {
     }
 
     fn video_argv(mode: &Mode, hw: HwEncoder) -> Vec<String> {
+        video_argv_for(mode, "h264", hw)
+    }
+
+    fn video_argv_for(mode: &Mode, src_codec: &str, hw: HwEncoder) -> Vec<String> {
         let mut cmd = Command::new("ffmpeg");
-        apply_video_args(&mut cmd, mode, hw);
+        apply_video_args(&mut cmd, mode, src_codec, hw);
         cmd.as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn hevc_remux_is_tagged_hvc1() {
+        let hevc = video_argv_for(&Mode::Remux, "hevc", HwEncoder::None);
+        assert!(hevc.windows(2).any(|w| w == ["-tag:v", "hvc1"]));
+        let h264 = video_argv_for(&Mode::Remux, "h264", HwEncoder::None);
+        assert!(!h264.iter().any(|a| a == "-tag:v"));
     }
 
     #[test]
