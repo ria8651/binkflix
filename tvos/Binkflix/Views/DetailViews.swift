@@ -145,6 +145,7 @@ struct ShowDetailView: View {
     @State private var state: LoadState<ShowDetail> = .loading
     @State private var reload = 0
     @State private var seasonNumber: Int?
+    @FocusState private var focusedSeason: Int?
 
     var body: some View {
         Loadable(state: state, retry: { reload += 1 }) { detail in
@@ -210,15 +211,27 @@ struct ShowDetailView: View {
             ScrollView(.horizontal) {
                 HStack(spacing: 20) {
                     ForEach(detail.seasons) { season in
-                        Button(season.name) { seasonNumber = season.number }
-                            .buttonStyle(.bordered)
-                            .tint(season.number == seasonNumber ? .white : nil)
+                        let selected = season.number == seasonNumber
+                        Button { seasonNumber = season.number } label: {
+                            Text(season.name).fontWeight(selected ? .bold : .regular)
+                        }
+                        .buttonStyle(.bordered)
+                        .focused($focusedSeason, equals: season.number)
+                        .overlay(alignment: .bottom) {
+                            if selected {
+                                Capsule().fill(.white).frame(width: 40, height: 4).offset(y: 14)
+                            }
+                        }
                     }
                 }
                 .padding(.vertical, 20)
             }
             .scrollClipDisabled()
             .focusSection()
+            // Like the TV app: the episode row follows focus across seasons.
+            .onChange(of: focusedSeason) { _, focused in
+                if let focused { seasonNumber = focused }
+            }
         }
         if let season = detail.seasons.first(where: { $0.number == seasonNumber }) ?? detail.seasons.first {
             Shelf(title: season.name) {
