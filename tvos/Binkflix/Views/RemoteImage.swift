@@ -2,8 +2,7 @@ import ImageIO
 import SwiftUI
 import UIKit
 
-/// Loads artwork with the device's bearer token (AsyncImage can't send
-/// headers). Images are decoded at the size they're shown at, not their
+/// Loads artwork. Images are decoded at the size they're shown at, not their
 /// source size: the Apple TV HD's GPU runs out of memory (black and
 /// garbled regions) scaling full-size artwork down every frame. Decoded
 /// images are kept in memory; the bytes in URLCache.
@@ -28,15 +27,13 @@ final class ImageLoader {
         cache.object(forKey: Self.key(url, fit))
     }
 
-    func load(_ url: URL, fit: CGSize, fill: Bool, headers: [String: String]) async -> UIImage? {
+    func load(_ url: URL, fit: CGSize, fill: Bool) async -> UIImage? {
         let key = Self.key(url, fit)
         if let hit = cache.object(forKey: key) { return hit }
         if let task = inflight[key as URL] { return await task.value }
         let session = session
         let task = Task<UIImage?, Never> {
-            var req = URLRequest(url: url)
-            for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-            guard let (data, resp) = try? await session.data(for: req),
+            guard let (data, resp) = try? await session.data(from: url),
                   (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
             return await Task.detached { Self.downsample(data, fit: fit, fill: fill) }.value
         }
@@ -81,7 +78,6 @@ struct RemoteImage<Placeholder: View>: View {
     var contentMode: ContentMode = .fill
     @ViewBuilder var placeholder: () -> Placeholder
 
-    @Environment(AppModel.self) private var app
     @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
     @State private var size: CGSize = .zero
@@ -101,9 +97,7 @@ struct RemoteImage<Placeholder: View>: View {
             guard let url, size.width > 0, size.height > 0 else { return }
             let fit = CGSize(width: size.width * displayScale, height: size.height * displayScale)
             if let hit = ImageLoader.shared.cached(url, fit: fit) { image = hit; return }
-            image = await ImageLoader.shared.load(
-                url, fit: fit, fill: contentMode == .fill, headers: app.client?.authHeaders ?? [:]
-            )
+            image = await ImageLoader.shared.load(url, fit: fit, fill: contentMode == .fill)
         }
     }
 

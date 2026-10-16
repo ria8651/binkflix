@@ -7,23 +7,11 @@ struct ServerInfo: Decodable {
     let name: String
     let apiVersion: Int
     let auth: Bool
+    /// Where to pair when `auth` is on.
+    let bastion: BastionInfo?
 }
 
 struct Me: Decodable {
-    let login: String
-}
-
-struct DeviceCode: Decodable {
-    let deviceCode: String
-    let userCode: String
-    let verificationUri: String
-    let verificationUriComplete: String
-    let expiresIn: Int
-    let interval: Int
-}
-
-struct DeviceToken: Decodable {
-    let token: String
     let login: String
 }
 

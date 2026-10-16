@@ -2,15 +2,15 @@ import Foundation
 import Observation
 import Security
 
-/// Which server we talk to and as whom. The server URL lives in defaults; the
-/// device token in the keychain.
+/// Which server we talk to and as whom. The server URL and where to pair
+/// live in defaults; bastion's refresh token in the keychain.
 @Observable
 final class AppModel {
     enum Phase {
         /// No server picked yet.
         case setup
-        /// Server needs auth and we hold no token.
-        case pairing(APIClient)
+        /// Server needs auth and this Apple TV isn't paired.
+        case pairing(BastionSession)
         case ready(APIClient)
     }
 
@@ -21,44 +21,58 @@ final class AppModel {
     private(set) var watchGeneration = 0
 
     private static let serverKey = "server"
+    private static let bastionKey = "bastion"
 
     init() {
-        if let s = UserDefaults.standard.string(forKey: Self.serverKey), let url = URL(string: s) {
-            let token = Keychain.token
-            phase = .ready(APIClient(base: url, token: token))
+        guard let s = UserDefaults.standard.string(forKey: Self.serverKey), let url = URL(string: s) else { return }
+        guard let bastion = Self.savedBastion else {
+            phase = .ready(APIClient(base: url, session: nil))
             Task { await refresh() }
+            return
+        }
+        let session = BastionSession(info: bastion, server: url, refreshToken: Keychain.refreshToken)
+        if session.isPaired {
+            phase = .ready(APIClient(base: url, session: session))
+            Task { await refresh() }
+        } else {
+            phase = .pairing(session)
         }
     }
 
     var client: APIClient? {
+        if case let .ready(c) = phase { c } else { nil }
+    }
+
+    var server: URL? {
         switch phase {
         case .setup: nil
-        case let .pairing(c), let .ready(c): c
+        case let .pairing(s): s.server
+        case let .ready(c): c.base
         }
     }
 
     /// Point the app at `url`. Asks the server whether it needs pairing.
     func connect(to url: URL) async throws {
-        let anon = APIClient(base: url, token: nil)
-        let info = try await anon.info()
+        let info = try await APIClient(base: url, session: nil).info()
+        signOut()
         UserDefaults.standard.set(url.absoluteString, forKey: Self.serverKey)
-        Keychain.token = nil
-        if info.auth {
-            phase = .pairing(anon)
+        Self.savedBastion = info.bastion
+        if let bastion = info.bastion {
+            phase = .pairing(BastionSession(info: bastion, server: url, refreshToken: nil))
         } else {
-            phase = .ready(anon)
+            phase = .ready(APIClient(base: url, session: nil))
             await refresh()
         }
     }
 
-    func paired(token: String, login: String) {
-        guard let base = client?.base else { return }
-        Keychain.token = token
-        self.login = login
-        phase = .ready(APIClient(base: base, token: token))
+    /// Bastion approved the code `session` was pairing with.
+    func paired(_ session: BastionSession, _ tokens: BastionTokens) async throws {
+        try await session.paired(tokens)
+        phase = .ready(APIClient(base: session.server, session: session))
+        await refresh()
     }
 
-    /// Re-check the saved token; drop to pairing if the server revoked it.
+    /// Re-check the session; drop to pairing if bastion signed this device out.
     func refresh() async {
         guard case let .ready(c) = phase else { return }
         do {
@@ -66,22 +80,47 @@ final class AppModel {
         } catch APIError.unauthorized {
             unlink()
         } catch {
-            // Offline or server down: keep the token, screens show the error.
+            // Offline or server down: stay signed in, screens show the error.
         }
     }
 
+    /// Forget this device's credentials. Bastion keeps listing it on the
+    /// account page, where it can be revoked.
     func unlink() {
-        guard let base = client?.base else { return }
-        Keychain.token = nil
-        login = nil
-        phase = .pairing(APIClient(base: base, token: nil))
+        guard let server else { return }
+        guard let bastion = Self.savedBastion else {
+            // Saved before the server turned auth on: ask it again.
+            Task { try? await connect(to: server) }
+            return
+        }
+        signOut()
+        phase = .pairing(BastionSession(info: bastion, server: server, refreshToken: nil))
     }
 
     func forgetServer() {
+        signOut()
         UserDefaults.standard.removeObject(forKey: Self.serverKey)
-        Keychain.token = nil
-        login = nil
+        Self.savedBastion = nil
         phase = .setup
+    }
+
+    private func signOut() {
+        login = nil
+        Keychain.refreshToken = nil
+        guard let server else { return }
+        Task { _ = try? await URLSession.shared.data(from: server.appending(path: "/auth/logout")) }
+        for cookie in HTTPCookieStorage.shared.cookies(for: server) ?? [] {
+            HTTPCookieStorage.shared.deleteCookie(cookie)
+        }
+    }
+
+    private static var savedBastion: BastionInfo? {
+        get {
+            UserDefaults.standard.data(forKey: bastionKey).flatMap { try? JSONDecoder().decode(BastionInfo.self, from: $0) }
+        }
+        set {
+            UserDefaults.standard.set(newValue.flatMap { try? JSONEncoder().encode($0) }, forKey: bastionKey)
+        }
     }
 
     func watchStateChanged() {
@@ -90,9 +129,9 @@ final class AppModel {
 }
 
 enum Keychain {
-    private static let account = "device-token"
+    private static let account = "bastion-refresh-token"
 
-    static var token: String? {
+    static var refreshToken: String? {
         get {
             var out: CFTypeRef?
             let query: [String: Any] = [

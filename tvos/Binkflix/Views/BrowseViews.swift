@@ -199,7 +199,7 @@ struct SettingsView: View {
                 }
             }
             Section {
-                if app.client?.token != nil {
+                if app.client?.session != nil {
                     Button("Unlink This Apple TV", role: .destructive) { app.unlink() }
                 }
                 Button("Change Server") { app.forgetServer() }

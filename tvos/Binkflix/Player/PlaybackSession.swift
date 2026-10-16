@@ -94,7 +94,10 @@ final class PlaybackSession: NSObject, AVPlayerViewControllerDelegate {
         var query: [String: String?] = ["mode": mode]
         if item.resume > 0 { query["t"] = String(format: "%.3f", item.resume) }
         let url = client.url("/api/media/\(item.media.id)/hls/master.m3u8", query: query)
-        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": client.authHeaders])
+        // AVPlayer only sends the session cookie on the first request unless
+        // it's handed over explicitly.
+        let cookies = HTTPCookieStorage.shared.cookies(for: url) ?? []
+        let asset = AVURLAsset(url: url, options: [AVURLAssetHTTPCookiesKey: cookies])
         let playerItem = AVPlayerItem(asset: asset)
         playerItem.externalMetadata = metadata(for: item.media)
 
@@ -150,7 +153,7 @@ final class PlaybackSession: NSObject, AVPlayerViewControllerDelegate {
     private func loadArtwork(for media: Media, into item: AVPlayerItem) {
         let url = media.showId.map(client.showPoster) ?? client.mediaImage(media.id)
         Task {
-            guard let image = await ImageLoader.shared.load(url, fit: CGSize(width: 600, height: 900), fill: false, headers: client.authHeaders),
+            guard let image = await ImageLoader.shared.load(url, fit: CGSize(width: 600, height: 900), fill: false),
                   let data = image.jpegData(compressionQuality: 0.8) else { return }
             let art = AVMutableMetadataItem()
             art.identifier = .commonIdentifierArtwork

@@ -12,23 +12,17 @@ enum APIError: LocalizedError {
     }
 }
 
-/// Talks to one binkflix server, as one paired device (or anonymously when
-/// the server runs without auth).
+/// Talks to one binkflix server, signed in through `session` (or
+/// anonymously when the server runs without auth).
 struct APIClient {
     let base: URL
-    let token: String?
+    let session: BastionSession?
 
     static let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.keyDecodingStrategy = .convertFromSnakeCase
         return d
     }()
-
-    /// Headers every request needs, including the ones AVPlayer and the image
-    /// loader make on their own.
-    var authHeaders: [String: String] {
-        token.map { ["Authorization": "Bearer \($0)"] } ?? [:]
-    }
 
     func url(_ path: String, query: [String: String?] = [:]) -> URL {
         var c = URLComponents(url: base.appending(path: path), resolvingAgainstBaseURL: false)!
@@ -40,7 +34,6 @@ struct APIClient {
     func request(_ url: URL, method: String = "GET", json: (any Encodable)? = nil) throws -> URLRequest {
         var req = URLRequest(url: url)
         req.httpMethod = method
-        for (k, v) in authHeaders { req.setValue(v, forHTTPHeaderField: k) }
         if let json {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONEncoder().encode(json)
@@ -48,9 +41,15 @@ struct APIClient {
         return req
     }
 
+    /// Signs in again and retries once on a 401: the session cookie dies
+    /// with a server restart, and isn't kept across app launches.
     @discardableResult
     func send(_ req: URLRequest) async throws -> Data {
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        var (data, resp) = try await URLSession.shared.data(for: req)
+        if (resp as? HTTPURLResponse)?.statusCode == 401, let session {
+            try await session.signIn()
+            (data, resp) = try await URLSession.shared.data(for: req)
+        }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         if code == 401 { throw APIError.unauthorized }
         guard (200..<300).contains(code) else {

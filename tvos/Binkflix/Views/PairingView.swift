@@ -2,10 +2,10 @@ import CoreImage.CIFilterBuiltins
 import SwiftUI
 import UIKit
 
-/// Device-flow pairing (see the server's `devices.rs`): show a code, let the
-/// user approve it on `/link` from a signed-in browser, poll for the token.
+/// Bastion's device sign-in: show a code, let the user confirm it on
+/// bastion's `/device` page from their phone, poll for the tokens.
 struct PairingView: View {
-    let client: APIClient
+    let session: BastionSession
 
     @Environment(AppModel.self) private var app
     @State private var code: DeviceCode?
@@ -19,7 +19,7 @@ struct PairingView: View {
                 if let code {
                     Text("On your phone or computer, go to")
                         .foregroundStyle(.secondary)
-                    Text(linkURL(code.verificationUri).absoluteString)
+                    Text(code.verificationUri)
                         .font(.title2.monospaced())
                     Text("and enter")
                         .foregroundStyle(.secondary)
@@ -36,7 +36,7 @@ struct PairingView: View {
             }
             .frame(maxWidth: 1000, alignment: .leading)
 
-            if let code, let qr = qrImage(linkURL(code.verificationUriComplete)) {
+            if let code, let url = URL(string: code.verificationUriComplete), let qr = qrImage(url) {
                 VStack(spacing: 24) {
                     Image(uiImage: qr)
                         .interpolation(.none)
@@ -53,26 +53,24 @@ struct PairingView: View {
         .task { await pair() }
     }
 
-    private func linkURL(_ path: String) -> URL {
-        URL(string: path, relativeTo: client.base)?.absoluteURL ?? client.base
-    }
-
-    /// Request a code and poll until approved; start over when a code expires.
+    /// Request a code and poll until approved; start over when a code
+    /// expires or is denied.
     private func pair() async {
         while !Task.isCancelled {
             do {
-                let name = UIDevice.current.name
-                struct Start: Encodable { let name: String }
-                let req = try client.request(client.url("/auth/device/code"), method: "POST", json: Start(name: name))
-                let fresh: DeviceCode = try APIClient.decoder.decode(DeviceCode.self, from: await client.send(req))
+                let fresh = try await session.startPairing(name: UIDevice.current.name)
                 code = fresh
                 error = nil
-                if let token = try await poll(fresh) {
-                    app.paired(token: token.token, login: token.login)
+                if let tokens = try await poll(fresh) {
+                    try await app.paired(session, tokens)
                     return
                 }
             } catch is CancellationError {
                 return
+            } catch let e as OAuthError where e.error == "invalid_client" {
+                self.error = "Device sign-in is off for \(session.info.service). Turn it on from the service's page in bastion."
+                code = nil
+                try? await Task.sleep(for: .seconds(10))
             } catch {
                 self.error = error.localizedDescription
                 try? await Task.sleep(for: .seconds(5))
@@ -80,20 +78,27 @@ struct PairingView: View {
         }
     }
 
-    /// The token once approved, `nil` once the code expired.
-    private func poll(_ code: DeviceCode) async throws -> DeviceToken? {
-        struct Poll: Encodable { let device_code: String }
-        let req = try client.request(client.url("/auth/device/token"), method: "POST", json: Poll(device_code: code.deviceCode))
-        while true {
-            try await Task.sleep(for: .seconds(max(code.interval, 1)))
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            if (resp as? HTTPURLResponse)?.statusCode == 200 {
-                return try APIClient.decoder.decode(DeviceToken.self, from: data)
+    /// The tokens once approved, `nil` once the code expired or was denied.
+    private func poll(_ code: DeviceCode) async throws -> BastionTokens? {
+        var interval = max(code.interval, 1)
+        let deadline = ContinuousClock.now + .seconds(code.expiresIn)
+        while ContinuousClock.now < deadline {
+            try await Task.sleep(for: .seconds(interval))
+            do {
+                return try await session.poll(code)
+            } catch let e as OAuthError {
+                switch e.error {
+                case "authorization_pending": continue
+                case "slow_down": interval += 5
+                case "access_denied":
+                    error = "That code was declined."
+                    return nil
+                case "expired_token": return nil
+                default: throw e
+                }
             }
-            struct Failure: Decodable { let error: String }
-            let failure = try? APIClient.decoder.decode(Failure.self, from: data)
-            if failure?.error != "authorization_pending" { return nil }
         }
+        return nil
     }
 
     private func qrImage(_ url: URL) -> UIImage? {

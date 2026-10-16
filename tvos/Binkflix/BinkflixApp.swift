@@ -22,8 +22,8 @@ struct RootView: View {
         switch app.phase {
         case .setup:
             ServerSetupView()
-        case let .pairing(client):
-            PairingView(client: client)
+        case let .pairing(session):
+            PairingView(session: session)
         case .ready:
             MainView()
         }
