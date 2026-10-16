@@ -7,13 +7,19 @@ struct Backdrop: View {
     var body: some View {
         RemoteImage(url: url) { Color.black }
             .overlay {
+                // Text sits on the left and the rows at the bottom: darken
+                // both, so it stays readable over bright art.
                 LinearGradient(
                     stops: [
-                        .init(color: .black.opacity(0.95), location: 0),
-                        .init(color: .black.opacity(0.55), location: 0.55),
-                        .init(color: .black.opacity(0.2), location: 1),
+                        .init(color: .black.opacity(0.9), location: 0),
+                        .init(color: .black.opacity(0.7), location: 0.45),
+                        .init(color: .black.opacity(0.1), location: 1),
                     ],
-                    startPoint: .bottomLeading, endPoint: .topTrailing
+                    startPoint: .leading, endPoint: .trailing
+                )
+                LinearGradient(
+                    colors: [.black.opacity(0.8), .clear],
+                    startPoint: .bottom, endPoint: .center
                 )
             }
             .ignoresSafeArea()
@@ -156,6 +162,7 @@ struct ShowDetailView: View {
                     VStack(alignment: .leading, spacing: 40) {
                         header(detail)
                             .frame(minHeight: 560, alignment: .bottomLeading)
+                            .padding(.top, 120)
                         seasons(detail)
                     }
                 }
@@ -186,7 +193,7 @@ struct ShowDetailView: View {
                 RemoteImage(url: app.client?.showClearlogo(id), contentMode: .fit) {
                     Text(show.title).font(.largeTitle.bold())
                 }
-                .frame(maxWidth: 700, maxHeight: 220, alignment: .bottomLeading)
+                .frame(maxWidth: 640, maxHeight: 180, alignment: .bottomLeading)
             } else {
                 Text(show.title).font(.largeTitle.bold())
             }
