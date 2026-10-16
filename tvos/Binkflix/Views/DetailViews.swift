@@ -146,6 +146,7 @@ struct ShowDetailView: View {
     @State private var reload = 0
     @State private var seasonNumber: Int?
     @FocusState private var focusedSeason: Int?
+    @FocusState private var focusedEpisode: String?
 
     var body: some View {
         Loadable(state: state, retry: { reload += 1 }) { detail in
@@ -164,8 +165,15 @@ struct ShowDetailView: View {
             guard let client = app.client else { return }
             let result = await Result { try await client.show(id) }
             state.apply(result)
-            if seasonNumber == nil, let detail = state.value {
+            guard let detail = state.value else { return }
+            if seasonNumber == nil {
                 seasonNumber = upNext(detail)?.seasonNumber ?? detail.seasons.first?.number
+            }
+            // Back from the player: return focus to what was playing last.
+            if let last = player.lastPlayed,
+               let season = detail.seasons.first(where: { $0.episodes.contains { $0.id == last } }) {
+                seasonNumber = season.number
+                focusedEpisode = last
             }
         }
     }
@@ -228,6 +236,7 @@ struct ShowDetailView: View {
             }
             .scrollClipDisabled()
             .focusSection()
+            .defaultFocus($focusedSeason, seasonNumber, priority: .userInitiated)
             // Like the TV app: the episode row follows focus across seasons.
             .onChange(of: focusedSeason) { _, focused in
                 if let focused { seasonNumber = focused }
@@ -235,7 +244,9 @@ struct ShowDetailView: View {
         }
         if let season = detail.seasons.first(where: { $0.number == seasonNumber }) ?? detail.seasons.first {
             Shelf(title: season.name) {
-                ForEach(season.episodes) { EpisodeCard(episode: $0) }
+                ForEach(season.episodes) { episode in
+                    EpisodeCard(episode: episode).focused($focusedEpisode, equals: episode.id)
+                }
             }
         }
     }

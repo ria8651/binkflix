@@ -16,7 +16,8 @@ final class PlaybackSession: NSObject, AVPlayerViewControllerDelegate {
     private var lastReport = Date.distantPast
     private var finished = false
 
-    var onFinish: (() -> Void)?
+    /// Called once the player is gone, with the media it was showing last.
+    var onFinish: ((String?) -> Void)?
 
     /// How often progress is saved while playing.
     private static let reportInterval: TimeInterval = 10
@@ -249,7 +250,7 @@ final class PlaybackSession: NSObject, AVPlayerViewControllerDelegate {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         statusObservation = nil
         player.replaceCurrentItem(with: nil)
-        onFinish?()
+        onFinish?(current?.media.id)
     }
 
     // MARK: AVPlayerViewControllerDelegate

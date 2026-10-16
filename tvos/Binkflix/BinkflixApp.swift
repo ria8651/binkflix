@@ -72,7 +72,9 @@ struct MainView: View {
             }
         }
         if let id = defaults.string(forKey: "debugPlay") {
-            try? await Task.sleep(for: .seconds(1))
+            // Let any -debugOpen push settle first, or the player is presented
+            // mid-transition and Menu goes to the page behind it.
+            try? await Task.sleep(for: .seconds(3))
             player.play(id, app: app)
         }
     }
