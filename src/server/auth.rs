@@ -6,6 +6,10 @@
 //!   unauthed → middleware redirects to `<bastion>/auth/login?service=<slug>&return=<self>/auth/bastion`
 //!   bastion  → redirects to `<self>/auth/bastion?bastion_token=<jwt>`
 //!   we verify, mint opaque session id, set cookie, redirect `/`
+//!
+//! Native clients (the Apple TV app) sign in through bastion's device flow
+//! instead — `/api/info` tells them where — and send the JWT as
+//! `Authorization: Bearer`, verified on every request.
 
 use axum::{
     extract::{Query, Request, State},
@@ -88,7 +92,6 @@ struct JwksCache {
 pub struct AuthState {
     pub cfg: AuthConfig,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
-    pub devices: super::devices::Devices,
     jwks: Arc<RwLock<JwksCache>>,
     http: reqwest::Client,
 }
@@ -98,7 +101,6 @@ impl AuthState {
         Self {
             cfg,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            devices: super::devices::Devices::default(),
             jwks: Arc::new(RwLock::new(JwksCache::default())),
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -153,6 +155,20 @@ struct Claims {
     perms: Vec<String>,
 }
 
+impl Claims {
+    fn into_session(self) -> Session {
+        let login = self
+            .username
+            .unwrap_or_else(|| format!("user:{}", &self.sub[..8.min(self.sub.len())]));
+        Session {
+            user_sub: self.sub,
+            login,
+            created_at: Instant::now(),
+            perms: self.perms,
+        }
+    }
+}
+
 pub fn router() -> Router<crate::server::AppState> {
     Router::new()
         .route("/auth/login", get(login))
@@ -200,25 +216,10 @@ async fn bastion_callback(
         }
     };
 
-    let user_sub = claims.sub.clone();
-    let login_name = claims
-        .username
-        .unwrap_or_else(|| format!("user:{}", &user_sub[..8.min(user_sub.len())]));
-    let perms = claims.perms.clone();
+    let session = claims.into_session();
+    let (user_sub, login_name) = (session.user_sub.clone(), session.login.clone());
     let sid = new_sid();
-
-    {
-        let mut sessions = auth.sessions.write().await;
-        sessions.insert(
-            sid.clone(),
-            Session {
-                user_sub: user_sub.clone(),
-                login: login_name.clone(),
-                created_at: Instant::now(),
-                perms,
-            },
-        );
-    }
+    auth.sessions.write().await.insert(sid.clone(), session);
 
     super::users::touch(&state.pool, &user_sub, &login_name).await;
 
@@ -309,13 +310,19 @@ pub async fn require_session(
         return next.run(req).await;
     };
 
-    // Paired devices (see `devices.rs`) authenticate with a bearer token
-    // instead of the cookie. A bad token is a hard 401 — never a redirect
+    // Native clients (the Apple TV app) pair through bastion's device sign-in
+    // and send the JWT it hands them as a bearer token, refreshing it with
+    // bastion before it expires. A bad one is a hard 401 — never a redirect
     // into a browser login the device can't follow.
     if let Some(token) = bearer_token(&req) {
-        let Some(session) = auth.devices.session_for(&state.pool, token).await else {
-            return StatusCode::UNAUTHORIZED.into_response();
+        let claims = match verify_token(auth, token).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(%e, "bearer token rejected");
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
         };
+        let session = claims.into_session();
         super::users::touch(&state.pool, &session.user_sub, &session.login).await;
         let mut req = req;
         req.extensions_mut().insert(session);
