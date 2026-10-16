@@ -53,7 +53,7 @@ struct CardLabel: View {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.title3)
                         .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, .tint)
+                        .foregroundStyle(.black, .white)
                         .padding(12)
                 }
             }
