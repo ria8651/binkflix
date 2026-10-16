@@ -3,7 +3,9 @@
 # Builder produces the server binary + bundled web assets via `dx bundle`;
 # runtime is a slim Debian image with just the binary + vendored static files.
 
-FROM rust:1-trixie AS builder
+# Pinned: rustc 1.99 emits wasm that wasm-bindgen 0.2.118 can't process
+# ("import ... doesn't have an adapter listed").
+FROM rust:1.98-trixie AS builder
 RUN rustup target add wasm32-unknown-unknown \
  && curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
 
