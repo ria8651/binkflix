@@ -9,7 +9,7 @@
 
 use axum::{
     extract::{Query, Request, State},
-    http::{header, StatusCode, Uri},
+    http::{header, HeaderMap, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
     routing::get,
@@ -161,7 +161,8 @@ pub fn router() -> Router<crate::server::AppState> {
 }
 
 /// Kicks the user over to bastion to authenticate. No return URL is sent —
-/// bastion already knows where to redirect (the service's registered URL).
+/// bastion already knows where to redirect (the service's registered URL);
+/// the page to come back to rides in `RETURN_COOKIE` instead.
 async fn login(State(state): State<crate::server::AppState>) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         return (StatusCode::NOT_FOUND, "auth disabled").into_response();
@@ -236,7 +237,20 @@ async fn bastion_callback(
         .build();
     let jar = jar.add(cookie);
 
-    (jar, Redirect::to("/")).into_response()
+    // Back to the page that sent them to log in, e.g. a TV's
+    // `/link?code=…` QR link.
+    let back = jar.get(RETURN_COOKIE).map(|c| c.value().to_string()).filter(|p| is_local_path(p));
+    let jar = jar.remove(Cookie::build(RETURN_COOKIE).path("/").build());
+    (jar, Redirect::to(back.as_deref().unwrap_or("/"))).into_response()
+}
+
+/// Where to go after login, set when a signed-out browser is sent there.
+const RETURN_COOKIE: &str = "binkflix_return";
+
+/// A path on this site, not `//host` or `/\host`, which browsers treat as
+/// another origin.
+fn is_local_path(p: &str) -> bool {
+    p.starts_with('/') && !p.starts_with("//") && !p.starts_with("/\\")
 }
 
 async fn logout(
@@ -312,7 +326,7 @@ pub async fn require_session(
     // Paired devices (see `devices.rs`) authenticate with a bearer token
     // instead of the cookie. A bad token is a hard 401 — never a redirect
     // into a browser login the device can't follow.
-    if let Some(token) = bearer_token(&req) {
+    if let Some(token) = bearer_token(req.headers()) {
         let Some(session) = auth.devices.session_for(&state.pool, token).await else {
             return StatusCode::UNAUTHORIZED.into_response();
         };
@@ -338,17 +352,28 @@ pub async fn require_session(
     if req.uri().path().starts_with("/api/") || !accept.contains("text/html") {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Redirect::to("/auth/login").into_response()
+    let back = req.uri().path_and_query().map(|p| p.as_str().to_string()).filter(|p| is_local_path(p));
+    let jar = match back {
+        Some(back) => jar.add(
+            Cookie::build((RETURN_COOKIE, back))
+                .path("/")
+                .http_only(true)
+                .secure(!cfg!(debug_assertions))
+                .same_site(SameSite::Lax)
+                .build(),
+        ),
+        None => jar,
+    };
+    (jar, Redirect::to("/auth/login")).into_response()
 }
 
-fn bearer_token(req: &Request) -> Option<&str> {
-    req.headers()
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
+/// The `Authorization: Bearer …` token, if any (the scheme is
+/// case-insensitive).
+pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    Some(token.trim())
+        .filter(|t| scheme.eq_ignore_ascii_case("bearer") && !t.is_empty())
 }
 
 fn is_public_path(uri: &Uri) -> bool {

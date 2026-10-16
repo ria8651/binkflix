@@ -21,7 +21,7 @@ use super::error::{Error, Result};
 use super::AppState;
 use crate::types::{DeviceInfo, LinkedDevice};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
@@ -39,7 +39,9 @@ const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// Suggested poll interval for `/auth/device/token`, in seconds.
 const POLL_INTERVAL_SECS: u64 = 2;
 /// `/auth/device/code` is unauthenticated; cap what it can make us hold.
-const MAX_PENDING: usize = 64;
+/// Entries are tiny, so the cap is high enough that filling it to block
+/// pairing takes real effort.
+const MAX_PENDING: usize = 1024;
 /// How long a validated token is trusted before it's re-read from the DB.
 /// Bounds how often `last_used_at` is written; revocation through
 /// `DELETE /api/devices/{id}` evicts immediately regardless.
@@ -52,6 +54,9 @@ struct Pending {
     user_code: String,
     name: String,
     expires: Instant,
+    /// Set when a browser starts approving, so a second approval of the
+    /// same code (double submit, two people) can't mint a second token.
+    claimed: bool,
     /// Set once a browser approves; handed over on the next poll.
     token: Option<(String, String)>,
 }
@@ -62,6 +67,9 @@ pub struct Devices {
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     /// Token hash → session it resolves to, and when that was read.
     cache: Arc<Mutex<HashMap<String, (Session, Instant)>>>,
+    /// Bumped on every revoke. A lookup that raced a revoke doesn't cache
+    /// what it read, or the revoked token would work until the cache TTL.
+    revocations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Devices {
@@ -74,6 +82,7 @@ impl Devices {
             }
         }
 
+        let revocations = self.revocations.load(std::sync::atomic::Ordering::SeqCst);
         let row: Option<(String, String, String)> = sqlx::query_as(
             "UPDATE device_tokens SET last_used_at = ? WHERE token_hash = ?
              RETURNING user_sub, login, perms_json",
@@ -97,7 +106,9 @@ impl Devices {
             created_at: Instant::now(),
             perms: serde_json::from_str(&perms_json).unwrap_or_default(),
         };
-        cache.insert(hash, (session.clone(), Instant::now()));
+        if self.revocations.load(std::sync::atomic::Ordering::SeqCst) == revocations {
+            cache.insert(hash, (session.clone(), Instant::now()));
+        }
         Some(session)
     }
 }
@@ -157,6 +168,7 @@ async fn start(
             user_code: user_code.clone(),
             name,
             expires: Instant::now() + PAIRING_TTL,
+            claimed: false,
             token: None,
         },
     );
@@ -216,23 +228,24 @@ struct LinkBody {
 async fn link(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
+    headers: HeaderMap,
     Json(body): Json<LinkBody>,
 ) -> Result<Json<LinkedDevice>> {
+    browser_only(&headers)?;
     let wanted = normalize_user_code(&body.user_code);
     let devices = devices(&state);
 
     // Claim the pairing under the lock, then do the DB write without it.
     let (device_code, name) = {
-        let pending = devices.pending.lock().expect("pairings poisoned");
-        pending
-            .iter()
+        let mut pending = devices.pending.lock().expect("pairings poisoned");
+        let (dc, p) = pending
+            .iter_mut()
             .find(|(_, p)| {
-                p.token.is_none()
-                    && p.expires > Instant::now()
-                    && normalize_user_code(&p.user_code) == wanted
+                !p.claimed && p.expires > Instant::now() && normalize_user_code(&p.user_code) == wanted
             })
-            .map(|(dc, p)| (dc.clone(), p.name.clone()))
-            .ok_or(Error::NotFound)?
+            .ok_or(Error::NotFound)?;
+        p.claimed = true;
+        (dc.clone(), p.name.clone())
     };
 
     let token = random_hex(32);
@@ -251,7 +264,12 @@ async fn link(
     .bind(now)
     .bind(now)
     .execute(&state.pool)
-    .await?;
+    .await
+    .inspect_err(|_| {
+        if let Some(p) = devices.pending.lock().expect("pairings poisoned").get_mut(&device_code) {
+            p.claimed = false;
+        }
+    })?;
 
     if let Some(p) = devices.pending.lock().expect("pairings poisoned").get_mut(&device_code) {
         p.token = Some((token, session.login.clone()));
@@ -263,7 +281,9 @@ async fn link(
 async fn list(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<DeviceInfo>>> {
+    browser_only(&headers)?;
     let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
         "SELECT id, name, created_at, last_used_at FROM device_tokens
          WHERE user_sub = ? ORDER BY last_used_at DESC",
@@ -281,8 +301,10 @@ async fn list(
 async fn revoke(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
+    browser_only(&headers)?;
     let hash: Option<String> = sqlx::query_scalar(
         "DELETE FROM device_tokens WHERE id = ? AND user_sub = ? RETURNING token_hash",
     )
@@ -291,8 +313,20 @@ async fn revoke(
     .fetch_optional(&state.pool)
     .await?;
     let hash = hash.ok_or(Error::NotFound)?;
-    devices(&state).cache.lock().expect("device cache poisoned").remove(&hash);
+    let devices = devices(&state);
+    devices.revocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    devices.cache.lock().expect("device cache poisoned").remove(&hash);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Device management is for signed-in browsers. A paired device's token
+/// must not mint more tokens (which would outlive revoking it) or manage
+/// the user's other devices.
+fn browser_only(headers: &HeaderMap) -> Result<()> {
+    if super::auth::bearer_token(headers).is_some() {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
 }
 
 fn hash_token(token: &str) -> String {

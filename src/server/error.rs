@@ -9,6 +9,9 @@ pub enum Error {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("forbidden")]
+    Forbidden,
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 
@@ -29,6 +32,7 @@ impl IntoResponse for Error {
         let (status, msg) = match &self {
             Error::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            Error::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             Error::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m.clone()),
             Error::Sqlx(sqlx::Error::RowNotFound) => {
                 (StatusCode::NOT_FOUND, "not found".to_string())
