@@ -353,6 +353,16 @@ struct ServerInfo {
     /// `false` when bastion auth is off: every request is served as the
     /// shared dev identity, so clients skip device pairing.
     auth: bool,
+    /// Where to pair when `auth` is on: the client runs bastion's device
+    /// sign-in (RFC 8628) against `origin` with `client_id = service`, and
+    /// sends the JWT it gets back as `Authorization: Bearer`.
+    bastion: Option<BastionInfo>,
+}
+
+#[derive(Serialize)]
+struct BastionInfo {
+    origin: String,
+    service: String,
 }
 
 /// Public (no session needed) so a client can check compatibility and
@@ -363,6 +373,10 @@ async fn info(State(state): State<AppState>) -> Json<ServerInfo> {
         api_version: API_VERSION,
         build: crate::types::BUILD_ID,
         auth: state.auth.is_some(),
+        bastion: state.auth.as_ref().map(|a| BastionInfo {
+            origin: a.cfg.bastion_origin.clone(),
+            service: a.cfg.service_slug.clone(),
+        }),
     })
 }
 
