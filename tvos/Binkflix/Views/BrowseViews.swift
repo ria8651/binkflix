@@ -205,6 +205,8 @@ struct SettingsView: View {
                 Button("Change Server") { app.forgetServer() }
             }
         }
+        // Focused rows grow past the column; don't clip them.
+        .scrollClipDisabled()
         .frame(maxWidth: 1200)
     }
 }
