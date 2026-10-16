@@ -151,7 +151,7 @@ final class PlaybackSession: NSObject, AVPlayerViewControllerDelegate {
     private func loadArtwork(for media: Media, into item: AVPlayerItem) {
         let url = media.showId.map(client.showPoster) ?? client.mediaImage(media.id)
         Task {
-            guard let image = await ImageLoader.shared.load(url, headers: client.authHeaders),
+            guard let image = await ImageLoader.shared.load(url, fit: CGSize(width: 600, height: 900), fill: false, headers: client.authHeaders),
                   let data = image.jpegData(compressionQuality: 0.8) else { return }
             let art = AVMutableMetadataItem()
             art.identifier = .commonIdentifierArtwork
