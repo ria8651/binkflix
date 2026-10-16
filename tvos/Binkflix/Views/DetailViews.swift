@@ -152,33 +152,22 @@ struct ShowDetailView: View {
     @State private var reload = 0
     @State private var seasonNumber: Int?
     @FocusState private var focusedSeason: Int?
-    /// The episode card that has focus, as reported by the card. Not a
-    /// `@FocusState`: binding one onto the cards stops their tilt effect.
-    @State private var focusedEpisode: String?
-    private static let pageEnd = "page-end"
 
     var body: some View {
         Loadable(state: state, retry: { reload += 1 }) { detail in
             ZStack {
                 Backdrop(url: detail.show.hasFanart ? app.client?.showFanart(id) : nil)
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 40) {
-                            header(detail)
-                                .frame(minHeight: 560, alignment: .bottomLeading)
-                                .padding(.top, 120)
-                            seasons(detail)
-                            Color.clear.frame(height: 20).id(Self.pageEnd)
-                        }
-                    }
-                    // Focus only scrolls the artwork into view; bring the
-                    // episode text under it on screen too.
-                    .onChange(of: focusedEpisode) { _, focused in
-                        if focused != nil {
-                            withAnimation { proxy.scrollTo(Self.pageEnd, anchor: .bottom) }
-                        }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 40) {
+                        header(detail)
+                            .frame(minHeight: 560, alignment: .bottomLeading)
+                            .padding(.top, 120)
+                        seasons(detail)
                     }
                 }
+                // Focus scrolling only brings an episode's artwork into
+                // view; leave room below it for the text under it.
+                .safeAreaPadding(.bottom, 140)
             }
         }
         .task(id: [app.watchGeneration, reload]) {
@@ -258,13 +247,7 @@ struct ShowDetailView: View {
         if let season = detail.seasons.first(where: { $0.number == seasonNumber }) ?? detail.seasons.first {
             Shelf(title: season.name) {
                 ForEach(season.episodes) { episode in
-                    EpisodeCard(episode: episode) { focused in
-                        if focused {
-                            focusedEpisode = episode.id
-                        } else if focusedEpisode == episode.id {
-                            focusedEpisode = nil
-                        }
-                    }
+                    EpisodeCard(episode: episode)
                 }
             }
         }
@@ -280,7 +263,6 @@ struct ShowDetailView: View {
 
 struct EpisodeCard: View {
     let episode: EpisodeSummary
-    var onFocusChange: (Bool) -> Void = { _ in }
     @Environment(AppModel.self) private var app
     @Environment(PlayerPresenter.self) private var player
 
@@ -295,8 +277,7 @@ struct EpisodeCard: View {
                 subtitle: runtime(episode.runtimeMinutes),
                 detail: episode.plot,
                 progress: episode.progress,
-                watched: episode.isCompleted,
-                onFocusChange: onFocusChange
+                watched: episode.isCompleted
             )
         }
         .buttonStyle(.borderless)
