@@ -153,17 +153,28 @@ struct ShowDetailView: View {
     @State private var seasonNumber: Int?
     @FocusState private var focusedSeason: Int?
     @FocusState private var focusedEpisode: String?
+    private static let pageEnd = "page-end"
 
     var body: some View {
         Loadable(state: state, retry: { reload += 1 }) { detail in
             ZStack {
                 Backdrop(url: detail.show.hasFanart ? app.client?.showFanart(id) : nil)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 40) {
-                        header(detail)
-                            .frame(minHeight: 560, alignment: .bottomLeading)
-                            .padding(.top, 120)
-                        seasons(detail)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 40) {
+                            header(detail)
+                                .frame(minHeight: 560, alignment: .bottomLeading)
+                                .padding(.top, 120)
+                            seasons(detail)
+                            Color.clear.frame(height: 20).id(Self.pageEnd)
+                        }
+                    }
+                    // Focus only scrolls the artwork into view; bring the
+                    // episode text under it on screen too.
+                    .onChange(of: focusedEpisode) { _, focused in
+                        if focused != nil {
+                            withAnimation { proxy.scrollTo(Self.pageEnd, anchor: .bottom) }
+                        }
                     }
                 }
             }
@@ -280,6 +291,7 @@ struct EpisodeCard: View {
                 size: CardSize.landscape,
                 title: "\(episode.episodeNumber). \(episode.title)",
                 subtitle: runtime(episode.runtimeMinutes),
+                detail: episode.plot,
                 progress: episode.progress,
                 watched: episode.isCompleted
             )

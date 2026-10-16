@@ -36,6 +36,8 @@ struct CardLabel: View {
     let size: CGSize
     let title: String
     var subtitle: String?
+    /// Longer text under the subtitle, e.g. an episode's plot.
+    var detail: String?
     /// 0…1 watch progress drawn across the bottom of the artwork.
     var progress: Double?
     var watched = false
@@ -68,6 +70,13 @@ struct CardLabel: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+            }
+            if let detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3, reservesSpace: true)
+                    .padding(.top, 6)
             }
         }
         .frame(width: size.width, alignment: .leading)
