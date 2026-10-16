@@ -18,6 +18,7 @@ use tower_http::services::ServeFile;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/info", get(info))
         .route("/api/me", get(me))
         .route("/api/library", get(library))
         .route("/api/media/{id}", get(media))
@@ -131,12 +132,12 @@ async fn playback_sample(
     // session_id (or to a fabricated one) and pollute analytics. We pull the
     // delivery params in the same round-trip so we can attach authoritative
     // server-side transcode telemetry below.
-    /// `(user_sub, file_id, delivery_mode, audio_idx, target_bitrate_kbps)`
-    /// as selected from `playback_sessions`.
-    type SessionDeliveryRow = (Option<String>, Option<String>, String, Option<i64>, Option<i64>);
+    /// `(user_sub, file_id, delivery_mode, target_bitrate_kbps)` as
+    /// selected from `playback_sessions`.
+    type SessionDeliveryRow = (Option<String>, Option<String>, String, Option<i64>);
     let row: Option<SessionDeliveryRow> =
         match sqlx::query_as(
-            "SELECT user_sub, file_id, delivery_mode, audio_idx, target_bitrate_kbps
+            "SELECT user_sub, file_id, delivery_mode, target_bitrate_kbps
              FROM playback_sessions WHERE id = ?",
         )
         .bind(&body.session_id)
@@ -146,7 +147,7 @@ async fn playback_sample(
             Ok(r) => r,
             Err(_) => return StatusCode::NO_CONTENT,
         };
-    let Some((owner, file_id, delivery_mode, audio_idx, target_bitrate)) = row else {
+    let Some((owner, file_id, delivery_mode, target_bitrate)) = row else {
         // Unknown session.
         return StatusCode::FORBIDDEN;
     };
@@ -162,13 +163,12 @@ async fn playback_sample(
     // progress, which only the server can see — fill them from the live
     // producer rather than trusting the client (which leaves them None).
     // `observed_kbps` stays whatever the client reports: it's the viewer's
-    // own network throughput. Resolve the same `(file_id, audio_idx,
-    // mode_tag)` key the HLS endpoint cached under so we snapshot the right
+    // own network throughput. Resolve the same `(file_id, track)` key the
+    // HLS endpoint cached the video under so we snapshot the right
     // producer.
     let telemetry = match file_id.as_deref() {
         Some(file_id) => {
-            server_transcode_telemetry(&state, file_id, &delivery_mode, audio_idx, target_bitrate)
-                .await
+            server_transcode_telemetry(&state, file_id, &delivery_mode, target_bitrate).await
         }
         None => None,
     };
@@ -207,33 +207,33 @@ async fn playback_sample(
 /// Snapshot the live HLS producer for a session and return
 /// `(transcode_position_ms, transcode_rate_x100)`. `None` when the session
 /// isn't going through the transcode/remux pipeline (direct serve has no
-/// producer) or no producer is currently live for that key. The producer's
-/// `head` is the highest finished segment; segments are a nominal 6s, so the
-/// encoder's leading edge in media time is `head × 6000ms`.
+/// producer) or no producer is currently live for that key. The video
+/// producer is the one reported: it's the expensive half, and the one a
+/// slow encode stalls. Its `head` is the highest finished segment; segments
+/// are a nominal 6s, so the encoder's leading edge in media time is
+/// `head × 6000ms`.
 async fn server_transcode_telemetry(
     state: &AppState,
     file_id: &str,
     delivery_mode: &str,
-    audio_idx: Option<i64>,
     target_bitrate: Option<i64>,
 ) -> Option<(i64, i64)> {
-    let mode_tag_prefix = match delivery_mode {
-        "remux" => "remux".to_string(),
+    let track_prefix = match delivery_mode {
+        "remux" => "v-remux".to_string(),
         "transcode" => {
-            // Rebuild as much of the `tx{bitrate}h{height}` tag the HLS
+            // Rebuild as much of the `v-tx{bitrate}h{height}` tag the HLS
             // endpoint caches under (see `resolve_plan`) as this row can
             // support. Height isn't recorded and is no longer derivable
             // from the bitrate under Auto, so we match on the prefix.
             let bitrate = u32::try_from(target_bitrate?).ok()?;
-            format!("tx{bitrate}h")
+            format!("v-tx{bitrate}h")
         }
         // "direct" (or anything else) doesn't spawn a producer.
         _ => return None,
     };
-    let audio_idx = audio_idx.and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
     let snap = state
         .hls_producers
-        .snapshot_by_prefix(file_id, audio_idx, &mode_tag_prefix)
+        .snapshot_by_prefix(file_id, &track_prefix)
         .await?;
     let position_ms = i64::from(snap.head) * 6000;
     Some((position_ms, i64::from(snap.encode_rate_x100)))
@@ -336,6 +336,48 @@ async fn create_room(
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Version of the API native clients (the Apple TV app) are written against.
+/// The web client ships with the server so it never cares; a native build
+/// outlives server deploys, so bump this on any change an already-installed
+/// client would trip over (removed/renamed fields or routes, changed
+/// semantics). Additive changes don't need a bump.
+pub const API_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct ServerInfo {
+    name: &'static str,
+    api_version: u32,
+    build: &'static str,
+    /// `false` when bastion auth is off: every request is served as the
+    /// shared dev identity, so clients skip device pairing.
+    auth: bool,
+    /// Where to pair when `auth` is on: the client runs bastion's device
+    /// sign-in (RFC 8628) against `origin` with `client_id = service`, and
+    /// trades the JWT at `/auth/bastion` for a session cookie.
+    bastion: Option<BastionInfo>,
+}
+
+#[derive(Serialize)]
+struct BastionInfo {
+    origin: String,
+    service: String,
+}
+
+/// Public (no session needed) so a client can check compatibility and
+/// whether to pair before it has credentials.
+async fn info(State(state): State<AppState>) -> Json<ServerInfo> {
+    Json(ServerInfo {
+        name: "binkflix",
+        api_version: API_VERSION,
+        build: crate::types::BUILD_ID,
+        auth: state.auth.is_some(),
+        bastion: state.auth.as_ref().map(|a| BastionInfo {
+            origin: a.cfg.bastion_origin.clone(),
+            service: a.cfg.service_slug.clone(),
+        }),
+    })
 }
 
 async fn me(Extension(session): Extension<super::auth::Session>) -> Json<crate::types::Me> {

@@ -58,7 +58,15 @@ use tokio::process::Command;
 ///          too, so Auto derives it from the source resolution instead of
 ///          from the bitrate. All of these change segment bytes under tags
 ///          that would otherwise collide with v12's.
-pub const PLAN_VERSION: u32 = 13;
+///   v14:   HEVC remux tagged `hvc1` instead of ffmpeg's default `hev1` —
+///          Apple's HLS stack (AVPlayer, Safari) only accepts `hvc1` in
+///          fMP4. Changes init.mp4 bytes for every HEVC remux.
+///   v15:   Audio demuxed out of the video segments into its own renditions
+///          (see `AudioPlan`), served behind a master playlist. Video
+///          segments are video-only and shared across audio tracks; the
+///          plan carries the variant's `CODECS` string. Each audio grid
+///          starts at its track's first sample, not 0.
+pub const PLAN_VERSION: u32 = 15;
 
 /// Target segment length. ffmpeg only cuts at source keyframes under
 /// `-c:v copy`, so real segments will land near this value but vary with
@@ -71,19 +79,29 @@ const TARGET_SEGMENT_SECS: f64 = 6.0;
 /// transcode for better seeking.
 const MAX_SEGMENT_WARN_SECS: f64 = 30.0;
 
-/// Top-level plan persisted as JSON in `media_files.stream_plan_json`.
+/// Top-level plan for the video rendition, persisted as JSON in
+/// `media_files.stream_plan_json` (remux only; transcode plans are cheap
+/// to rebuild).
 ///
-/// Audio is intentionally absent: the per-request `audio_idx` decides
-/// which source stream to mux, and `derive_audio_plan` builds the
-/// matching `AudioPlan` on demand. That lets a single persisted plan
-/// serve every audio track on the file without growing per-track
-/// duplicates in the DB.
+/// Audio is intentionally absent: each audio track is its own rendition
+/// with its own timeline (see `AudioPlan`), so one persisted plan serves
+/// every audio track on the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamPlan {
     pub version: u32,
     pub mode: Mode,
     pub duration: f64,
     pub video_codec: String,
+    /// RFC 6381 codec string of the output video (`avc1.640029`,
+    /// `hvc1.2.4.L120.B0`) for the master playlist's `CODECS`, which is how
+    /// players pick between the stereo and surround variants. `None` when
+    /// the source's parameters couldn't be read.
+    #[serde(default)]
+    pub codecs: Option<String>,
+    /// `PQ` / `HLG` for HDR sources, `None` for SDR. Without it AVPlayer
+    /// treats an HDR stream as SDR.
+    #[serde(default)]
+    pub video_range: Option<String>,
     pub segments: Vec<Segment>,
 }
 
@@ -118,14 +136,71 @@ pub enum Mode {
     },
 }
 
+/// The two renditions an audio track can be served as. Each lives in its
+/// own `EXT-X-MEDIA` group referenced by its own variant, so a player
+/// picks by what it can decode (`CODECS`) rather than us guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioFlavor {
+    /// Stereo AAC. Decodes everywhere, so every track gets one.
+    Stereo,
+    /// The source's channels, passed through where Apple can play the
+    /// codec and otherwise E-AC-3 5.1. Only for tracks with more than two
+    /// channels.
+    Surround,
+}
+
+impl AudioFlavor {
+    pub const ALL: [AudioFlavor; 2] = [AudioFlavor::Stereo, AudioFlavor::Surround];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AudioFlavor::Stereo => "stereo",
+            AudioFlavor::Surround => "surround",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.as_str() == s)
+    }
+}
+
+/// One audio rendition: which source track, how ffmpeg turns it into the
+/// output, and its timeline. Derived per request from the probe (cheap),
+/// never persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioPlan {
-    pub src_codec: Option<String>,
-    /// What the producer's ffmpeg will emit. Either "copy" (when source is
-    /// already AAC/MP3) or "aac" (everything else gets transcoded — cheap).
+    pub idx: u32,
+    pub flavor: AudioFlavor,
+    pub src_codec: String,
+    /// What the producer's ffmpeg will emit: `copy`, `aac` or `eac3`.
     pub out_codec: String,
     pub channels: u32,
+    /// Output bitrate, or the source's for `copy` (an estimate when the
+    /// probe has none). Only feeds the master playlist's `BANDWIDTH`.
     pub bitrate_kbps: u32,
+    /// RFC 6381 codec string for `CODECS`.
+    pub codecs: String,
+    /// `CHANNELS` attribute: the channel count, or `16/JOC` for Atmos.
+    pub channels_attr: String,
+    /// Uniform 6s grid over the track. Audio cuts anywhere, so unlike a
+    /// remux video plan this needs no probe pass. Segment times are from
+    /// `origin`.
+    pub segments: Vec<Segment>,
+    /// Source timestamp of the track's first sample, where the grid
+    /// starts. The HLS muxer cuts every 6s from a run's first packet, so
+    /// runs launched mid-file have to start on this grid to line up with
+    /// the segments around them.
+    pub origin: f64,
+    /// Source timestamp that input `-ss` is relative to.
+    pub container_start: f64,
+}
+
+impl AudioPlan {
+    /// Cache and producer key, e.g. `a0-stereo`.
+    pub fn tag(&self) -> String {
+        format!("a{}-{}", self.idx, self.flavor.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,9 +307,24 @@ pub fn build_transcode_plan(
         },
         duration,
         video_codec: v.codec.clone(),
+        // Every backend is pinned to High@4.1 (see `apply_video_args`).
+        codecs: Some(TRANSCODE_CODECS.into()),
+        // Encoded as 8-bit SDR whatever the source was.
+        video_range: None,
         segments,
     })
 }
+
+/// `CODECS` for transcoded video: H.264 High, level 4.1.
+const TRANSCODE_CODECS: &str = "avc1.640029";
+
+/// A uniform grid's last segment shorter than this is folded into the one
+/// before. Durations are approximate (the container's is its longest
+/// stream's; frame sizes overhang), and a sliver segment the stream doesn't
+/// actually reach is one ffmpeg never writes — a request for it would wait
+/// out the full timeout. Losing up to this much at the very end is the
+/// cheaper failure.
+const MIN_TAIL_SECS: f64 = 1.0;
 
 fn uniform_segments(duration: f64, target_secs: f64) -> Vec<Segment> {
     let mut out = Vec::new();
@@ -246,8 +336,10 @@ fn uniform_segments(duration: f64, target_secs: f64) -> Vec<Segment> {
         t += target_secs;
     }
     let tail = (duration - t).max(0.0);
-    if tail > 0.0 {
-        out.push(Segment { i: idx, t, d: tail });
+    match out.last_mut() {
+        Some(last) if tail < MIN_TAIL_SECS => last.d += tail,
+        _ if tail > 0.0 => out.push(Segment { i: idx, t, d: tail }),
+        _ => {}
     }
     out
 }
@@ -262,37 +354,204 @@ pub async fn build_remux_plan(src: &Path, info: &MediaTechInfo) -> anyhow::Resul
     let duration = info.duration_seconds.expect("viable => duration present");
 
     let segments = probe_segments(src, duration).await?;
+    let (codecs, video_range) = probe_video_params(src, &v.codec).await;
 
     Ok(StreamPlan {
         version: PLAN_VERSION,
         mode: Mode::Remux,
         duration,
         video_codec: v.codec.clone(),
+        codecs,
+        video_range,
         segments,
     })
 }
 
-/// Pick the Nth audio stream from the probe and decide whether ffmpeg
-/// should copy it through or transcode to AAC. Returns `None` when the
-/// source has no audio at all OR when `audio_idx` overruns the available
-/// streams — callers treat that as "no audio mapped" (ffmpeg's
-/// `-map 0:a:N?` then silently drops the audio map).
-///
-/// `aac`/`mp3` → copy (browsers decode them natively in MP4).
-/// Everything else (`ac3`/`dts`/`eac3`/`truehd`/…) → re-encode to
-/// stereo AAC at 192 kbps. Re-encode is cheap relative to video.
-pub fn derive_audio_plan(info: &MediaTechInfo, audio_idx: u32) -> Option<AudioPlan> {
-    let track = info.audio.get(audio_idx as usize)?;
-    let src_codec = Some(track.codec.clone());
-    let out_codec = match src_codec.as_deref() {
-        Some("aac") | Some("mp3") => "copy".to_string(),
-        _ => "aac".to_string(),
+/// Read the source video's `CODECS` string and `VIDEO-RANGE`. The codec
+/// string comes from the decoder configuration record (`avcC`/`hvcC`),
+/// which `-c:v copy` carries into init.mp4 unchanged, so it's exact. Sources
+/// that store Annex-B parameter sets instead (MPEG-TS) fall back to
+/// ffprobe's profile and level. Best-effort: a failed probe only costs the
+/// master playlist its `CODECS`.
+async fn probe_video_params(src: &Path, codec: &str) -> (Option<String>, Option<String>) {
+    #[derive(Deserialize)]
+    struct Out {
+        #[serde(default)]
+        streams: Vec<Stream>,
+    }
+    #[derive(Deserialize)]
+    struct Stream {
+        profile: Option<String>,
+        level: Option<i64>,
+        color_transfer: Option<String>,
+        extradata: Option<String>,
+    }
+    let output = Command::new("ffprobe")
+        .arg("-v").arg("error")
+        .arg("-protocol_whitelist").arg("file")
+        .arg("-select_streams").arg("v:0")
+        .arg("-show_entries").arg("stream=profile,level,color_transfer,extradata")
+        .arg("-show_data")
+        .arg("-of").arg("json")
+        .arg(src)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let Some(s) = output
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| serde_json::from_slice::<Out>(&o.stdout).ok())
+        .and_then(|o| o.streams.into_iter().next())
+    else {
+        return (None, None);
     };
+    let record = s.extradata.as_deref().map(parse_hexdump).unwrap_or_default();
+    let codecs = codecs_from_record(codec, &record)
+        .or_else(|| codecs_from_profile(codec, s.profile.as_deref(), s.level));
+    let range = match s.color_transfer.as_deref() {
+        Some("smpte2084") => Some("PQ".to_string()),
+        Some("arib-std-b67") => Some("HLG".to_string()),
+        _ => None,
+    };
+    (codecs, range)
+}
+
+/// Decode ffprobe's `-show_data` hexdump
+/// (`00000000: 0164 000d ffe1 ...  .d......`) back into bytes.
+fn parse_hexdump(dump: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in dump.lines() {
+        let Some((_, rest)) = line.split_once(": ") else { continue };
+        // The ASCII column starts after a run of two spaces.
+        let hex = rest.split("  ").next().unwrap_or_default();
+        let digits: Vec<u8> = hex.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
+        for pair in digits.chunks_exact(2) {
+            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(pair).unwrap_or_default(), 16) {
+                out.push(b);
+            }
+        }
+    }
+    out
+}
+
+/// RFC 6381 string from an `avcC` / `hvcC` decoder configuration record
+/// (ISO/IEC 14496-15). `None` for anything else, including Annex-B
+/// extradata, which starts with a start code rather than version 1.
+fn codecs_from_record(codec: &str, r: &[u8]) -> Option<String> {
+    match codec {
+        "h264" if r.len() >= 4 && r[0] == 1 => {
+            Some(format!("avc1.{:02x}{:02x}{:02x}", r[1], r[2], r[3]))
+        }
+        "hevc" if r.len() >= 13 && r[0] == 1 => {
+            let space = ["", "A", "B", "C"][(r[1] >> 6) as usize];
+            let tier = if r[1] & 0x20 != 0 { 'H' } else { 'L' };
+            let profile = r[1] & 0x1f;
+            // The compatibility flags are written bit-reversed.
+            let compat = u32::from_be_bytes([r[2], r[3], r[4], r[5]]).reverse_bits();
+            // Constraint bytes, trailing zero bytes dropped.
+            let mut constraints: Vec<String> = r[6..12].iter().map(|b| format!("{b:X}")).collect();
+            while constraints.len() > 1 && constraints.last().is_some_and(|c| c == "0") {
+                constraints.pop();
+            }
+            Some(format!(
+                "hvc1.{space}{profile}.{compat:X}.{tier}{}.{}",
+                r[12],
+                constraints.join(".")
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Approximate `CODECS` from ffprobe's profile name and level, for sources
+/// without a configuration record. The constraint fields are guesses (the
+/// common values), which players tolerate.
+fn codecs_from_profile(codec: &str, profile: Option<&str>, level: Option<i64>) -> Option<String> {
+    let level = level.filter(|l| *l > 0)?;
+    match codec {
+        "h264" => {
+            let (idc, constraints) = match profile? {
+                "Constrained Baseline" => (0x42, 0x40),
+                "Baseline" => (0x42, 0x00),
+                "Main" => (0x4d, 0x00),
+                "High" => (0x64, 0x00),
+                "High 10" => (0x6e, 0x00),
+                "High 4:2:2" => (0x7a, 0x00),
+                "High 4:4:4 Predictive" => (0xf4, 0x00),
+                _ => return None,
+            };
+            Some(format!("avc1.{idc:02x}{constraints:02x}{level:02x}"))
+        }
+        "hevc" => {
+            let (idc, compat) = match profile? {
+                "Main" => (1, 6),
+                "Main 10" => (2, 4),
+                "Rext" => (4, 10),
+                _ => return None,
+            };
+            Some(format!("hvc1.{idc}.{compat:X}.L{level}.B0"))
+        }
+        _ => None,
+    }
+}
+
+/// Bitrate assumed for a copied track whose probe reported none.
+const COPY_FALLBACK_KBPS: u32 = 640;
+const STEREO_AAC_KBPS: u32 = 192;
+const SURROUND_EAC3_KBPS: u32 = 640;
+
+/// Plan source audio track `idx` as `flavor`. `None` when the track
+/// doesn't exist, or for `Surround` when it has two channels or fewer
+/// (the stereo rendition already carries everything).
+///
+/// * **Stereo**: AAC that's already stereo is copied. Anything else is
+///   downmixed to 192k AAC, which every browser and Apple device decodes.
+/// * **Surround**: AAC, AC-3 and E-AC-3 are copied, since Apple plays all
+///   three (and passes AC-3/E-AC-3 through to a receiver). Codecs it can't
+///   play (DTS, TrueHD, FLAC, Opus, PCM) become E-AC-3 5.1 at 640k.
+pub fn derive_audio_plan(info: &MediaTechInfo, idx: u32, flavor: AudioFlavor) -> Option<AudioPlan> {
+    let track = info.audio.get(idx as usize)?;
+    let src_channels = track.channels.unwrap_or(2);
+    let src_kbps = track.bitrate_kbps.and_then(|b| u32::try_from(b).ok());
+    let codec = track.codec.as_str();
+    let (out_codec, channels, bitrate_kbps, codecs) = match flavor {
+        AudioFlavor::Stereo if codec == "aac" && src_channels <= 2 => {
+            ("copy", src_channels, src_kbps.unwrap_or(STEREO_AAC_KBPS), "mp4a.40.2")
+        }
+        AudioFlavor::Stereo => ("aac", 2, STEREO_AAC_KBPS, "mp4a.40.2"),
+        AudioFlavor::Surround if src_channels <= 2 => return None,
+        AudioFlavor::Surround => match codec {
+            "aac" => ("copy", src_channels, src_kbps.unwrap_or(COPY_FALLBACK_KBPS), "mp4a.40.2"),
+            "ac3" => ("copy", src_channels, src_kbps.unwrap_or(COPY_FALLBACK_KBPS), "ac-3"),
+            "eac3" => ("copy", src_channels, src_kbps.unwrap_or(COPY_FALLBACK_KBPS), "ec-3"),
+            _ => ("eac3", src_channels.min(6), SURROUND_EAC3_KBPS, "ec-3"),
+        },
+    };
+    // Atmos in E-AC-3 is signalled as joint object coding, not a count.
+    let atmos = out_codec == "copy"
+        && codec == "eac3"
+        && track.profile.as_deref().is_some_and(|p| p.contains("Atmos"));
+    let channels_attr = if atmos { "16/JOC".to_string() } else { channels.to_string() };
+    // The track's own length where the probe has it: the container's is
+    // the longest stream's, and grid slots past this track's end never get
+    // written.
+    let duration = track
+        .duration_seconds
+        .or(info.duration_seconds)
+        .filter(|d| d.is_finite() && *d > 0.0)?;
     Some(AudioPlan {
-        src_codec,
-        out_codec,
-        channels: 2,
-        bitrate_kbps: 192,
+        idx,
+        flavor,
+        src_codec: codec.to_string(),
+        out_codec: out_codec.to_string(),
+        channels,
+        bitrate_kbps,
+        codecs: codecs.to_string(),
+        channels_attr,
+        segments: uniform_segments(duration, TARGET_SEGMENT_SECS),
+        origin: track.start_seconds.or(info.start_seconds).unwrap_or(0.0),
+        container_start: info.start_seconds.unwrap_or(0.0),
     })
 }
 
@@ -491,6 +750,143 @@ pub async fn store(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{AudioTrackInfo, BrowserCompat};
+
+    #[test]
+    fn hexdump_parses_back_to_bytes() {
+        let dump = "\n00000000: 0164 000d ffe1 0019 6764 000d acd9 4141  .d......gd....AA\n\
+                    00000010: fb01 10                                  ...\n";
+        assert_eq!(
+            parse_hexdump(dump),
+            vec![0x01, 0x64, 0x00, 0x0d, 0xff, 0xe1, 0x00, 0x19, 0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9, 0x41, 0x41, 0xfb, 0x01, 0x10]
+        );
+    }
+
+    #[test]
+    fn codecs_from_avcc() {
+        // x264 High@1.3, as ffprobe dumped it.
+        let r = [0x01, 0x64, 0x00, 0x0d, 0xff, 0xe1];
+        assert_eq!(codecs_from_record("h264", &r).as_deref(), Some("avc1.64000d"));
+    }
+
+    #[test]
+    fn codecs_from_hvcc() {
+        // x265 Main@3.1: profile 1, compat flags 0x60000000 (bit-reversed
+        // to 6), constraint byte 0x90, level_idc 93.
+        let main = [0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x90, 0, 0, 0, 0, 0, 0x5d];
+        assert_eq!(codecs_from_record("hevc", &main).as_deref(), Some("hvc1.1.6.L93.90"));
+        // Main 10, high tier, level 5.1 (153), typical UHD Blu-ray header.
+        let main10 = [0x01, 0x22, 0x20, 0x00, 0x00, 0x00, 0xb0, 0, 0, 0, 0, 0, 0x99];
+        assert_eq!(codecs_from_record("hevc", &main10).as_deref(), Some("hvc1.2.4.H153.B0"));
+    }
+
+    #[test]
+    fn annex_b_extradata_falls_back_to_profile_and_level() {
+        let annex_b = [0x00, 0x00, 0x00, 0x01, 0x67, 0x64];
+        assert_eq!(codecs_from_record("h264", &annex_b), None);
+        assert_eq!(codecs_from_profile("h264", Some("High"), Some(41)).as_deref(), Some("avc1.640029"));
+        assert_eq!(codecs_from_profile("hevc", Some("Main 10"), Some(120)).as_deref(), Some("hvc1.2.4.L120.B0"));
+        assert_eq!(codecs_from_profile("hevc", Some("Main"), None), None);
+        assert_eq!(codecs_from_profile("vp9", Some("Profile 0"), Some(41)), None);
+    }
+
+    fn track(codec: &str, channels: u32) -> AudioTrackInfo {
+        AudioTrackInfo {
+            codec: codec.into(),
+            profile: None,
+            duration_seconds: None,
+            start_seconds: None,
+            channels: Some(channels),
+            channel_layout: None,
+            sample_rate_hz: Some(48_000),
+            bitrate_kbps: None,
+            language: None,
+            title: None,
+            default: false,
+        }
+    }
+
+    fn info(audio: Vec<AudioTrackInfo>) -> MediaTechInfo {
+        MediaTechInfo {
+            container: Some("matroska".into()),
+            duration_seconds: Some(20.0),
+            start_seconds: None,
+            bitrate_kbps: None,
+            file_size: None,
+            video: None,
+            audio,
+            browser_compat: BrowserCompat::Remux,
+            compat_reason: None,
+        }
+    }
+
+    fn flavors(t: AudioTrackInfo) -> (Option<String>, Option<String>) {
+        let i = info(vec![t]);
+        let out = |f| derive_audio_plan(&i, 0, f).map(|a| format!("{} {} {}", a.out_codec, a.codecs, a.channels_attr));
+        (out(AudioFlavor::Stereo), out(AudioFlavor::Surround))
+    }
+
+    #[test]
+    fn stereo_sources_get_only_a_stereo_rendition() {
+        assert_eq!(flavors(track("aac", 2)), (Some("copy mp4a.40.2 2".into()), None));
+        assert_eq!(flavors(track("mp3", 2)), (Some("aac mp4a.40.2 2".into()), None));
+        assert_eq!(flavors(track("ac3", 2)), (Some("aac mp4a.40.2 2".into()), None));
+    }
+
+    #[test]
+    fn surround_passes_apple_codecs_through_and_converts_the_rest() {
+        assert_eq!(flavors(track("ac3", 6)), (Some("aac mp4a.40.2 2".into()), Some("copy ac-3 6".into())));
+        assert_eq!(flavors(track("eac3", 6)).1, Some("copy ec-3 6".into()));
+        assert_eq!(flavors(track("aac", 6)).1, Some("copy mp4a.40.2 6".into()));
+        // TrueHD 7.1 has no Apple decoder: E-AC-3, capped at 5.1.
+        assert_eq!(flavors(track("truehd", 8)).1, Some("eac3 ec-3 6".into()));
+        assert_eq!(flavors(track("dts", 6)).1, Some("eac3 ec-3 6".into()));
+    }
+
+    #[test]
+    fn atmos_is_signalled_as_joint_object_coding() {
+        let mut t = track("eac3", 6);
+        t.profile = Some("Dolby Digital Plus + Dolby Atmos".into());
+        assert_eq!(flavors(t).1, Some("copy ec-3 16/JOC".into()));
+    }
+
+    #[test]
+    fn audio_timeline_is_a_uniform_grid() {
+        let a = derive_audio_plan(&info(vec![track("aac", 2)]), 0, AudioFlavor::Stereo).unwrap();
+        let starts: Vec<f64> = a.segments.iter().map(|s| s.t).collect();
+        assert_eq!(starts, vec![0.0, 6.0, 12.0, 18.0]);
+        assert!((a.segments[3].d - 2.0).abs() < 1e-9);
+        assert_eq!(a.tag(), "a0-stereo");
+        assert!(derive_audio_plan(&info(vec![]), 0, AudioFlavor::Stereo).is_none());
+    }
+
+    #[test]
+    fn audio_timeline_follows_the_track_and_folds_a_sliver_tail() {
+        // Container says 20s (its longest stream); this track is 18.021s.
+        // The 0.021s past 18 is folded into the last segment rather than
+        // becoming a slot ffmpeg would never write.
+        let mut t = track("ac3", 6);
+        t.duration_seconds = Some(18.021);
+        let a = derive_audio_plan(&info(vec![t]), 0, AudioFlavor::Surround).unwrap();
+        assert_eq!(a.segments.len(), 3);
+        assert!((a.segments[2].d - 6.021).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_grid_starts_at_the_tracks_first_sample() {
+        // Audio delayed 0.5s in a TS whose clock starts at 1.4s: runs seek
+        // relative to the container but cut on the track's own grid.
+        let mut t = track("ac3", 6);
+        t.start_seconds = Some(1.9);
+        let mut i = info(vec![t]);
+        i.start_seconds = Some(1.4);
+        let a = derive_audio_plan(&i, 0, AudioFlavor::Surround).unwrap();
+        assert!((a.origin - 1.9).abs() < 1e-9);
+        assert!((a.container_start - 1.4).abs() < 1e-9);
+        // Probes from before start times were recorded keep the old grid.
+        let a = derive_audio_plan(&info(vec![track("ac3", 6)]), 0, AudioFlavor::Surround).unwrap();
+        assert_eq!((a.origin, a.container_start), (0.0, 0.0));
+    }
 
     #[test]
     fn group_segments_short_gop_yields_six_second_segments() {

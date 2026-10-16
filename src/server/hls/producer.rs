@@ -75,7 +75,7 @@
 
 use super::cache;
 use super::hwenc::{HwEncConfig, HwEncoder};
-use super::plan::{AudioPlan, Mode, StreamPlan};
+use super::plan::{AudioPlan, Mode, Segment, StreamPlan};
 use dashmap::DashMap;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
@@ -151,7 +151,7 @@ const VAAPI_QUALITY: u32 = 20;
 const FOLLOWER_POLL: Duration = Duration::from_millis(200);
 const FOLLOWER_STALL_GRACE: Duration = Duration::from_millis(1500);
 
-/// Registry key: `(file_id, audio_idx, mode_tag)`. Each key maps to a
+/// Registry key: `(file_id, track tag)` (see [`Track::tag`]). Each key maps to a
 /// *pool* of producers, not a single one. A segment request follows a
 /// pooled producer already covering its region (so synced viewers
 /// coalesce onto one ffmpeg); a request for a genuinely different region
@@ -161,7 +161,7 @@ const FOLLOWER_STALL_GRACE: Duration = Duration::from_millis(1500);
 /// cache is shared across the whole pool (it's keyed only by this tuple),
 /// so two producers promoting the same segment is a harmless
 /// first-writer-wins.
-type ProducerKey = (String, u32, String);
+type ProducerKey = (String, String);
 
 #[derive(Default)]
 pub struct ProducerRegistry {
@@ -173,24 +173,23 @@ impl ProducerRegistry {
         Arc::new(Self::default())
     }
 
-    fn pool(&self, file_id: &str, audio_idx: u32, mode_tag: &str) -> Arc<Mutex<Vec<ProducerHandle>>> {
+    fn pool(&self, file_id: &str, tag: &str) -> Arc<Mutex<Vec<ProducerHandle>>> {
         self.by_media
-            .entry((file_id.to_string(), audio_idx, mode_tag.to_string()))
+            .entry((file_id.to_string(), tag.to_string()))
             .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
             .clone()
     }
 
-    /// Snapshot the lead producer whose mode tag *starts with* `prefix`.
+    /// Snapshot the lead producer whose track tag *starts with* `prefix`.
     ///
     /// The analytics row records the target bitrate but not the height, and
     /// since Auto now derives height from the source resolution the two are
-    /// no longer a fixed pair — `tx{bitrate}h` is the most specific key the
-    /// telemetry endpoint can rebuild from what it stored. `remux` has no
+    /// no longer a fixed pair — `v-tx{bitrate}h` is the most specific key the
+    /// telemetry endpoint can rebuild from what it stored. `v-remux` has no
     /// suffix, so it round-trips through the same call unchanged.
     pub async fn snapshot_by_prefix(
         &self,
         file_id: &str,
-        audio_idx: u32,
         prefix: &str,
     ) -> Option<crate::types::HlsProducerState> {
         // Resolve to an owned tag first: holding a DashMap guard across the
@@ -199,15 +198,15 @@ impl ProducerRegistry {
             .by_media
             .iter()
             .find(|e| {
-                let (m, a, tag) = e.key();
-                m == file_id && *a == audio_idx && tag.starts_with(prefix)
+                let (m, tag) = e.key();
+                m == file_id && tag.starts_with(prefix)
             })
-            .map(|e| e.key().2.clone())?;
-        self.snapshot(file_id, audio_idx, &tag).await
+            .map(|e| e.key().1.clone())?;
+        self.snapshot(file_id, &tag).await
     }
 
-    pub async fn snapshot(&self, file_id: &str, audio_idx: u32, mode_tag: &str) -> Option<crate::types::HlsProducerState> {
-        let pool = self.by_media.get(&(file_id.to_string(), audio_idx, mode_tag.to_string())).map(|e| e.clone())?;
+    pub async fn snapshot(&self, file_id: &str, tag: &str) -> Option<crate::types::HlsProducerState> {
+        let pool = self.by_media.get(&(file_id.to_string(), tag.to_string())).map(|e| e.clone())?;
         let guard = pool.lock().await;
         // Report the lead producer (furthest along). The debug panel
         // shows one row; the pool is usually size 1 anyway.
@@ -295,6 +294,9 @@ pub struct ProducerHandle {
     /// the client to push back.
     pub target_head: Arc<AtomicU32>,
     pub paused: Arc<AtomicBool>,
+    /// Set by the watcher once ffmpeg has finished the source (it wrote
+    /// `#EXT-X-ENDLIST`) and every segment it wrote is promoted.
+    pub done: Arc<AtomicBool>,
     pub last_request_at: Arc<RwLock<Instant>>,
     pub child: Child,
     /// Per-run scratch dir. ffmpeg writes here; watcher promotes to
@@ -335,18 +337,9 @@ pub struct ProducerCtx {
     /// are keyed by, since segments are only interchangeable within a file.
     pub file_id: String,
     pub source: PathBuf,
-    pub plan: Arc<StreamPlan>,
     pub plan_dir: PathBuf,
-    pub audio_idx: u32,
-    /// Cache key for the registry — the same `(file_id, audio_idx)`
-    /// running with different `mode_tag`s are independent producers so a
-    /// remux client and a transcode client can coexist without one
-    /// killing the other's ffmpeg.
-    pub mode_tag: String,
-    /// `None` when the requested audio index doesn't exist on the source.
-    /// ffmpeg gets `-map 0:a:N?` either way; the optional flag just means
-    /// "no audio in the output" if the stream is missing.
-    pub audio: Option<AudioPlan>,
+    /// Which rendition this producer writes.
+    pub track: Track,
     /// Hardware-encoder configuration resolved at server startup. The
     /// encoder a given launch actually ends up on may differ: a hwenc
     /// ffmpeg that dies during startup falls back to libx264 for *that
@@ -357,6 +350,57 @@ pub struct ProducerCtx {
     pub pool: SqlitePool,
 }
 
+/// A rendition a producer writes. Video and audio are produced by separate
+/// ffmpegs on the same source timeline: both keep source timestamps
+/// (`-copyts` + `frag_discont`), so players line them up by media time.
+#[derive(Clone)]
+pub enum Track {
+    /// Video only. `mode_tag` (`remux`, `tx4000h720`) keeps a remux client
+    /// and transcode clients at different bitrates from sharing a cache.
+    Video { plan: Arc<StreamPlan>, mode_tag: String },
+    Audio(Arc<AudioPlan>),
+}
+
+/// Stands in for an audio track's video mode wherever a `Mode` decides
+/// something: no video encoder runs, same as a remux.
+const NO_VIDEO_ENCODE: Mode = Mode::Remux;
+
+impl Track {
+    /// Registry and cache key: `v-{mode_tag}` or `a{idx}-{flavor}`.
+    pub fn tag(&self) -> String {
+        match self {
+            Track::Video { mode_tag, .. } => format!("v-{mode_tag}"),
+            Track::Audio(a) => a.tag(),
+        }
+    }
+
+    fn segments(&self) -> &[Segment] {
+        match self {
+            Track::Video { plan, .. } => &plan.segments,
+            Track::Audio(a) => &a.segments,
+        }
+    }
+
+    fn mode(&self) -> &Mode {
+        match self {
+            Track::Video { plan, .. } => &plan.mode,
+            Track::Audio(_) => &NO_VIDEO_ENCODE,
+        }
+    }
+
+    /// The fields every `transcode.*` event for this track carries. Video
+    /// keeps the `mode_tag` its events always had; audio names its track.
+    fn event_envelope(&self) -> serde_json::Value {
+        match self {
+            Track::Video { mode_tag, .. } => serde_json::json!({ "mode_tag": mode_tag }),
+            Track::Audio(a) => serde_json::json!({
+                "audio_idx": a.idx,
+                "audio_flavor": a.flavor.as_str(),
+            }),
+        }
+    }
+}
+
 /// Just the bits a spawned watcher/reaper/stderr-reader needs to emit a
 /// `transcode.*` event — so we don't drag a whole `ProducerCtx` (with its
 /// `Arc<StreamPlan>` etc.) into every background task.
@@ -364,8 +408,7 @@ pub struct ProducerCtx {
 struct EventMeta {
     pool: SqlitePool,
     media_id: String,
-    audio_idx: u32,
-    mode_tag: String,
+    envelope: serde_json::Value,
 }
 
 impl EventMeta {
@@ -373,20 +416,17 @@ impl EventMeta {
         Self {
             pool: ctx.pool.clone(),
             media_id: ctx.media_id.clone(),
-            audio_idx: ctx.audio_idx,
-            mode_tag: ctx.mode_tag.clone(),
+            envelope: ctx.track.event_envelope(),
         }
     }
 
     /// Best-effort fire-and-forget event. `extra` fields are merged onto
-    /// the standard `{audio_idx, mode_tag}` envelope.
+    /// the track's envelope (see [`Track::event_envelope`]).
     fn emit(&self, kind: &'static str, extra: serde_json::Value) {
         let pool = self.pool.clone();
         let media = self.media_id.clone();
-        let aidx = self.audio_idx;
-        let mode = self.mode_tag.clone();
+        let mut data = self.envelope.clone();
         tokio::spawn(async move {
-            let mut data = serde_json::json!({ "audio_idx": aidx, "mode_tag": mode });
             if let (Some(obj), Some(ex)) = (data.as_object_mut(), extra.as_object()) {
                 for (k, v) in ex {
                     obj.insert(k.clone(), v.clone());
@@ -427,20 +467,21 @@ pub async fn ensure_segment(
     ctx: &ProducerCtx,
     idx: u32,
 ) -> anyhow::Result<PathBuf> {
-    if idx == 0 || idx as usize > ctx.plan.segments.len() {
+    let total = ctx.track.segments().len() as u32;
+    if idx == 0 || idx > total {
         anyhow::bail!("segment index {idx} out of range");
     }
-    let total = ctx.plan.segments.len() as u32;
+    let tag = ctx.track.tag();
     let seg_path = ctx.plan_dir.join(cache::segment_filename(idx));
 
     // Fast path: cached on disk. Still nudge a covering producer so it
     // keeps its read-ahead window aligned with where the client is.
     if tokio::fs::try_exists(&seg_path).await.unwrap_or(false) {
-        bump_covering(registry, &ctx.file_id, ctx.audio_idx, &ctx.mode_tag, idx, total).await;
+        bump_covering(registry, &ctx.file_id, &tag, idx, total).await;
         return Ok(seg_path);
     }
 
-    let pool = registry.pool(&ctx.file_id, ctx.audio_idx, &ctx.mode_tag);
+    let pool = registry.pool(&ctx.file_id, &tag);
     let overall_deadline = Instant::now() + SEGMENT_WAIT_TIMEOUT;
     // Producers we tried to follow but found stalled — don't re-follow
     // them on the next loop, spawn our own instead.
@@ -467,9 +508,10 @@ pub async fn ensure_segment(
                 // the pool lock across the launch is what makes concurrent
                 // requests for the same region coalesce.
                 let handle = launch_producer(ctx.clone(), idx, pool.clone()).await?;
+                let done = handle.done.clone();
                 guard.push(handle);
                 drop(guard);
-                wait_for_file(&seg_path, overall_deadline.saturating_duration_since(Instant::now())).await?;
+                wait_for_file(&seg_path, overall_deadline, &done).await?;
                 return Ok(seg_path);
             }
         };
@@ -477,6 +519,7 @@ pub async fn ensure_segment(
         match follow_wait(&seg_path, &pool, idx, &leader_head, total, overall_deadline).await {
             FollowOutcome::Ready => return Ok(seg_path),
             FollowOutcome::Respawn => stalled.push(leader_head),
+            FollowOutcome::PastEnd => return Err(PastEnd(idx).into()),
             FollowOutcome::Timeout => {
                 anyhow::bail!("timed out waiting for {}", seg_path.display())
             }
@@ -489,6 +532,8 @@ enum FollowOutcome {
     Ready,
     /// The leader stalled / disappeared — caller should re-decide (spawn).
     Respawn,
+    /// The leader reached the end of the source without writing it.
+    PastEnd,
     /// Overall deadline elapsed.
     Timeout,
 }
@@ -531,6 +576,7 @@ async fn follow_wait(
                 return FollowOutcome::Ready;
             }
             match guard.iter().find(|p| Arc::ptr_eq(&p.head, leader_head)) {
+                Some(h) if h.done.load(Ordering::Acquire) => return FollowOutcome::PastEnd,
                 Some(h) => {
                     nudge(h, idx, total).await;
                     true
@@ -554,14 +600,13 @@ async fn follow_wait(
 async fn bump_covering(
     registry: &ProducerRegistry,
     file_id: &str,
-    audio_idx: u32,
-    mode_tag: &str,
+    tag: &str,
     idx: u32,
     total: u32,
 ) {
     if let Some(pool) = registry
         .by_media
-        .get(&(file_id.to_string(), audio_idx, mode_tag.to_string()))
+        .get(&(file_id.to_string(), tag.to_string()))
         .map(|e| e.clone())
     {
         let guard = pool.lock().await;
@@ -571,11 +616,31 @@ async fn bump_covering(
     }
 }
 
-async fn wait_for_file(path: &Path, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
+/// A segment the plan lists but the source ends before: the producer that
+/// should have written it ran to EOF without doing so. Surfaced as a 404
+/// instead of waiting out the timeout and relaunching ffmpeg on each retry.
+#[derive(Debug)]
+pub struct PastEnd(pub u32);
+
+impl std::fmt::Display for PastEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "segment {} is past the end of the source", self.0)
+    }
+}
+
+impl std::error::Error for PastEnd {}
+
+/// Wait for `path` from a producer we just launched. `done` (the producer
+/// reached EOF) ends the wait early: once the watcher has promoted its
+/// last segment, anything still missing never arrives.
+async fn wait_for_file(path: &Path, deadline: Instant, done: &AtomicBool) -> anyhow::Result<()> {
     loop {
         if tokio::fs::try_exists(path).await.unwrap_or(false) {
             return Ok(());
+        }
+        if done.load(Ordering::Acquire) {
+            let idx = path.file_name().and_then(|n| n.to_str()).and_then(cache::segment_index);
+            return Err(PastEnd(idx.unwrap_or(0)).into());
         }
         if Instant::now() >= deadline {
             anyhow::bail!("timed out waiting for {}", path.display());
@@ -614,11 +679,11 @@ async fn launch_producer(
         let mut handle = launch_once(ctx.clone(), hw, target_idx, pool.clone()).await?;
         // Skipping the wait entirely (rather than waiting and ignoring the
         // result) keeps 750ms off every remux launch.
-        if !hwenc_at_risk(hw, &ctx.plan.mode) {
+        if !hwenc_at_risk(hw, ctx.track.mode()) {
             return Ok(handle);
         }
         let exit = wait_for_early_exit(&mut handle.child, Duration::from_millis(750)).await;
-        match classify_startup(hw, &ctx.plan.mode, &exit) {
+        match classify_startup(hw, ctx.track.mode(), &exit) {
             StartupVerdict::Ok => return Ok(handle),
             StartupVerdict::HwencFailed(status) => {
                 handle.shutdown().await;
@@ -738,8 +803,8 @@ async fn launch_once(
         .tempdir_in(&ctx.plan_dir)?;
 
     let seg = ctx
-        .plan
-        .segments
+        .track
+        .segments()
         .get((ff_start_idx as usize).saturating_sub(1))
         .ok_or_else(|| anyhow::anyhow!("ff_start_idx {ff_start_idx} out of plan range"))?;
     let start_t = seg.t;
@@ -819,7 +884,7 @@ async fn launch_once(
         });
     }
 
-    let total_segments = ctx.plan.segments.len() as u32;
+    let total_segments = ctx.track.segments().len() as u32;
     let head = Arc::new(AtomicU32::new(target_idx.saturating_sub(1)));
     let rate_x100 = Arc::new(AtomicU32::new(0));
     // Initial pull window: serve the requested segment plus a small
@@ -830,6 +895,7 @@ async fn launch_once(
         .min(total_segments);
     let target_head = Arc::new(AtomicU32::new(initial_target));
     let paused = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let last_request_at = Arc::new(RwLock::new(Instant::now()));
 
     let watcher = spawn_watcher(
@@ -837,6 +903,7 @@ async fn launch_once(
         run_dir.path().to_path_buf(),
         head.clone(),
         rate_x100.clone(),
+        done.clone(),
         total_segments,
         target_idx,
         meta.clone(),
@@ -857,6 +924,7 @@ async fn launch_once(
         rate_x100,
         target_head,
         paused,
+        done,
         last_request_at,
         child,
         _run_dir: run_dir,
@@ -871,14 +939,15 @@ fn spawn_ffmpeg(
     start_t: f64,
     run_dir: &Path,
 ) -> anyhow::Result<(Child, Vec<String>)> {
-    // Common preamble + HLS muxer flags. Codec args (video copy vs
-    // libx264) come from `apply_video_args` based on plan mode. Key
-    // shared pieces:
+    // Common preamble + HLS muxer flags. Each run writes one rendition:
+    // video (`apply_video_args`, copy or encode by plan mode) or one audio
+    // track (`apply_audio_args`). Key shared pieces:
     //
     //  * `-ss <start_t>` before `-i`: fast demuxer-index seek, lands at
     //    nearest cluster ≤ start_t, sub-millisecond.
     //  * `-copyts -avoid_negative_ts disabled`: preserve source PTS
-    //    through the pipeline, don't shift either track.
+    //    through the pipeline. Video and audio come from separate runs,
+    //    and source timestamps are the only clock they share.
     //  * `-hls_segment_options movflags=+frag_discont`: THE flag (from
     //    Jellyfin's `DynamicHlsController.cs`). Without it the
     //    HLS-fmp4 muxer normalises each fragment's tfdt to zero, which
@@ -896,7 +965,7 @@ fn spawn_ffmpeg(
     // VideoToolbox doesn't need any device init since the encoder owns
     // its own session; we just keep the software input + sw scale and
     // let h264_videotoolbox handle the upload internally.
-    if matches!(ctx.plan.mode, Mode::Transcode { .. }) {
+    if matches!(ctx.track.mode(), Mode::Transcode { .. }) {
         match hw {
             HwEncoder::Vaapi => {
                 cmd.arg("-init_hw_device")
@@ -922,15 +991,21 @@ fn spawn_ffmpeg(
         // the output muxer starts writing init.mp4.
         .arg("-analyzeduration").arg("10M")
         .arg("-probesize").arg("50M")
-        .arg("-ss").arg(format!("{start_t:.6}"))
+        .arg("-ss").arg(format!("{:.6}", seek_secs(&ctx.track, start_t)))
         .arg("-copyts")
-        .arg("-i").arg(&ctx.source)
-        .arg("-map").arg("0:v:0")
-        .arg("-map").arg(format!("0:a:{}?", ctx.audio_idx))
-        .arg("-avoid_negative_ts").arg("disabled");
-    apply_video_args(&mut cmd, &ctx.plan.mode, hw);
-    apply_audio_args(&mut cmd, ctx.audio.as_ref(), &ctx.plan.mode);
-    cmd.arg("-sn").arg("-dn")
+        .arg("-i").arg(&ctx.source);
+    match &ctx.track {
+        Track::Video { plan, .. } => {
+            cmd.arg("-map").arg("0:v:0");
+            apply_video_args(&mut cmd, &plan.mode, &plan.video_codec, hw);
+        }
+        Track::Audio(audio) => {
+            cmd.arg("-map").arg(format!("0:a:{}", audio.idx));
+            apply_audio_args(&mut cmd, audio, start_t);
+        }
+    }
+    cmd.arg("-avoid_negative_ts").arg("disabled")
+        .arg("-sn").arg("-dn")
         .arg("-f").arg("hls")
         .arg("-hls_time").arg("6")
         .arg("-hls_playlist_type").arg("vod")
@@ -954,6 +1029,16 @@ fn spawn_ffmpeg(
     let child = cmd.spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg: {e}"))?;
     Ok((child, argv))
+}
+
+/// Input `-ss` for a run starting at plan time `start_t`. Video plans are
+/// already in seek time; an audio plan's grid starts at the track's first
+/// sample, which needn't be the container's start.
+fn seek_secs(track: &Track, start_t: f64) -> f64 {
+    match track {
+        Track::Video { .. } => start_t,
+        Track::Audio(a) => (a.origin - a.container_start + start_t).max(0.0),
+    }
 }
 
 /// Snapshot the program + args of a built `Command` as plain strings
@@ -1052,10 +1137,15 @@ fn select_rate_control(hw: HwEncoder, hard_cap: bool) -> RateControl {
     }
 }
 
-fn apply_video_args(cmd: &mut Command, mode: &Mode, hw: HwEncoder) {
+fn apply_video_args(cmd: &mut Command, mode: &Mode, src_codec: &str, hw: HwEncoder) {
     match mode {
         Mode::Remux => {
             cmd.arg("-c:v").arg("copy");
+            // ffmpeg tags HEVC in MP4 as `hev1` by default; Apple's HLS
+            // stack (AVPlayer, Safari) only accepts `hvc1`.
+            if src_codec == "hevc" {
+                cmd.arg("-tag:v").arg("hvc1");
+            }
         }
         Mode::Transcode { bitrate_kbps, max_height, hard_cap } => {
             // `scale=-2:'min(H,ih)'` keeps source aspect, never
@@ -1182,24 +1272,36 @@ fn apply_video_args(cmd: &mut Command, mode: &Mode, hw: HwEncoder) {
     }
 }
 
-fn apply_audio_args(cmd: &mut Command, audio: Option<&AudioPlan>, mode: &Mode) {
-    // No audio plan = no source stream at this index. ffmpeg's
-    // `-map 0:a:N?` already silently drops the output, so we just don't
-    // pass any `-c:a`/`-b:a` flags and let ffmpeg produce a video-only
-    // output. (This also covers files with no audio at all.)
-    let Some(audio) = audio else { return };
-    // For Transcode we always re-encode audio to stereo AAC: the rest of
-    // the pipeline is already CPU-bound on libx264, and a uniform output
-    // codec sidesteps the "source AAC has weird channel layout that
-    // browsers won't decode" footgun on a path users only hit when
-    // remux already wasn't viable.
-    let force_aac = matches!(mode, Mode::Transcode { .. });
-    if !force_aac && audio.out_codec == "copy" {
-        cmd.arg("-c:a").arg("copy");
-    } else {
-        cmd.arg("-c:a").arg("aac")
-            .arg("-ac").arg(audio.channels.to_string())
-            .arg("-b:a").arg(format!("{}k", audio.bitrate_kbps));
+/// Codec args for an audio run starting at `start_t`, in plan time (from
+/// the track's `origin`).
+///
+/// The audio timeline is a uniform 6s grid, and the HLS muxer cuts at
+/// `first_pts + 6n`, so the run's first packet has to land on `start_t`
+/// for its segments to line up with the grid (and with segments other runs
+/// already cached). An encode gets that for free: input `-ss` decodes from
+/// the preceding keyframe and trims to `start_t`. A stream copy doesn't
+/// trim, so it starts wherever the demuxer seek landed — the cluster
+/// before, often seconds early. The `noise` bsf drops packets before
+/// `start_t` instead. (Output `-ss` would trim too, but rebases the
+/// timestamps to zero even under `-copyts`.)
+fn apply_audio_args(cmd: &mut Command, audio: &AudioPlan, start_t: f64) {
+    match audio.out_codec.as_str() {
+        "copy" => {
+            cmd.arg("-c:a").arg("copy");
+            if start_t > 0.0 {
+                // `pts` is a source timestamp (`-copyts`), so the cut is too.
+                // Keep the frame nearest the cut (drop by midpoint): the
+                // probed start can be a few ms off the first frame, and
+                // run 1 starts on that frame.
+                let cut = audio.origin + start_t;
+                cmd.arg("-bsf:a").arg(format!("noise=drop=lt(pts*tb+duration*tb/2\\,{cut:.6})"));
+            }
+        }
+        codec => {
+            cmd.arg("-c:a").arg(codec)
+                .arg("-ac").arg(audio.channels.to_string())
+                .arg("-b:a").arg(format!("{}k", audio.bitrate_kbps));
+        }
     }
 }
 
@@ -1252,6 +1354,7 @@ fn spawn_watcher(
     run_dir: PathBuf,
     head: Arc<AtomicU32>,
     rate_x100: Arc<AtomicU32>,
+    done: Arc<AtomicBool>,
     total_segments: u32,
     target_idx: u32,
     meta: EventMeta,
@@ -1272,6 +1375,14 @@ fn spawn_watcher(
     const NOMINAL_SEG_SECS: f64 = 6.0;
     tokio::spawn(async move {
         loop {
+            // ffmpeg writes `#EXT-X-ENDLIST` to its run playlist in the
+            // trailer, after closing its last segment. Read before the
+            // scratch snapshot, it means every file in that snapshot is
+            // complete.
+            let finished = tokio::fs::read_to_string(run_dir.join("_run.m3u8"))
+                .await
+                .is_ok_and(|p| p.contains("#EXT-X-ENDLIST"));
+
             // Snapshot the scratch dir: idx → (path, size).
             let mut scratch: BTreeMap<u32, (PathBuf, u64)> = BTreeMap::new();
             if let Ok(mut rd) = tokio::fs::read_dir(&run_dir).await {
@@ -1312,7 +1423,7 @@ fn spawn_watcher(
                     continue;
                 }
 
-                let safe = if scratch.contains_key(&(idx + 1)) {
+                let safe = if finished || scratch.contains_key(&(idx + 1)) {
                     true
                 } else if prev_sizes.get(&idx) == Some(size) {
                     segment_is_complete(path).await
@@ -1382,6 +1493,13 @@ fn spawn_watcher(
             }
 
             if next >= total_segments {
+                return;
+            }
+            // Reached EOF short of the plan's end: the source ends before
+            // the plan says it does. Everything ffmpeg wrote was promoted
+            // above, so tell waiters to stop expecting more.
+            if finished {
+                done.store(true, Ordering::Release);
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1723,12 +1841,24 @@ mod tests {
     }
 
     fn video_argv(mode: &Mode, hw: HwEncoder) -> Vec<String> {
+        video_argv_for(mode, "h264", hw)
+    }
+
+    fn video_argv_for(mode: &Mode, src_codec: &str, hw: HwEncoder) -> Vec<String> {
         let mut cmd = Command::new("ffmpeg");
-        apply_video_args(&mut cmd, mode, hw);
+        apply_video_args(&mut cmd, mode, src_codec, hw);
         cmd.as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn hevc_remux_is_tagged_hvc1() {
+        let hevc = video_argv_for(&Mode::Remux, "hevc", HwEncoder::None);
+        assert!(hevc.windows(2).any(|w| w == ["-tag:v", "hvc1"]));
+        let h264 = video_argv_for(&Mode::Remux, "h264", HwEncoder::None);
+        assert!(!h264.iter().any(|a| a == "-tag:v"));
     }
 
     #[test]

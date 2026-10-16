@@ -206,6 +206,10 @@ pub struct ShowDetail {
 pub struct MediaTechInfo {
     pub container: Option<String>,
     pub duration_seconds: Option<f64>,
+    /// The container's start timestamp, which input `-ss` seeks relative
+    /// to. Absent on files probed before it was recorded.
+    #[serde(default)]
+    pub start_seconds: Option<f64>,
     pub bitrate_kbps: Option<u64>,
     pub file_size: Option<u64>,
     pub video: Option<VideoTrackInfo>,
@@ -249,6 +253,19 @@ pub struct VideoTrackInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioTrackInfo {
     pub codec: String,
+    /// ffprobe's profile name, e.g. `LC` or `Dolby Digital Plus + Dolby
+    /// Atmos`. Absent on files probed before it was recorded.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The track's own length. Can differ from the container's, which is
+    /// the longest stream's. Absent on files probed before it was recorded.
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
+    /// When the track's first sample plays, in source timestamps (so it
+    /// includes the container's start). Non-zero for delayed audio and for
+    /// MPEG-TS sources. Absent on files probed before it was recorded.
+    #[serde(default)]
+    pub start_seconds: Option<f64>,
     pub channels: Option<u32>,
     pub channel_layout: Option<String>,
     pub sample_rate_hz: Option<u32>,
@@ -341,6 +358,21 @@ pub struct HlsState {
     /// Sorted segment indices currently on disk under the plan dir.
     pub cached_segments: Vec<u32>,
     pub producer: Option<HlsProducerState>,
+    /// The selected audio track's rendition, which has its own producer
+    /// and cache. `None` when the source has no such track.
+    #[serde(default)]
+    pub audio: Option<HlsAudioState>,
+}
+
+/// Pipeline state of one audio rendition. Its timeline is a uniform 6s
+/// grid, independent of the video plan's.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HlsAudioState {
+    /// Rendition tag, e.g. `a0-stereo` or `a1-surround`.
+    pub track: String,
+    pub total_segments: u32,
+    pub cached_segments: Vec<u32>,
+    pub producer: Option<HlsProducerState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -371,11 +403,14 @@ pub struct HlsProducerState {
 // URL builders — relative paths work through dx proxy and same-origin alike.
 pub fn media_image_url(id: &str) -> String { format!("/api/media/{id}/image") }
 pub fn media_stream_url(id: &str) -> String { format!("/api/media/{id}/stream") }
-/// HLS playlist URL with explicit mode + optional bitrate. `mode` is
-/// `"remux"` or `"transcode"`; bitrate (kbps) is honored for transcode
-/// only. Empty mode falls back to the server's compat verdict.
+/// HLS master playlist URL for the web player, with explicit mode +
+/// optional bitrate. `mode` is `"remux"` or `"transcode"`; bitrate (kbps)
+/// is honored for transcode only. Empty mode falls back to the server's
+/// compat verdict. The master carries only `audio_idx`'s renditions (the
+/// player switches tracks by reloading, which is cheap since video is
+/// cached separately) and no subtitles (rendered by JASSUB / `<track>`).
 pub fn media_hls_url(id: &str, audio_idx: u32, mode: &str, bitrate_kbps: Option<u32>) -> String {
-    let mut url = format!("/api/media/{id}/hls/index.m3u8?a={audio_idx}");
+    let mut url = format!("/api/media/{id}/hls/master.m3u8?a={audio_idx}&subs=0");
     if !mode.is_empty() {
         url.push_str(&format!("&mode={mode}"));
     }

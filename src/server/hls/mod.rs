@@ -9,12 +9,21 @@
 //!   sequentially from a `start_idx`, killed+restarted on seeks far from
 //!   `head`, paused/resumed for backpressure, reaped on idle.
 //!
-//! HTTP surface (unchanged from the prior `/hls/{id}/...` endpoints):
-//! * `GET /api/media/{id}/hls/index.m3u8` → render from plan, instant.
-//! * `GET /api/media/{id}/hls/init.mp4` → ensure producer running, wait for
-//!   the canonical init.mp4 to land, serve.
-//! * `GET /api/media/{id}/hls/seg-NNNNN.m4s` → cache hit serves immediately;
-//!   cache miss triggers the producer (start/resume/restart) and waits.
+//! Video and audio are separate renditions, each with its own plan,
+//! producer and cache: switching audio track or video quality only
+//! re-runs the half that changed.
+//!
+//! HTTP surface, all under `/api/media/{id}/hls/`:
+//! * `master.m3u8` → entry point. A stereo and a surround variant over the
+//!   same video, the audio renditions in matching groups, and a WebVTT
+//!   rendition per subtitle track. See `playlist::render_master`.
+//! * `index.m3u8`, `init.mp4`, `seg-NNNNN.m4s` → the video rendition.
+//!   Playlist renders from the plan, instantly; init/segments are served
+//!   from cache or wait on the producer (start/resume/restart).
+//! * `audio/{idx}-{flavor}/{index.m3u8,init.mp4,seg-NNNNN.m4s}` → one audio
+//!   rendition, same shape.
+//! * `subs-{track}.m3u8` / `subs-{track}.vtt` → a subtitle rendition and
+//!   its one segment, the track flattened to WebVTT.
 
 mod cache;
 mod hwenc;
@@ -42,8 +51,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Query string carried on every HLS endpoint:
-/// * `?a=N` — source audio stream index (defaults to 0).
+/// Query string on the master and video endpoints:
+/// * `?a=N` — the client's audio track. On the master, narrows the audio
+///   renditions to that track; on the video playlist and segments, only
+///   attributes the playback session (video is shared across tracks).
 /// * `?mode=remux|transcode` — encode strategy (defaults to the cached
 ///   compat verdict — `Direct`-classed files can still be requested via
 ///   HLS by passing an explicit mode).
@@ -66,6 +77,10 @@ pub struct HlsParams {
     pub bitrate: Option<u32>,
     #[serde(default)]
     pub t: Option<f64>,
+    /// `?subs=0` leaves subtitle renditions out of the master, for clients
+    /// that render subtitles themselves (the web player, via JASSUB).
+    #[serde(default)]
+    pub subs: Option<u8>,
 }
 
 impl HlsParams {
@@ -185,13 +200,14 @@ pub fn router() -> Router<AppState> {
         // `state` must be matched before the catch-all `{file}` route or
         // axum routes it through `serve()` and 400s on the unknown name.
         .route("/api/media/{id}/hls/state", get(state))
+        .route("/api/media/{id}/hls/audio/{track}/{file}", get(serve_audio))
         .route("/api/media/{id}/hls/{file}", get(serve))
 }
 
 /// Debug snapshot consumed by the player's debug panel. Cheap enough to
-/// poll once a second: scans the plan dir for cached segments (sub-ms on
-/// 1k-entry dirs), reads three atomics + one async lock for producer
-/// state. Not authenticated separately — same `require_session` middleware
+/// poll once a second: scans the plan dirs for cached segments (sub-ms on
+/// 1k-entry dirs), reads three atomics + one async lock per producer.
+/// Not authenticated separately — same `require_session` middleware
 /// covers it as the rest of `/api/media/...`.
 async fn state(
     State(state): State<AppState>,
@@ -199,18 +215,42 @@ async fn state(
     Query(params): Query<HlsParams>,
 ) -> Result<axum::Json<crate::types::HlsState>> {
     let audio_idx = validate_audio_idx(params.idx())?;
-    let resolved = resolve_plan(&state, &id, audio_idx, &params).await?;
+    let resolved = resolve_plan(&state, &id, &params).await?;
+    let video_tag = video_track_tag(&resolved.mode_tag);
     let cached_segments = scan_cached_segments(&resolved.plan_dir, resolved.plan.segments.len() as u32).await;
-    let producer = state
-        .hls_producers
-        .snapshot(&resolved.file_id, audio_idx, &resolved.mode_tag)
-        .await;
+    let producer = state.hls_producers.snapshot(&resolved.source.file_id, &video_tag).await;
+
+    // Which flavor of the track the player is on isn't knowable here (the
+    // player picked a variant), so report the one with a live producer,
+    // else the one with more cached, else stereo.
+    let mut audio = None::<crate::types::HlsAudioState>;
+    for flavor in plan::AudioFlavor::ALL {
+        let Some(a) = plan::derive_audio_plan(&resolved.source.info, audio_idx, flavor) else { continue };
+        let dir = resolved.source.plan_dir(&a.tag());
+        let total = a.segments.len() as u32;
+        let candidate = crate::types::HlsAudioState {
+            track: a.tag(),
+            total_segments: total,
+            cached_segments: scan_cached_segments(&dir, total).await,
+            producer: state.hls_producers.snapshot(&resolved.source.file_id, &a.tag()).await,
+        };
+        let better = match &audio {
+            None => true,
+            Some(cur) => (candidate.producer.is_some(), candidate.cached_segments.len())
+                > (cur.producer.is_some(), cur.cached_segments.len()),
+        };
+        if better {
+            audio = Some(candidate);
+        }
+    }
+
     Ok(axum::Json(crate::types::HlsState {
         duration: resolved.plan.duration,
         total_segments: resolved.plan.segments.len() as u32,
         segment_durations: resolved.plan.segments.iter().map(|s| s.d).collect(),
         cached_segments,
         producer,
+        audio,
     }))
 }
 
@@ -241,31 +281,24 @@ fn validate_audio_idx(idx: u32) -> Result<u32> {
     Ok(idx)
 }
 
-struct ResolvedPlan {
-    /// The item's primary file — everything below was derived from it.
+/// The file an item currently plays from, with what every rendition is
+/// derived from.
+struct Source {
     file_id: String,
-    plan: Arc<plan::StreamPlan>,
-    plan_dir: PathBuf,
     src: PathBuf,
     info: MediaTechInfo,
-    /// Cache-key tag derived from the chosen mode + bitrate. Same shape
-    /// as `mode_tag` in `cache::plan_dir_name`.
-    mode_tag: String,
+    mtime: i64,
+    size: i64,
 }
 
-/// Resolve the plan + on-disk plan dir + tech info for the file item `id`
-/// currently plays from. Builds +
-/// persists the remux plan on cache miss; transcode plans are built on
-/// demand without DB caching (cheap — duration only). Sweeps stale
-/// sibling dirs after a rebuild. The remux plan timeline is shared
-/// across audio tracks; `audio_idx` and `mode_tag` only affect the
-/// returned `plan_dir` so each (track, mode, bitrate) caches separately.
-async fn resolve_plan(
-    state: &AppState,
-    id: &str,
-    audio_idx: u32,
-    params: &HlsParams,
-) -> Result<ResolvedPlan> {
+impl Source {
+    /// Cache dir for rendition `track` (see `cache::plan_dir_name`).
+    fn plan_dir(&self, track: &str) -> PathBuf {
+        cache::plan_dir(&self.file_id, PLAN_VERSION, self.mtime, self.size, track)
+    }
+}
+
+async fn resolve_source(state: &AppState, id: &str) -> Result<Source> {
     if !id_is_safe(id) {
         return Err(Error::BadRequest("invalid media id".into()));
     }
@@ -293,6 +326,29 @@ async fn resolve_plan(
             probed
         }
     };
+    let (mtime, size) = cache::stat_source(&src).await.map_err(Error::Io)?;
+    Ok(Source { file_id, src, info, mtime, size })
+}
+
+struct ResolvedPlan {
+    source: Source,
+    plan: Arc<plan::StreamPlan>,
+    plan_dir: PathBuf,
+    /// Cache-key tag derived from the chosen mode + bitrate (`remux`,
+    /// `tx4000h720`). The video track's tag is this prefixed with `v-`.
+    mode_tag: String,
+}
+
+fn video_track_tag(mode_tag: &str) -> String {
+    format!("v-{mode_tag}")
+}
+
+/// Resolve the video plan + its on-disk plan dir for the file item `id`
+/// currently plays from. Builds + persists the remux plan on cache miss;
+/// transcode plans are built on demand without DB caching (cheap —
+/// duration only). Sweeps stale sibling dirs after a rebuild.
+async fn resolve_plan(state: &AppState, id: &str, params: &HlsParams) -> Result<ResolvedPlan> {
+    let source = resolve_source(state, id).await?;
 
     let chosen_mode = match params.mode.as_deref() {
         Some("remux") => RequestedMode::Remux,
@@ -300,17 +356,15 @@ async fn resolve_plan(
         Some(other) => {
             return Err(Error::BadRequest(format!("unknown hls mode: {other}")));
         }
-        None => match info.browser_compat {
+        None => match source.info.browser_compat {
             crate::types::BrowserCompat::Transcode => RequestedMode::Transcode,
             _ => RequestedMode::Remux,
         },
     };
 
-    let (mtime, size) = cache::stat_source(&src).await.map_err(Error::Io)?;
-
-    match chosen_mode {
+    let (plan, mode_tag) = match chosen_mode {
         RequestedMode::Remux => {
-            let plan = match plan::load_if_fresh(&state.pool, &file_id, &src)
+            let plan = match plan::load_if_fresh(&state.pool, &source.file_id, &source.src)
                 .await
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
             {
@@ -318,57 +372,42 @@ async fn resolve_plan(
                 None => {
                     // ffprobe error messages can include the full source path;
                     // log details server-side and return a generic public message.
-                    let p = plan::build_remux_plan(&src, &info)
+                    let p = plan::build_remux_plan(&source.src, &source.info)
                         .await
                         .map_err(|e| {
-                            tracing::error!(media_id = %id, %file_id, %e, "failed to build HLS plan");
+                            tracing::error!(media_id = %id, file_id = %source.file_id, %e, "failed to build HLS plan");
                             Error::NotImplemented("hls plan unavailable".into())
                         })?;
-                    plan::store(&state.pool, &file_id, &p, mtime, size)
+                    plan::store(&state.pool, &source.file_id, &p, source.mtime, source.size)
                         .await
                         .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-                    let keep_prefix = cache::plan_dir_prefix(p.version, mtime, size);
-                    cache::sweep_stale_plan_dirs(&file_id, &keep_prefix).await;
+                    let keep_prefix = cache::plan_dir_prefix(p.version, source.mtime, source.size);
+                    cache::sweep_stale_plan_dirs(&source.file_id, &keep_prefix).await;
                     p
                 }
             };
-            let mode_tag = "remux".to_string();
-            let plan_dir = cache::plan_dir(&file_id, plan.version, mtime, size, audio_idx, &mode_tag);
-            Ok(ResolvedPlan {
-                file_id,
-                plan: Arc::new(plan),
-                plan_dir,
-                src,
-                info,
-                mode_tag,
-            })
+            (plan, "remux".to_string())
         }
         RequestedMode::Transcode => {
-            let (bitrate, max_height) = resolve_encode_target(params.bitrate, &info);
+            let (bitrate, max_height) = resolve_encode_target(params.bitrate, &source.info);
             let hard_cap = params.bitrate.is_some();
-            let plan = plan::build_transcode_plan(&info, bitrate, max_height, hard_cap)
+            let plan = plan::build_transcode_plan(&source.info, bitrate, max_height, hard_cap)
                 .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
             // The `-auto` suffix keeps Auto's cache separate from an explicit
             // pick that happens to resolve to the same numbers: on a
             // quality-mode encoder the two produce different bytes. It's a
-            // *suffix* so `server_transcode_telemetry`'s `tx{bitrate}h`
+            // *suffix* so `server_transcode_telemetry`'s `v-tx{bitrate}h`
             // prefix lookup still matches either.
             let mode_tag = if hard_cap {
                 format!("tx{bitrate}h{max_height}")
             } else {
                 format!("tx{bitrate}h{max_height}-auto")
             };
-            let plan_dir = cache::plan_dir(&file_id, plan.version, mtime, size, audio_idx, &mode_tag);
-            Ok(ResolvedPlan {
-                file_id,
-                plan: Arc::new(plan),
-                plan_dir,
-                src,
-                info,
-                mode_tag,
-            })
+            (plan, mode_tag)
         }
-    }
+    };
+    let plan_dir = source.plan_dir(&video_track_tag(&mode_tag));
+    Ok(ResolvedPlan { source, plan: Arc::new(plan), plan_dir, mode_tag })
 }
 
 #[derive(Copy, Clone)]
@@ -414,6 +453,46 @@ fn resolve_encode_target(explicit: Option<u32>, info: &MediaTechInfo) -> (u32, u
     )
 }
 
+/// Fallback video `BANDWIDTH` for a remux whose probe reported no bitrate.
+const REMUX_FALLBACK_KBPS: u64 = 8_000;
+
+/// Video `BANDWIDTH` (bps) and `RESOLUTION` for the master playlist. Audio
+/// is added per variant. Remux uses the container bitrate, which includes
+/// the source's audio, so it overestimates a little — harmless with the
+/// variants differing only in audio. Transcode mirrors the producer's
+/// `scale=-2:'min(H,ih)'`.
+fn video_shape(plan: &plan::StreamPlan, info: &MediaTechInfo) -> (u64, Option<(u32, u32)>) {
+    let src = info
+        .video
+        .as_ref()
+        .and_then(|v| Some((v.width?, v.height?)))
+        .filter(|&(w, h)| w > 0 && h > 0);
+    match plan.mode {
+        plan::Mode::Remux => {
+            let kbps = info
+                .bitrate_kbps
+                .or_else(|| info.video.as_ref().and_then(|v| v.bitrate_kbps))
+                .unwrap_or(REMUX_FALLBACK_KBPS);
+            (kbps * 1000, src)
+        }
+        plan::Mode::Transcode { bitrate_kbps, max_height, .. } => {
+            let resolution = src.map(|(w, h)| {
+                let out_h = h.min(max_height);
+                let out_w = ((w as f64 * out_h as f64 / h as f64 / 2.0).round() as u32) * 2;
+                (out_w, out_h)
+            });
+            (bitrate_kbps as u64 * 1000, resolution)
+        }
+    }
+}
+
+/// The track a client gets when it doesn't name one: the source's
+/// default-flagged audio stream, else the first.
+fn default_audio_idx(info: &MediaTechInfo) -> u32 {
+    info.audio.iter().position(|a| a.default).unwrap_or(0) as u32
+}
+
+/// Video files, the master playlist, and the subtitle renditions.
 async fn serve(
     State(state): State<AppState>,
     Extension(session): Extension<super::auth::Session>,
@@ -425,9 +504,40 @@ async fn serve(
         return Err(Error::BadRequest(format!("invalid hls file: {file}")));
     }
 
-    let audio_idx = validate_audio_idx(params.idx())?;
-    let resolved = resolve_plan(&state, &id, audio_idx, &params).await?;
-    let ResolvedPlan { file_id, plan, plan_dir, src, info, mode_tag } = resolved;
+    // Subtitle renditions don't depend on the video plan, so they're
+    // answered before resolving one (which can mean a keyframe probe).
+    if let Some(track) = cache::subtitle_track(&file, ".vtt") {
+        let file = super::files::primary(&state.pool, &id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let body = super::subtitles::get_vtt_from_db(&state.pool, &file.id, track)
+            .await
+            .map_err(Error::Other)?
+            .ok_or(Error::NotFound)?;
+        let mut resp = (StatusCode::OK, body).into_response();
+        let h = resp.headers_mut();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/vtt; charset=utf-8"));
+        // Addressed by item, so a replaced file can put different content
+        // behind the same track id — keep the cache short.
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=60"));
+        return Ok(resp);
+    }
+    if let Some(track) = cache::subtitle_track(&file, ".m3u8") {
+        let source = resolve_source(&state, &id).await?;
+        let duration = source.info.duration_seconds.unwrap_or_default();
+        let body = playlist::render_subtitle_playlist(duration, track);
+        return Ok(text_response(body, "application/vnd.apple.mpegurl", false));
+    }
+
+    validate_audio_idx(params.idx())?;
+    let resolved = resolve_plan(&state, &id, &params).await?;
+    let ResolvedPlan { source, plan, plan_dir, mode_tag } = resolved;
+    // The track this playback is attributed to: the client's `?a=`, else
+    // the one it gets by default, matching what the master names.
+    let audio_idx = params.a.unwrap_or_else(|| default_audio_idx(&source.info));
+    if params.a.is_some() && !source.info.audio.is_empty() && audio_idx as usize >= source.info.audio.len() {
+        return Err(Error::NotFound);
+    }
     let path = plan_dir.join(&file);
 
     // Strict mode with an unsatisfiable request (encoder missing from this
@@ -442,10 +552,14 @@ async fn serve(
     }
 
     // Server-driven playback session: open-or-refresh keyed by
-    // (user, media, audio, mode). Opened on the first request; refreshed
-    // (cheap, in-memory) on every later one; closed by the idle sweeper.
-    // `room_id` is derived from the syncplay hub so a watch party is
-    // attributed without the client passing anything.
+    // (user, media, audio, mode). Opened on the first request (normally
+    // the master playlist); refreshed (cheap, in-memory) on every later
+    // video request; closed by the idle sweeper. Audio requests don't
+    // touch it: video keeps it alive. `audio_idx` is the client's `?a=`,
+    // which the master threads onto the video playlist; a client that
+    // switches tracks inside the player (native apps) is attributed to
+    // its default. `room_id` is derived from the syncplay hub so a watch
+    // party is attributed without the client passing anything.
     let (session_id, is_new) = state.active_sessions.touch((
         session.user_sub.clone(),
         id.clone(),
@@ -453,19 +567,24 @@ async fn serve(
         mode_tag.clone(),
     ));
     if is_new {
+        let info = &source.info;
         let delivery_mode = match &plan.mode {
             plan::Mode::Remux => "remux",
             plan::Mode::Transcode { .. } => "transcode",
         };
         let src_video = info.video.as_ref().map(|v| v.codec.as_str());
         let src_audio = info.audio.get(audio_idx as usize).map(|a| a.codec.as_str());
-        let (out_video, out_audio, bitrate): (Option<&str>, Option<&str>, Option<u32>) =
-            match &plan.mode {
-                plan::Mode::Remux => (src_video, src_audio, None),
-                plan::Mode::Transcode { bitrate_kbps, .. } => {
-                    (Some("h264"), Some("aac"), Some(*bitrate_kbps))
-                }
-            };
+        // The stereo rendition is the one every client can play; a player
+        // that takes the surround variant instead isn't visible from here.
+        let stereo = plan::derive_audio_plan(info, audio_idx, plan::AudioFlavor::Stereo);
+        let out_audio = stereo.as_ref().map(|a| match a.out_codec.as_str() {
+            "copy" => a.src_codec.as_str(),
+            other => other,
+        });
+        let (out_video, bitrate): (Option<&str>, Option<u32>) = match &plan.mode {
+            plan::Mode::Remux => (src_video, None),
+            plan::Mode::Transcode { bitrate_kbps, .. } => (Some("h264"), Some(*bitrate_kbps)),
+        };
         let room_id = state.hub.room_for_user(&session.user_sub);
         let browser = headers
             .get(header::USER_AGENT)
@@ -477,7 +596,7 @@ async fn serve(
                 id: &session_id,
                 user_sub: Some(&session.user_sub),
                 media_id: &id,
-                file_id: &file_id,
+                file_id: &source.file_id,
                 delivery_mode,
                 chosen_reason: None,
                 src_video_codec: src_video,
@@ -496,98 +615,256 @@ async fn serve(
         .await;
     }
 
-    if file == "index.m3u8" {
-        // Clamp the requested start to inside the plan's covered range.
-        // RFC 8216 says players SHOULD clamp, but some older Safari
-        // versions silently drop an out-of-range TIME-OFFSET and start
-        // at 0 — exactly the behavior we're trying to prevent. The
-        // 0.5s tail leaves room for the last segment without landing
-        // past EOF.
-        let time_offset = params.t.and_then(|t| {
-            if t.is_finite() && t > 0.0 {
-                Some(t.min((plan.duration - 0.5).max(0.0)))
-            } else {
-                None
-            }
-        });
-        // The plan-dir name is the server's content-identity key; thread it
-        // into the segment/init URIs (as `&v=`) so the `immutable` cache those
-        // URLs earn is busted whenever the plan regenerates. See `render_m3u8`.
-        let cache_tag = plan_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        let body = playlist::render_m3u8(
-            &plan,
-            audio_idx,
-            params.mode.as_deref(),
-            params.bitrate,
-            time_offset,
-            cache_tag,
-        );
-        let mut resp = text_response(body, "application/vnd.apple.mpegurl", false);
-        let h = resp.headers_mut();
-        // Mirror the `/stream` endpoint's mode advertisement so the
-        // player's debug-panel `ObservedStream` parser engages — without
-        // `X-Stream-Mode` it would fall back to the cached compat
-        // verdict and miss the encoder/container we're actually serving.
-        let mode_str = match plan.mode {
-            plan::Mode::Remux => "remux",
-            plan::Mode::Transcode { .. } => "transcode",
+    if file == "master.m3u8" || file == "index.m3u8" {
+        let body = if file == "master.m3u8" {
+            render_master(&state, &source, &plan, &params).await?
+        } else {
+            // Clamp the requested start to inside the plan's covered range.
+            // RFC 8216 says players SHOULD clamp, but some older Safari
+            // versions silently drop an out-of-range TIME-OFFSET and start
+            // at 0 — exactly the behavior we're trying to prevent. The
+            // 0.5s tail leaves room for the last segment without landing
+            // past EOF.
+            let time_offset = params.t.and_then(|t| {
+                if t.is_finite() && t > 0.0 {
+                    Some(t.min((plan.duration - 0.5).max(0.0)))
+                } else {
+                    None
+                }
+            });
+            let query = segment_query(&params, &plan_dir);
+            playlist::render_m3u8(&plan.segments, &query, time_offset)
         };
-        if let Ok(v) = HeaderValue::from_str(mode_str) {
-            h.insert("X-Stream-Mode", v);
-        }
-        // Hand the client its server-derived session id so the optional
-        // metrics stream can tag samples without a separate start call.
-        if let Ok(v) = HeaderValue::from_str(&session_id) {
-            h.insert("X-Playback-Session", v);
-        }
-        // For transcode, advertise the H.264 encoder producers are *asked*
-        // to use. This response is written before any producer for the
-        // stream exists, so it can't reflect the per-launch hw fallback —
-        // and being cacheable, it couldn't stay true if it tried. What
-        // actually encoded a given segment is reported separately.
-        if let plan::Mode::Transcode { hard_cap, .. } = plan.mode {
-            let enc = producer::requested_encoder_name(&state.hwenc);
-            if let Ok(v) = HeaderValue::from_str(enc) {
-                h.insert("X-Stream-Encoder", v);
-            }
-            // Which rate control that encoder ended up on. Without this the
-            // panel can't tell capped CRF from ABR from VideoToolbox's
-            // uncapped quality mode, and would report a bitrate ceiling
-            // that two of the three don't actually honour.
-            let rc = producer::requested_rate_control_name(&state.hwenc, hard_cap);
-            if let Ok(v) = HeaderValue::from_str(&rc) {
-                h.insert("X-Stream-Ratecontrol", v);
-            }
-        }
+        let mut resp = text_response(body, "application/vnd.apple.mpegurl", false);
+        add_stream_headers(&mut resp, &state, &plan, &session_id);
         return Ok(resp);
     }
 
     let ctx = producer::ProducerCtx {
         media_id: id.clone(),
-        file_id,
-        source: src,
-        plan: plan.clone(),
+        file_id: source.file_id,
+        source: source.src,
         plan_dir: plan_dir.clone(),
-        audio_idx,
-        mode_tag,
-        audio: plan::derive_audio_plan(&info, audio_idx),
+        track: producer::Track::Video { plan: plan.clone(), mode_tag },
         hw: state.hwenc,
         pool: state.pool.clone(),
     };
+    serve_media_file(&state, &ctx, &file, &path).await
+}
 
-    if file == "init.mp4" {
-        ensure_init(&state, &ctx).await?;
-    } else if let Some(idx) = cache::segment_index(&file) {
-        producer::ensure_segment(&state.hls_producers, &ctx, idx)
-            .await
-            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
+/// One audio rendition's files: `audio/{idx}-{flavor}/{index.m3u8 |
+/// init.mp4 | seg-N.m4s}`. Independent of the video mode, so every video
+/// quality shares one audio cache.
+async fn serve_audio(
+    State(state): State<AppState>,
+    Path((id, track, file)): Path<(String, String, String)>,
+) -> Result<Response> {
+    if !is_allowed_name(&file) || file == "master.m3u8" || file.starts_with("subs-") {
+        return Err(Error::BadRequest(format!("invalid hls file: {file}")));
+    }
+    let (idx, flavor) = track
+        .split_once('-')
+        .and_then(|(i, f)| Some((i.parse::<u32>().ok()?, plan::AudioFlavor::parse(f)?)))
+        .ok_or_else(|| Error::BadRequest(format!("invalid audio track: {track}")))?;
+    let idx = validate_audio_idx(idx)?;
+    let source = resolve_source(&state, &id).await?;
+    let audio = plan::derive_audio_plan(&source.info, idx, flavor).ok_or(Error::NotFound)?;
+    let plan_dir = source.plan_dir(&audio.tag());
+
+    if file == "index.m3u8" {
+        let query = segment_query(&HlsParams::default(), &plan_dir);
+        let body = playlist::render_m3u8(&audio.segments, &query, None);
+        return Ok(text_response(body, "application/vnd.apple.mpegurl", false));
     }
 
-    let bytes = tokio::fs::read(&path).await.map_err(|_| Error::NotFound)?;
-    Ok(file_response(bytes, mime_for(&file), true))
+    let path = plan_dir.join(&file);
+    let ctx = producer::ProducerCtx {
+        media_id: id,
+        file_id: source.file_id,
+        source: source.src,
+        plan_dir,
+        track: producer::Track::Audio(Arc::new(audio)),
+        hw: state.hwenc,
+        pool: state.pool.clone(),
+    };
+    serve_media_file(&state, &ctx, &file, &path).await
+}
+
+/// Produce (if needed) and serve init.mp4 or a segment for `ctx`'s track.
+async fn serve_media_file(
+    state: &AppState,
+    ctx: &producer::ProducerCtx,
+    file: &str,
+    path: &std::path::Path,
+) -> Result<Response> {
+    if file == "init.mp4" {
+        ensure_init(state, ctx).await?;
+    } else if let Some(idx) = cache::segment_index(file) {
+        producer::ensure_segment(&state.hls_producers, ctx, idx)
+            .await
+            .map_err(|e| match e.downcast_ref::<producer::PastEnd>() {
+                Some(_) => Error::NotFound,
+                None => Error::Other(e),
+            })?;
+    }
+    let bytes = tokio::fs::read(path).await.map_err(|_| Error::NotFound)?;
+    Ok(file_response(bytes, mime_for(file), true))
+}
+
+/// Query for a media playlist's init/segment URIs: what picks the plan
+/// (`mode`, `bitrate`; nothing for audio), the client's audio pick so video
+/// requests stay attributed to its playback session, plus the plan-dir name
+/// as the `v=` cache key. See `render_m3u8`.
+fn segment_query(params: &HlsParams, plan_dir: &std::path::Path) -> String {
+    let mut parts = Vec::new();
+    if let Some(a) = params.a {
+        parts.push(format!("a={a}"));
+    }
+    if let Some(m) = params.mode.as_deref().filter(|m| !m.is_empty()) {
+        parts.push(format!("mode={m}"));
+    }
+    if let Some(b) = params.bitrate {
+        parts.push(format!("bitrate={b}"));
+    }
+    if let Some(tag) = plan_dir.file_name().and_then(|n| n.to_str()) {
+        parts.push(format!("v={tag}"));
+    }
+    parts.join("&")
+}
+
+/// Render `master.m3u8` for `plan`. `?a=N` narrows the audio renditions to
+/// that one track (the web player switches tracks by reloading, and native
+/// browser HLS can't switch in-player); without it every track is listed
+/// for the player's own menu. `?subs=0` drops the subtitle renditions for
+/// clients that render subtitles themselves.
+async fn render_master(
+    state: &AppState,
+    source: &Source,
+    plan: &plan::StreamPlan,
+    params: &HlsParams,
+) -> Result<String> {
+    let info = &source.info;
+    // Everything the video playlist needs to resolve the same plan, plus
+    // the audio pick (session attribution) and start position.
+    let mut query = vec![format!("a={}", params.a.unwrap_or_else(|| default_audio_idx(info)))];
+    if let Some(m) = params.mode.as_deref().filter(|m| !m.is_empty()) {
+        query.push(format!("mode={m}"));
+    }
+    if let Some(b) = params.bitrate {
+        query.push(format!("bitrate={b}"));
+    }
+    if let Some(t) = params.t.filter(|t| t.is_finite() && *t > 0.0) {
+        query.push(format!("t={t}"));
+    }
+    let query = query.join("&");
+    let (bandwidth_bps, resolution) = video_shape(plan, info);
+    let video = playlist::VideoVariant {
+        query: &query,
+        bandwidth_bps,
+        resolution,
+        codecs: plan.codecs.as_deref(),
+        video_range: plan.video_range.as_deref(),
+    };
+
+    let default_idx = params.a.unwrap_or_else(|| default_audio_idx(info));
+    let tracks: Vec<u32> = match params.a {
+        Some(a) => vec![a],
+        None => (0..info.audio.len() as u32).collect(),
+    };
+    let plans: Vec<(plan::AudioPlan, String)> = tracks
+        .iter()
+        .flat_map(|&i| plan::AudioFlavor::ALL.map(|f| plan::derive_audio_plan(info, i, f)))
+        .flatten()
+        .map(|a| {
+            let name = info
+                .audio
+                .get(a.idx as usize)
+                .map(audio_rendition_name)
+                .unwrap_or_default();
+            (a, name)
+        })
+        .collect();
+    let audio: Vec<playlist::AudioRendition> = plans
+        .iter()
+        .map(|(a, name)| playlist::AudioRendition {
+            idx: a.idx,
+            flavor: a.flavor,
+            name,
+            language: info.audio.get(a.idx as usize).and_then(|t| t.language.as_deref()),
+            default: a.idx == default_idx,
+            codecs: &a.codecs,
+            channels: &a.channels_attr,
+            bitrate_kbps: a.bitrate_kbps,
+        })
+        .collect();
+
+    let tracks = if params.subs == Some(0) {
+        Vec::new()
+    } else {
+        super::subtitles::list_from_db(&state.pool, &source.file_id)
+            .await
+            .map_err(Error::Other)?
+    };
+    let subs: Vec<_> = tracks
+        .iter()
+        .map(|t| playlist::SubtitleRendition {
+            track_id: &t.id,
+            name: &t.label,
+            language: &t.language,
+            default: t.default,
+            forced: t.forced,
+        })
+        .collect();
+    Ok(playlist::render_master(&video, &audio, &subs))
+}
+
+/// What a player's audio menu shows for a track: its title, else its
+/// language (AVPlayer localises that itself when NAME is missing, but NAME
+/// is required). Empty falls through to `Track N`.
+fn audio_rendition_name(t: &crate::types::AudioTrackInfo) -> String {
+    t.title
+        .clone()
+        .or_else(|| t.language.clone())
+        .unwrap_or_default()
+}
+
+/// Headers the debug panel and metrics stream read off the playlist
+/// response (whichever one the player was handed).
+fn add_stream_headers(resp: &mut Response, state: &AppState, plan: &plan::StreamPlan, session_id: &str) {
+    let h = resp.headers_mut();
+    // Mirror the `/stream` endpoint's mode advertisement so the
+    // player's debug-panel `ObservedStream` parser engages — without
+    // `X-Stream-Mode` it would fall back to the cached compat
+    // verdict and miss the encoder/container we're actually serving.
+    let mode_str = match plan.mode {
+        plan::Mode::Remux => "remux",
+        plan::Mode::Transcode { .. } => "transcode",
+    };
+    h.insert("X-Stream-Mode", HeaderValue::from_static(mode_str));
+    // Hand the client its server-derived session id so the optional
+    // metrics stream can tag samples without a separate start call.
+    if let Ok(v) = HeaderValue::from_str(session_id) {
+        h.insert("X-Playback-Session", v);
+    }
+    // For transcode, advertise the H.264 encoder producers are *asked*
+    // to use. This response is written before any producer for the
+    // stream exists, so it can't reflect the per-launch hw fallback —
+    // and being cacheable, it couldn't stay true if it tried. What
+    // actually encoded a given segment is reported separately.
+    if let plan::Mode::Transcode { hard_cap, .. } = plan.mode {
+        let enc = producer::requested_encoder_name(&state.hwenc);
+        if let Ok(v) = HeaderValue::from_str(enc) {
+            h.insert("X-Stream-Encoder", v);
+        }
+        // Which rate control that encoder ended up on. Without this the
+        // panel can't tell capped CRF from ABR from VideoToolbox's
+        // uncapped quality mode, and would report a bitrate ceiling
+        // that two of the three don't actually honour.
+        let rc = producer::requested_rate_control_name(&state.hwenc, hard_cap);
+        if let Ok(v) = HeaderValue::from_str(&rc) {
+            h.insert("X-Stream-Ratecontrol", v);
+        }
+    }
 }
 
 /// Ensure init.mp4 exists. ffmpeg's HLS-fmp4 muxer writes init.mp4
@@ -699,6 +976,7 @@ mod tests {
         MediaTechInfo {
             container: Some("matroska".into()),
             duration_seconds: Some(1200.0),
+            start_seconds: None,
             bitrate_kbps: container_kbps,
             file_size: None,
             video: height.map(|h| VideoTrackInfo {
@@ -770,6 +1048,27 @@ mod tests {
         // Auto's "don't outspend the source" guard must not silently
         // undercut a bitrate the user asked for by name.
         assert_eq!(resolve_encode_target(Some(8000), &info(Some(1080), Some(1500))), (8000, 1080));
+    }
+
+    #[test]
+    fn video_shape_follows_the_plan() {
+        let src = info(Some(1080), Some(6000));
+        let remux = plan::StreamPlan {
+            version: plan::PLAN_VERSION,
+            mode: plan::Mode::Remux,
+            duration: 1200.0,
+            video_codec: "hevc".into(),
+            codecs: None,
+            video_range: None,
+            segments: vec![],
+        };
+        assert_eq!(video_shape(&remux, &src), (6_000_000, Some((1920, 1080))));
+
+        let tx = plan::StreamPlan {
+            mode: plan::Mode::Transcode { bitrate_kbps: 2000, max_height: 480, hard_cap: true },
+            ..remux
+        };
+        assert_eq!(video_shape(&tx, &src), (2_000_000, Some((854, 480))));
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //!   unauthed → middleware redirects to `<bastion>/auth/login?service=<slug>&return=<self>/auth/bastion`
 //!   bastion  → redirects to `<self>/auth/bastion?bastion_token=<jwt>`
 //!   we verify, mint opaque session id, set cookie, redirect `/`
+//!
+//! Native clients (the Apple TV app) get the JWT from bastion's device flow
+//! instead — `/api/info` tells them where — and trade it at `/auth/bastion`
+//! for the same cookie.
 
 use axum::{
     extract::{Query, Request, State},
@@ -159,7 +163,8 @@ pub fn router() -> Router<crate::server::AppState> {
 }
 
 /// Kicks the user over to bastion to authenticate. No return URL is sent —
-/// bastion already knows where to redirect (the service's registered URL).
+/// bastion already knows where to redirect (the service's registered URL);
+/// the page to come back to rides in `RETURN_COOKIE` instead.
 async fn login(State(state): State<crate::server::AppState>) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         return (StatusCode::NOT_FOUND, "auth disabled").into_response();
@@ -234,7 +239,19 @@ async fn bastion_callback(
         .build();
     let jar = jar.add(cookie);
 
-    (jar, Redirect::to("/")).into_response()
+    // Back to the page that sent them to log in.
+    let back = jar.get(RETURN_COOKIE).map(|c| c.value().to_string()).filter(|p| is_local_path(p));
+    let jar = jar.remove(Cookie::build(RETURN_COOKIE).path("/").build());
+    (jar, Redirect::to(back.as_deref().unwrap_or("/"))).into_response()
+}
+
+/// Where to go after login, set when a signed-out browser is sent there.
+const RETURN_COOKIE: &str = "binkflix_return";
+
+/// A path on this site, not `//host` or `/\host`, which browsers treat as
+/// another origin.
+fn is_local_path(p: &str) -> bool {
+    p.starts_with('/') && !p.starts_with("//") && !p.starts_with("/\\")
 }
 
 async fn logout(
@@ -323,12 +340,25 @@ pub async fn require_session(
     if req.uri().path().starts_with("/api/") || !accept.contains("text/html") {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Redirect::to("/auth/login").into_response()
+    let back = req.uri().path_and_query().map(|p| p.as_str().to_string()).filter(|p| is_local_path(p));
+    let jar = match back {
+        Some(back) => jar.add(
+            Cookie::build((RETURN_COOKIE, back))
+                .path("/")
+                .http_only(true)
+                .secure(!cfg!(debug_assertions))
+                .same_site(SameSite::Lax)
+                .build(),
+        ),
+        None => jar,
+    };
+    (jar, Redirect::to("/auth/login")).into_response()
 }
 
 fn is_public_path(uri: &Uri) -> bool {
     let p = uri.path();
     p.starts_with("/auth/")
+        || p == "/api/info"
         || p.starts_with("/jassub/")
         || p.starts_with("/static/")
         || p == "/favicon.ico"

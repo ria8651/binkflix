@@ -111,7 +111,7 @@ pub async fn media_stream(
         // the `?mode=transcode` debug override against `/stream`, where
         // we redirect to the equivalent HLS URL.
         BrowserCompat::Transcode => {
-            let target = format!("/api/media/{id}/hls/index.m3u8?a=0&mode=transcode");
+            let target = format!("/api/media/{id}/hls/master.m3u8?a=0&subs=0&mode=transcode");
             Ok((
                 StatusCode::TEMPORARY_REDIRECT,
                 [(header::LOCATION, target)],
