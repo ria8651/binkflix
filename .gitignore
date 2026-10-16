@@ -9,3 +9,8 @@
 .claude
 !.claude/settings.json
 !.claude/launch.json
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+/tvos/build
