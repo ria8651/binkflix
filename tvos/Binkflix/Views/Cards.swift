@@ -57,6 +57,10 @@ struct CardLabel: View {
                     }
                 }
                 .clipShape(.rect(cornerRadius: 12))
+                // The system focus look (lift, tilt, specular sheen) on the
+                // artwork only; `.borderless` would otherwise scale the
+                // whole label, caption included.
+                .hoverEffect(.highlight)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.caption)
