@@ -991,7 +991,7 @@ fn spawn_ffmpeg(
         // the output muxer starts writing init.mp4.
         .arg("-analyzeduration").arg("10M")
         .arg("-probesize").arg("50M")
-        .arg("-ss").arg(format!("{start_t:.6}"))
+        .arg("-ss").arg(format!("{:.6}", seek_secs(&ctx.track, start_t)))
         .arg("-copyts")
         .arg("-i").arg(&ctx.source);
     match &ctx.track {
@@ -1029,6 +1029,16 @@ fn spawn_ffmpeg(
     let child = cmd.spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg: {e}"))?;
     Ok((child, argv))
+}
+
+/// Input `-ss` for a run starting at plan time `start_t`. Video plans are
+/// already in seek time; an audio plan's grid starts at the track's first
+/// sample, which needn't be the container's start.
+fn seek_secs(track: &Track, start_t: f64) -> f64 {
+    match track {
+        Track::Video { .. } => start_t,
+        Track::Audio(a) => (a.origin - a.container_start + start_t).max(0.0),
+    }
 }
 
 /// Snapshot the program + args of a built `Command` as plain strings
@@ -1262,7 +1272,8 @@ fn apply_video_args(cmd: &mut Command, mode: &Mode, src_codec: &str, hw: HwEncod
     }
 }
 
-/// Codec args for an audio run starting at `start_t`.
+/// Codec args for an audio run starting at `start_t`, in plan time (from
+/// the track's `origin`).
 ///
 /// The audio timeline is a uniform 6s grid, and the HLS muxer cuts at
 /// `first_pts + 6n`, so the run's first packet has to land on `start_t`
@@ -1278,7 +1289,12 @@ fn apply_audio_args(cmd: &mut Command, audio: &AudioPlan, start_t: f64) {
         "copy" => {
             cmd.arg("-c:a").arg("copy");
             if start_t > 0.0 {
-                cmd.arg("-bsf:a").arg(format!("noise=drop=lt(pts*tb\\,{start_t:.6})"));
+                // `pts` is a source timestamp (`-copyts`), so the cut is too.
+                // Keep the frame nearest the cut (drop by midpoint): the
+                // probed start can be a few ms off the first frame, and
+                // run 1 starts on that frame.
+                let cut = audio.origin + start_t;
+                cmd.arg("-bsf:a").arg(format!("noise=drop=lt(pts*tb+duration*tb/2\\,{cut:.6})"));
             }
         }
         codec => {

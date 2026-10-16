@@ -64,7 +64,8 @@ use tokio::process::Command;
 ///   v15:   Audio demuxed out of the video segments into its own renditions
 ///          (see `AudioPlan`), served behind a master playlist. Video
 ///          segments are video-only and shared across audio tracks; the
-///          plan carries the variant's `CODECS` string.
+///          plan carries the variant's `CODECS` string. Each audio grid
+///          starts at its track's first sample, not 0.
 pub const PLAN_VERSION: u32 = 15;
 
 /// Target segment length. ffmpeg only cuts at source keyframes under
@@ -182,9 +183,17 @@ pub struct AudioPlan {
     pub codecs: String,
     /// `CHANNELS` attribute: the channel count, or `16/JOC` for Atmos.
     pub channels_attr: String,
-    /// Uniform 6s grid over the whole file. Audio cuts anywhere, so unlike
-    /// a remux video plan this needs no probe pass.
+    /// Uniform 6s grid over the track. Audio cuts anywhere, so unlike a
+    /// remux video plan this needs no probe pass. Segment times are from
+    /// `origin`.
     pub segments: Vec<Segment>,
+    /// Source timestamp of the track's first sample, where the grid
+    /// starts. The HLS muxer cuts every 6s from a run's first packet, so
+    /// runs launched mid-file have to start on this grid to line up with
+    /// the segments around them.
+    pub origin: f64,
+    /// Source timestamp that input `-ss` is relative to.
+    pub container_start: f64,
 }
 
 impl AudioPlan {
@@ -541,6 +550,8 @@ pub fn derive_audio_plan(info: &MediaTechInfo, idx: u32, flavor: AudioFlavor) ->
         codecs: codecs.to_string(),
         channels_attr,
         segments: uniform_segments(duration, TARGET_SEGMENT_SECS),
+        origin: track.start_seconds.or(info.start_seconds).unwrap_or(0.0),
+        container_start: info.start_seconds.unwrap_or(0.0),
     })
 }
 
@@ -784,6 +795,7 @@ mod tests {
             codec: codec.into(),
             profile: None,
             duration_seconds: None,
+            start_seconds: None,
             channels: Some(channels),
             channel_layout: None,
             sample_rate_hz: Some(48_000),
@@ -798,6 +810,7 @@ mod tests {
         MediaTechInfo {
             container: Some("matroska".into()),
             duration_seconds: Some(20.0),
+            start_seconds: None,
             bitrate_kbps: None,
             file_size: None,
             video: None,
@@ -857,6 +870,22 @@ mod tests {
         let a = derive_audio_plan(&info(vec![t]), 0, AudioFlavor::Surround).unwrap();
         assert_eq!(a.segments.len(), 3);
         assert!((a.segments[2].d - 6.021).abs() < 1e-9);
+    }
+
+    #[test]
+    fn audio_grid_starts_at_the_tracks_first_sample() {
+        // Audio delayed 0.5s in a TS whose clock starts at 1.4s: runs seek
+        // relative to the container but cut on the track's own grid.
+        let mut t = track("ac3", 6);
+        t.start_seconds = Some(1.9);
+        let mut i = info(vec![t]);
+        i.start_seconds = Some(1.4);
+        let a = derive_audio_plan(&i, 0, AudioFlavor::Surround).unwrap();
+        assert!((a.origin - 1.9).abs() < 1e-9);
+        assert!((a.container_start - 1.4).abs() < 1e-9);
+        // Probes from before start times were recorded keep the old grid.
+        let a = derive_audio_plan(&info(vec![track("ac3", 6)]), 0, AudioFlavor::Surround).unwrap();
+        assert_eq!((a.origin, a.container_start), (0.0, 0.0));
     }
 
     #[test]

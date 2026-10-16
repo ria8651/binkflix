@@ -221,6 +221,10 @@ pub struct ShowDetail {
 pub struct MediaTechInfo {
     pub container: Option<String>,
     pub duration_seconds: Option<f64>,
+    /// The container's start timestamp, which input `-ss` seeks relative
+    /// to. Absent on files probed before it was recorded.
+    #[serde(default)]
+    pub start_seconds: Option<f64>,
     pub bitrate_kbps: Option<u64>,
     pub file_size: Option<u64>,
     pub video: Option<VideoTrackInfo>,
@@ -272,6 +276,11 @@ pub struct AudioTrackInfo {
     /// the longest stream's. Absent on files probed before it was recorded.
     #[serde(default)]
     pub duration_seconds: Option<f64>,
+    /// When the track's first sample plays, in source timestamps (so it
+    /// includes the container's start). Non-zero for delayed audio and for
+    /// MPEG-TS sources. Absent on files probed before it was recorded.
+    #[serde(default)]
+    pub start_seconds: Option<f64>,
     pub channels: Option<u32>,
     pub channel_layout: Option<String>,
     pub sample_rate_hz: Option<u32>,

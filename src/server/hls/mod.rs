@@ -529,9 +529,15 @@ async fn serve(
         return Ok(text_response(body, "application/vnd.apple.mpegurl", false));
     }
 
-    let audio_idx = validate_audio_idx(params.idx())?;
+    validate_audio_idx(params.idx())?;
     let resolved = resolve_plan(&state, &id, &params).await?;
     let ResolvedPlan { source, plan, plan_dir, mode_tag } = resolved;
+    // The track this playback is attributed to: the client's `?a=`, else
+    // the one it gets by default, matching what the master names.
+    let audio_idx = params.a.unwrap_or_else(|| default_audio_idx(&source.info));
+    if params.a.is_some() && !source.info.audio.is_empty() && audio_idx as usize >= source.info.audio.len() {
+        return Err(Error::NotFound);
+    }
     let path = plan_dir.join(&file);
 
     // Strict mode with an unsatisfiable request (encoder missing from this
@@ -706,10 +712,14 @@ async fn serve_media_file(
 }
 
 /// Query for a media playlist's init/segment URIs: what picks the plan
-/// (`mode`, `bitrate`; nothing for audio) plus the plan-dir name as the
-/// `v=` cache key. See `render_m3u8`.
+/// (`mode`, `bitrate`; nothing for audio), the client's audio pick so video
+/// requests stay attributed to its playback session, plus the plan-dir name
+/// as the `v=` cache key. See `render_m3u8`.
 fn segment_query(params: &HlsParams, plan_dir: &std::path::Path) -> String {
     let mut parts = Vec::new();
+    if let Some(a) = params.a {
+        parts.push(format!("a={a}"));
+    }
     if let Some(m) = params.mode.as_deref().filter(|m| !m.is_empty()) {
         parts.push(format!("mode={m}"));
     }
@@ -966,6 +976,7 @@ mod tests {
         MediaTechInfo {
             container: Some("matroska".into()),
             duration_seconds: Some(1200.0),
+            start_seconds: None,
             bitrate_kbps: container_kbps,
             file_size: None,
             video: height.map(|h| VideoTrackInfo {

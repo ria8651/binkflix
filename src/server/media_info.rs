@@ -269,6 +269,7 @@ pub async fn probe_full(
                     codec: s.codec_name.clone(),
                     profile: s.profile.clone().filter(|s| !s.is_empty()),
                     duration_seconds: parse_stream_duration(s.duration.as_deref(), &s.tags),
+                    start_seconds: parse_seconds(s.start_time.as_deref()),
                     channels: s.channels,
                     channel_layout: s.channel_layout.clone().filter(|s| !s.is_empty()),
                     sample_rate_hz: s.sample_rate.as_deref().and_then(|s| s.parse().ok()),
@@ -313,6 +314,7 @@ pub async fn probe_full(
     let info = MediaTechInfo {
         container,
         duration_seconds: parsed.format.duration.as_deref().and_then(|s| s.parse().ok()),
+        start_seconds: parse_seconds(parsed.format.start_time.as_deref()),
         bitrate_kbps: parse_bitrate_kbps(parsed.format.bit_rate.as_deref()),
         file_size: parsed.format.size.as_deref().and_then(|s| s.parse().ok()),
         video: video_track,
@@ -420,6 +422,10 @@ fn parse_stream_duration(duration: Option<&str>, tags: &std::collections::BTreeM
     Some(h * 3600.0 + m * 60.0 + s).filter(|d| d.is_finite() && *d > 0.0)
 }
 
+fn parse_seconds(s: Option<&str>) -> Option<f64> {
+    s?.parse::<f64>().ok().filter(|t| t.is_finite())
+}
+
 fn parse_fps(s: Option<&str>) -> Option<f64> {
     // ffprobe reports `num/den`, e.g. `24000/1001`.
     let s = s?;
@@ -452,6 +458,7 @@ struct ProbeChapter {
 struct ProbeFormat {
     format_name: Option<String>,
     duration: Option<String>,
+    start_time: Option<String>,
     size: Option<String>,
     bit_rate: Option<String>,
 }
@@ -474,6 +481,7 @@ struct ProbeStream {
     sample_rate: Option<String>,
     bit_rate: Option<String>,
     duration: Option<String>,
+    start_time: Option<String>,
     #[serde(default)]
     tags: std::collections::BTreeMap<String, String>,
     #[serde(default)]
