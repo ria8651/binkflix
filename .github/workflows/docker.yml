@@ -65,6 +65,9 @@ jobs:
             }
 
       - uses: docker/build-push-action@v6
+        env:
+          # Skip the job summary (it carries Docker's feedback survey link).
+          DOCKER_BUILD_SUMMARY: false
         with:
           context: .
           platforms: linux/amd64
