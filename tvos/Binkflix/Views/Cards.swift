@@ -27,8 +27,10 @@ struct Shelf<Content: View>: View {
     }
 }
 
-/// Artwork with a caption under it. Used as a button label with
-/// `.buttonStyle(.borderless)`, which lifts the image on focus.
+/// Artwork with a caption under it, as a button label with
+/// `.buttonStyle(.borderless)`. The body is two sibling views (no stack) so
+/// the style sees artwork + title and does the TV-app focus look itself:
+/// the artwork lifts and the caption slides down out of its way.
 struct CardLabel: View {
     let url: URL?
     let size: CGSize
@@ -39,41 +41,36 @@ struct CardLabel: View {
     var watched = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            RemoteImage(url: url, title: title)
-                .frame(width: size.width, height: size.height)
-                .overlay(alignment: .bottom) {
-                    if let progress {
-                        ProgressBar(value: progress).padding(14)
-                    }
-                }
-                .overlay(alignment: .topTrailing) {
-                    if watched {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.title3)
-                            .symbolRenderingMode(.palette)
-                            .foregroundStyle(.white, .tint)
-                            .padding(12)
-                    }
-                }
-                .clipShape(.rect(cornerRadius: 12))
-                // The system focus look (lift, tilt, specular sheen) on the
-                // artwork only; `.borderless` would otherwise scale the
-                // whole label, caption included.
-                .hoverEffect(.highlight)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption)
-                    .lineLimit(1)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+        RemoteImage(url: url, title: title)
+            .frame(width: size.width, height: size.height)
+            .overlay(alignment: .bottom) {
+                if let progress {
+                    ProgressBar(value: progress).padding(14)
                 }
             }
-            .frame(width: size.width, alignment: .leading)
+            .overlay(alignment: .topTrailing) {
+                if watched {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title3)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .tint)
+                        .padding(12)
+                }
+            }
+            .clipShape(.rect(cornerRadius: 12))
+            .hoverEffect(.highlight)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption)
+                .lineLimit(1)
+            if let subtitle {
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
+        .frame(width: size.width, alignment: .leading)
     }
 }
 
