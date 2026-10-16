@@ -113,12 +113,14 @@ struct PlayButtons: View {
             } label: {
                 Label(resume > 0 ? "Resume \(timestamp(resume))" : "Play", systemImage: "play.fill")
             }
+            .hoverEffect(.highlight)
             if resume > 0 {
                 Button {
                     player.play(id, app: app, from: 0)
                 } label: {
                     Label("Start Over", systemImage: "arrow.counterclockwise")
                 }
+                .hoverEffect(.highlight)
             }
             Button {
                 Task {
@@ -128,6 +130,7 @@ struct PlayButtons: View {
             } label: {
                 Label(watched ? "Watched" : "Mark Watched", systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
             }
+            .hoverEffect(.highlight)
         }
         .padding(.top, 20)
         .focusSection()
@@ -225,6 +228,7 @@ struct ShowDetailView: View {
                     let tag = "S\(next.seasonNumber) E\(next.episodeNumber)"
                     Label(next.progress != nil ? "Resume \(tag)" : "Play \(tag)", systemImage: "play.fill")
                 }
+                .hoverEffect(.highlight)
                 .padding(.top, 20)
             }
         }
@@ -242,6 +246,7 @@ struct ShowDetailView: View {
                             Text(season.name).fontWeight(selected ? .bold : .regular)
                         }
                         .buttonStyle(.bordered)
+                        .hoverEffect(.highlight)
                         .focused($focusedSeason, equals: season.number)
                         .overlay(alignment: .bottom) {
                             if selected {
