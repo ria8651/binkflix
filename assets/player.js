@@ -1330,6 +1330,16 @@ async function attachInner(videoId, url, opts) {
             try { hls.destroy(); } catch (_) { /* ignore */ }
         }
     });
+    // The master offers the same video twice: with surround audio
+    // (AC-3/E-AC-3, for Apple TV) and with stereo AAC. hls.js already drops
+    // the variant a browser can't decode, but where both decode (Edge with
+    // Dolby) its ABR would hop between them on bandwidth estimates and swap
+    // the audio under the viewer. Pin the stereo one; quality is the
+    // user's pick anyway, never ABR.
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        const stereo = hls.levels.findIndex((l) => l.attrs?.AUDIO === "stereo");
+        if (stereo >= 0 && hls.levels.length > 1) hls.currentLevel = stereo;
+    });
     hls.loadSource(url);
     hls.attachMedia(video);
     // Explicit startLoad after attachMedia ensures hls.js uses our

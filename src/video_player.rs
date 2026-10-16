@@ -462,7 +462,7 @@ pub fn VideoPlayer(id: String, back_route: crate::app::Route) -> Element {
         match mode {
             // Direct serve only carries the file's first audio track.
             // Picking a non-default track transparently switches to HLS
-            // so the server can `-map 0:a:N?` the right one.
+            // so the server can serve that track as its own audio rendition.
             BrowserCompat::Direct => {
                 if aidx == 0 {
                     media_stream_url(&id_for_src)
@@ -2099,6 +2099,23 @@ fn HlsPipelineRows(state: HlsState) -> Element {
         .as_ref()
         .map(|p| format!("{:.1}s since last request", p.idle_for_secs))
         .unwrap_or_else(|| "—".into());
+    // Audio is its own rendition with its own producer and cache; one row
+    // covers it, since it's cheap and rarely the bottleneck.
+    let audio_label = state.audio.as_ref().map(|a| {
+        let producer = match &a.producer {
+            None => "idle".to_string(),
+            Some(p) => {
+                let status = if p.paused { "paused" } else { "running" };
+                format!("{status} · seg {} / {}", p.head, a.total_segments)
+            }
+        };
+        format!(
+            "{} · {producer} · cached {} / {}",
+            a.track,
+            a.cached_segments.len(),
+            a.total_segments
+        )
+    });
     rsx! {
         DebugRow { label: "Producer", value: producer_label }
         DebugRow { label: "Window", value: window_label }
@@ -2106,6 +2123,9 @@ fn HlsPipelineRows(state: HlsState) -> Element {
         DebugRow {
             label: "Cache",
             value: format!("{cached_count} / {total} segs ({cached_pct}%)"),
+        }
+        if let Some(audio) = audio_label {
+            DebugRow { label: "Audio", value: audio }
         }
     }
 }

@@ -132,12 +132,12 @@ async fn playback_sample(
     // session_id (or to a fabricated one) and pollute analytics. We pull the
     // delivery params in the same round-trip so we can attach authoritative
     // server-side transcode telemetry below.
-    /// `(user_sub, file_id, delivery_mode, audio_idx, target_bitrate_kbps)`
-    /// as selected from `playback_sessions`.
-    type SessionDeliveryRow = (Option<String>, Option<String>, String, Option<i64>, Option<i64>);
+    /// `(user_sub, file_id, delivery_mode, target_bitrate_kbps)` as
+    /// selected from `playback_sessions`.
+    type SessionDeliveryRow = (Option<String>, Option<String>, String, Option<i64>);
     let row: Option<SessionDeliveryRow> =
         match sqlx::query_as(
-            "SELECT user_sub, file_id, delivery_mode, audio_idx, target_bitrate_kbps
+            "SELECT user_sub, file_id, delivery_mode, target_bitrate_kbps
              FROM playback_sessions WHERE id = ?",
         )
         .bind(&body.session_id)
@@ -147,7 +147,7 @@ async fn playback_sample(
             Ok(r) => r,
             Err(_) => return StatusCode::NO_CONTENT,
         };
-    let Some((owner, file_id, delivery_mode, audio_idx, target_bitrate)) = row else {
+    let Some((owner, file_id, delivery_mode, target_bitrate)) = row else {
         // Unknown session.
         return StatusCode::FORBIDDEN;
     };
@@ -163,13 +163,12 @@ async fn playback_sample(
     // progress, which only the server can see — fill them from the live
     // producer rather than trusting the client (which leaves them None).
     // `observed_kbps` stays whatever the client reports: it's the viewer's
-    // own network throughput. Resolve the same `(file_id, audio_idx,
-    // mode_tag)` key the HLS endpoint cached under so we snapshot the right
+    // own network throughput. Resolve the same `(file_id, track)` key the
+    // HLS endpoint cached the video under so we snapshot the right
     // producer.
     let telemetry = match file_id.as_deref() {
         Some(file_id) => {
-            server_transcode_telemetry(&state, file_id, &delivery_mode, audio_idx, target_bitrate)
-                .await
+            server_transcode_telemetry(&state, file_id, &delivery_mode, target_bitrate).await
         }
         None => None,
     };
@@ -208,33 +207,33 @@ async fn playback_sample(
 /// Snapshot the live HLS producer for a session and return
 /// `(transcode_position_ms, transcode_rate_x100)`. `None` when the session
 /// isn't going through the transcode/remux pipeline (direct serve has no
-/// producer) or no producer is currently live for that key. The producer's
-/// `head` is the highest finished segment; segments are a nominal 6s, so the
-/// encoder's leading edge in media time is `head × 6000ms`.
+/// producer) or no producer is currently live for that key. The video
+/// producer is the one reported: it's the expensive half, and the one a
+/// slow encode stalls. Its `head` is the highest finished segment; segments
+/// are a nominal 6s, so the encoder's leading edge in media time is
+/// `head × 6000ms`.
 async fn server_transcode_telemetry(
     state: &AppState,
     file_id: &str,
     delivery_mode: &str,
-    audio_idx: Option<i64>,
     target_bitrate: Option<i64>,
 ) -> Option<(i64, i64)> {
-    let mode_tag_prefix = match delivery_mode {
-        "remux" => "remux".to_string(),
+    let track_prefix = match delivery_mode {
+        "remux" => "v-remux".to_string(),
         "transcode" => {
-            // Rebuild as much of the `tx{bitrate}h{height}` tag the HLS
+            // Rebuild as much of the `v-tx{bitrate}h{height}` tag the HLS
             // endpoint caches under (see `resolve_plan`) as this row can
             // support. Height isn't recorded and is no longer derivable
             // from the bitrate under Auto, so we match on the prefix.
             let bitrate = u32::try_from(target_bitrate?).ok()?;
-            format!("tx{bitrate}h")
+            format!("v-tx{bitrate}h")
         }
         // "direct" (or anything else) doesn't spawn a producer.
         _ => return None,
     };
-    let audio_idx = audio_idx.and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
     let snap = state
         .hls_producers
-        .snapshot_by_prefix(file_id, audio_idx, &mode_tag_prefix)
+        .snapshot_by_prefix(file_id, &track_prefix)
         .await?;
     let position_ms = i64::from(snap.head) * 6000;
     Some((position_ms, i64::from(snap.encode_rate_x100)))

@@ -267,6 +267,8 @@ pub async fn probe_full(
             "audio" => {
                 audio_tracks.push(AudioTrackInfo {
                     codec: s.codec_name.clone(),
+                    profile: s.profile.clone().filter(|s| !s.is_empty()),
+                    duration_seconds: parse_stream_duration(s.duration.as_deref(), &s.tags),
                     channels: s.channels,
                     channel_layout: s.channel_layout.clone().filter(|s| !s.is_empty()),
                     sample_rate_hz: s.sample_rate.as_deref().and_then(|s| s.parse().ok()),
@@ -404,6 +406,20 @@ fn parse_bitrate_kbps(s: Option<&str>) -> Option<u64> {
     s.and_then(|s| s.parse::<u64>().ok()).map(|bps| bps / 1000)
 }
 
+/// A stream's own duration: ffprobe's `duration` (MP4 and most others), else
+/// the `DURATION` tag Matroska muxers write (`00:02:00.021000000`).
+fn parse_stream_duration(duration: Option<&str>, tags: &std::collections::BTreeMap<String, String>) -> Option<f64> {
+    if let Some(d) = duration.and_then(|d| d.parse::<f64>().ok()) {
+        return Some(d).filter(|d| d.is_finite() && *d > 0.0);
+    }
+    let tag = tags.get("DURATION")?;
+    let mut parts = tag.splitn(3, ':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s).filter(|d| d.is_finite() && *d > 0.0)
+}
+
 fn parse_fps(s: Option<&str>) -> Option<f64> {
     // ffprobe reports `num/den`, e.g. `24000/1001`.
     let s = s?;
@@ -457,6 +473,7 @@ struct ProbeStream {
     channel_layout: Option<String>,
     sample_rate: Option<String>,
     bit_rate: Option<String>,
+    duration: Option<String>,
     #[serde(default)]
     tags: std::collections::BTreeMap<String, String>,
     #[serde(default)]

@@ -38,41 +38,22 @@ pub fn file_dir(id: &str) -> PathBuf {
 }
 
 /// Subdirectory within `file_dir` whose name encodes the plan's invalidation
-/// keys. Changes if the source file changes (mtime/size), the plan algorithm
-/// is bumped (`PLAN_VERSION`), the user picks a different audio track, or
-/// the encode mode/quality differs. Audio index is part of the key because
-/// each track's segments contain a different muxed audio stream; the
-/// `mode_tag` (e.g. `remux` or `tx4000h720`) is part of the key because
-/// transcoded segments at one bitrate aren't interchangeable with another.
-pub fn plan_dir_name(
-    plan_version: u32,
-    source_mtime: i64,
-    source_size: i64,
-    audio_idx: u32,
-    mode_tag: &str,
-) -> String {
-    format!("v{plan_version}-m{source_mtime}-s{source_size}-a{audio_idx}-{mode_tag}")
+/// keys plus which rendition it holds. Changes if the source file changes
+/// (mtime/size) or the plan algorithm is bumped (`PLAN_VERSION`). `track` is
+/// the rendition: `v-{mode_tag}` for video (`v-remux`, `v-tx4000h720`, since
+/// transcodes at one bitrate aren't interchangeable with another) or
+/// `a{idx}-{flavor}` for audio (`a0-stereo`). Video is shared across audio
+/// tracks and audio across video modes.
+pub fn plan_dir_name(plan_version: u32, source_mtime: i64, source_size: i64, track: &str) -> String {
+    format!("v{plan_version}-m{source_mtime}-s{source_size}-{track}")
 }
 
-pub fn plan_dir(
-    id: &str,
-    plan_version: u32,
-    source_mtime: i64,
-    source_size: i64,
-    audio_idx: u32,
-    mode_tag: &str,
-) -> PathBuf {
-    file_dir(id).join(plan_dir_name(
-        plan_version,
-        source_mtime,
-        source_size,
-        audio_idx,
-        mode_tag,
-    ))
+pub fn plan_dir(id: &str, plan_version: u32, source_mtime: i64, source_size: i64, track: &str) -> PathBuf {
+    file_dir(id).join(plan_dir_name(plan_version, source_mtime, source_size, track))
 }
 
 /// Remove every subdirectory of `file_dir(id)` whose name doesn't share
-/// the given `keep_prefix`. Per-audio-index variants of the *current*
+/// the given `keep_prefix`. Per-rendition dirs of the *current*
 /// (version,mtime,size) are kept so switching tracks doesn't repeatedly
 /// blow away each other's caches; only genuinely stale dirs (old plan
 /// version, outdated source mtime/size) are removed. Best-effort — IO
@@ -97,7 +78,7 @@ pub async fn sweep_stale_plan_dirs(id: &str, keep_prefix: &str) {
     }
 }
 
-/// Prefix used by `sweep_stale_plan_dirs` to keep all per-audio-index
+/// Prefix used by `sweep_stale_plan_dirs` to keep all per-rendition
 /// variants of the current (version, mtime, size) tuple.
 pub fn plan_dir_prefix(plan_version: u32, source_mtime: i64, source_size: i64) -> String {
     format!("v{plan_version}-m{source_mtime}-s{source_size}-")
