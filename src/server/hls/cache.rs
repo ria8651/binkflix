@@ -107,7 +107,10 @@ pub fn plan_dir_prefix(plan_version: u32, source_mtime: i64, source_size: i64) -
 /// Anything else is rejected with 400 to avoid path-traversal via the catch-all
 /// `{file}` route parameter.
 pub fn is_allowed_name(name: &str) -> bool {
-    if name == "index.m3u8" || name == "init.mp4" {
+    if name == "master.m3u8" || name == "index.m3u8" || name == "init.mp4" {
+        return true;
+    }
+    if subtitle_track(name, ".m3u8").is_some() || subtitle_track(name, ".vtt").is_some() {
         return true;
     }
     if let Some(rest) = name.strip_prefix("seg-") {
@@ -116,6 +119,16 @@ pub fn is_allowed_name(name: &str) -> bool {
         }
     }
     false
+}
+
+/// Parse `subs-{track}{ext}` → subtitle track id (`embed-3`, `file-0`).
+/// The rendition playlist (`.m3u8`) and its one WebVTT segment (`.vtt`)
+/// are rendered on the fly, never read from the plan dir.
+pub fn subtitle_track<'a>(name: &'a str, ext: &str) -> Option<&'a str> {
+    let track = name.strip_prefix("subs-")?.strip_suffix(ext)?;
+    let ok = !track.is_empty()
+        && track.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    ok.then_some(track)
 }
 
 /// Parse `seg-NNNNN.m4s` → segment index (1-based as ffmpeg numbers them).

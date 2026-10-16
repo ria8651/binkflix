@@ -10,6 +10,10 @@
 //!   `head`, paused/resumed for backpressure, reaped on idle.
 //!
 //! HTTP surface (unchanged from the prior `/hls/{id}/...` endpoints):
+//! * `GET /api/media/{id}/hls/master.m3u8` → one variant (`index.m3u8`)
+//!   plus a WebVTT rendition per subtitle track (`subs-{track}.m3u8`,
+//!   whose single segment is `subs-{track}.vtt`). For native players; the
+//!   web player loads `index.m3u8` directly and renders subtitles itself.
 //! * `GET /api/media/{id}/hls/index.m3u8` → render from plan, instant.
 //! * `GET /api/media/{id}/hls/init.mp4` → ensure producer running, wait for
 //!   the canonical init.mp4 to land, serve.
@@ -419,6 +423,42 @@ fn resolve_encode_target(explicit: Option<u32>, info: &MediaTechInfo) -> (u32, u
     )
 }
 
+/// Fallback `BANDWIDTH` for a remux whose probe reported no bitrate.
+const REMUX_FALLBACK_KBPS: u64 = 8_000;
+
+/// `BANDWIDTH` (bps) and `RESOLUTION` the master playlist advertises for
+/// the one variant. Transcode mirrors the producer's
+/// `scale=-2:'min(H,ih)'`.
+fn variant_shape(
+    plan: &plan::StreamPlan,
+    info: &MediaTechInfo,
+    audio: Option<&plan::AudioPlan>,
+) -> (u64, Option<(u32, u32)>) {
+    let src = info
+        .video
+        .as_ref()
+        .and_then(|v| Some((v.width?, v.height?)))
+        .filter(|&(w, h)| w > 0 && h > 0);
+    match plan.mode {
+        plan::Mode::Remux => {
+            let kbps = info
+                .bitrate_kbps
+                .or_else(|| info.video.as_ref().and_then(|v| v.bitrate_kbps))
+                .unwrap_or(REMUX_FALLBACK_KBPS);
+            (kbps * 1000, src)
+        }
+        plan::Mode::Transcode { bitrate_kbps, max_height, .. } => {
+            let audio_kbps = audio.map(|a| a.bitrate_kbps).unwrap_or(0);
+            let resolution = src.map(|(w, h)| {
+                let out_h = h.min(max_height);
+                let out_w = ((w as f64 * out_h as f64 / h as f64 / 2.0).round() as u32) * 2;
+                (out_w, out_h)
+            });
+            ((bitrate_kbps + audio_kbps) as u64 * 1000, resolution)
+        }
+    }
+}
+
 async fn serve(
     State(state): State<AppState>,
     Extension(session): Extension<super::auth::Session>,
@@ -428,6 +468,25 @@ async fn serve(
 ) -> Result<Response> {
     if !is_allowed_name(&file) {
         return Err(Error::BadRequest(format!("invalid hls file: {file}")));
+    }
+
+    // A subtitle rendition's one segment. Doesn't depend on the plan, so
+    // it's answered before resolving one.
+    if let Some(track) = cache::subtitle_track(&file, ".vtt") {
+        let file = super::files::primary(&state.pool, &id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let body = super::subtitles::get_vtt_from_db(&state.pool, &file.id, track)
+            .await
+            .map_err(Error::Other)?
+            .ok_or(Error::NotFound)?;
+        let mut resp = (StatusCode::OK, body).into_response();
+        let h = resp.headers_mut();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/vtt; charset=utf-8"));
+        // Addressed by item, so a replaced file can put different content
+        // behind the same track id — keep the cache short.
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=60"));
+        return Ok(resp);
     }
 
     let audio_idx = validate_audio_idx(params.idx())?;
@@ -444,6 +503,44 @@ async fn serve(
         return Err(Error::Other(anyhow::anyhow!(
             "transcode unavailable: explicit BINKFLIX_HWACCEL request cannot be honoured ({reason})"
         )));
+    }
+
+    // Master and subtitle playlists are entry points for native players,
+    // rendered fresh and not part of the plan dir. They don't open a
+    // playback session: the player's next request, for index.m3u8, does.
+    if file == "master.m3u8" || cache::subtitle_track(&file, ".m3u8").is_some() {
+        let mut query = format!("a={audio_idx}");
+        if let Some(m) = params.mode.as_deref().filter(|m| !m.is_empty()) {
+            query.push_str(&format!("&mode={m}"));
+        }
+        if let Some(b) = params.bitrate {
+            query.push_str(&format!("&bitrate={b}"));
+        }
+        let body = if let Some(track) = cache::subtitle_track(&file, ".m3u8") {
+            playlist::render_subtitle_playlist(plan.duration, track)
+        } else {
+            let tracks = super::subtitles::list_from_db(&state.pool, &file_id)
+                .await
+                .map_err(Error::Other)?;
+            let subs: Vec<_> = tracks
+                .iter()
+                .map(|t| playlist::SubtitleRendition {
+                    track_id: &t.id,
+                    name: &t.label,
+                    language: &t.language,
+                    default: t.default,
+                    forced: t.forced,
+                })
+                .collect();
+            let start = params
+                .t
+                .filter(|t| t.is_finite() && *t > 0.0)
+                .map(|t| format!("&t={t}"))
+                .unwrap_or_default();
+            let (bandwidth, resolution) = variant_shape(&plan, &info, audio.as_ref());
+            playlist::render_master(&query, &start, bandwidth, resolution, &subs)
+        };
+        return Ok(text_response(body, "application/vnd.apple.mpegurl", false));
     }
 
     // Server-driven playback session: open-or-refresh keyed by
@@ -781,6 +878,31 @@ mod tests {
         // Auto's "don't outspend the source" guard must not silently
         // undercut a bitrate the user asked for by name.
         assert_eq!(resolve_encode_target(Some(8000), &info(Some(1080), Some(1500))), (8000, 1080));
+    }
+
+    #[test]
+    fn variant_shape_follows_the_plan() {
+        let src = info(Some(1080), Some(6000));
+        let remux = plan::StreamPlan {
+            version: plan::PLAN_VERSION,
+            mode: plan::Mode::Remux,
+            duration: 1200.0,
+            video_codec: "hevc".into(),
+            segments: vec![],
+        };
+        assert_eq!(variant_shape(&remux, &src, None), (6_000_000, Some((1920, 1080))));
+
+        let tx = plan::StreamPlan {
+            mode: plan::Mode::Transcode { bitrate_kbps: 2000, max_height: 480, hard_cap: true },
+            ..remux
+        };
+        let audio = plan::AudioPlan {
+            src_codec: None,
+            out_codec: "aac".into(),
+            channels: 2,
+            bitrate_kbps: 192,
+        };
+        assert_eq!(variant_shape(&tx, &src, Some(&audio)), (2_192_000, Some((854, 480))));
     }
 
     #[test]

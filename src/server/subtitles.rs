@@ -77,6 +77,22 @@ pub async fn get_from_db(
     }))
 }
 
+/// Fetch a single track as WebVTT, flattening ASS, for clients that can't
+/// render ASS.
+pub async fn get_vtt_from_db(
+    pool: &SqlitePool,
+    file_id: &str,
+    track_id: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    Ok(get_from_db(pool, file_id, track_id).await?.map(|(body, ct)| {
+        if ct.starts_with("text/x-ssa") {
+            ass_to_vtt(&String::from_utf8_lossy(&body)).into_bytes()
+        } else {
+            body
+        }
+    }))
+}
+
 // ---- public: scan-time population ----
 
 /// Extract every usable subtitle track for `video` (sidecars + embedded) and

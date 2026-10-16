@@ -74,6 +74,102 @@ pub fn render_m3u8(
     out
 }
 
+/// A subtitle track as the master playlist advertises it.
+pub struct SubtitleRendition<'a> {
+    pub track_id: &'a str,
+    pub name: &'a str,
+    pub language: &'a str,
+    pub default: bool,
+    pub forced: bool,
+}
+
+/// Render the master playlist: one variant (the muxed media playlist, since
+/// the user picks quality rather than ABR) plus a WebVTT rendition per
+/// subtitle track, which is what gives AVPlayer its native subtitle menu.
+/// `query` goes on every child URI so they resolve the same plan the master
+/// did. `start_query` (`&t=`) only goes on the variant, where `EXT-X-START`
+/// is rendered.
+///
+/// `BANDWIDTH` is required but only steers variant choice, so an estimate
+/// is fine with one variant. `CODECS` is left off until audio is demuxed:
+/// AVPlayer reads them from init.mp4, and a wrong string is worse than none.
+pub fn render_master(
+    query: &str,
+    start_query: &str,
+    bandwidth_bps: u64,
+    resolution: Option<(u32, u32)>,
+    subs: &[SubtitleRendition],
+) -> String {
+    let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+    let mut names: Vec<String> = Vec::with_capacity(subs.len());
+    let mut has_default = false;
+    for s in subs {
+        // NAME must be unique within the group, and quoted strings can't
+        // carry quotes or newlines.
+        let base = quoted_safe(if s.name.is_empty() { s.track_id } else { s.name });
+        let mut name = base.clone();
+        let mut n = 2;
+        while names.contains(&name) {
+            name = format!("{base} ({n})");
+            n += 1;
+        }
+        // At most one DEFAULT=YES per group.
+        let default = s.default && !has_default;
+        has_default |= default;
+        let yn = |b: bool| if b { "YES" } else { "NO" };
+        out.push_str(&format!("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{name}\""));
+        if is_language_tag(s.language) {
+            out.push_str(&format!(",LANGUAGE=\"{}\"", s.language));
+        }
+        // FORCED=YES requires AUTOSELECT=YES.
+        out.push_str(&format!(
+            ",DEFAULT={},AUTOSELECT=YES,FORCED={},URI=\"subs-{}.m3u8?{query}\"\n",
+            yn(default),
+            yn(s.forced),
+            s.track_id,
+        ));
+        names.push(name);
+    }
+    out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bandwidth_bps}"));
+    if let Some((w, h)) = resolution {
+        out.push_str(&format!(",RESOLUTION={w}x{h}"));
+    }
+    if !subs.is_empty() {
+        out.push_str(",SUBTITLES=\"subs\"");
+    }
+    out.push_str(&format!("\nindex.m3u8?{query}{start_query}\n"));
+    out
+}
+
+/// Render a subtitle rendition: the whole track as one WebVTT segment
+/// spanning the media. The segment is the track flattened to VTT; it has a
+/// `.vtt` name because ffmpeg-based players refuse other segment URLs.
+pub fn render_subtitle_playlist(duration: f64, track_id: &str) -> String {
+    let d = duration.max(0.001);
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:1\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:{d:.3},\nsubs-{track_id}.vtt\n#EXT-X-ENDLIST\n",
+        d.ceil() as u64,
+    )
+}
+
+fn quoted_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '"' || c.is_control() { '\'' } else { c })
+        .collect()
+}
+
+/// Loose RFC 5646 check. The scanner stores whatever the container said:
+/// usually ISO 639-2 (`eng`), sometimes `und` or nothing.
+fn is_language_tag(s: &str) -> bool {
+    let mut parts = s.split('-');
+    let primary = parts.next().unwrap_or_default();
+    s != "und"
+        && (2..=3).contains(&primary.len())
+        && primary.chars().all(|c| c.is_ascii_alphabetic())
+        && parts.all(|p| (1..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::plan::{Mode, Segment, StreamPlan, PLAN_VERSION};
@@ -140,6 +236,54 @@ mod tests {
     fn empty_cache_tag_omits_v_param() {
         let s = render_m3u8(&sample_plan(), 0, None, None, None, "");
         assert!(!s.contains("&v="));
+    }
+
+    fn sub<'a>(track_id: &'a str, name: &'a str, language: &'a str, default: bool) -> SubtitleRendition<'a> {
+        SubtitleRendition { track_id, name, language, default, forced: false }
+    }
+
+    #[test]
+    fn master_points_at_media_playlist_and_subtitle_renditions() {
+        let subs = [sub("embed-3", "English", "eng", true), sub("file-0", "Signs", "eng", false)];
+        let s = render_master("a=1&mode=remux", "&t=12", 5_000_000, Some((1920, 1080)), &subs);
+        assert!(s.starts_with("#EXTM3U\n"));
+        assert!(s.contains(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",LANGUAGE=\"eng\",\
+             DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI=\"subs-embed-3.m3u8?a=1&mode=remux\"\n"
+        ));
+        assert!(s.contains("NAME=\"Signs\",LANGUAGE=\"eng\",DEFAULT=NO"));
+        assert!(s.contains(
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,SUBTITLES=\"subs\"\n\
+             index.m3u8?a=1&mode=remux&t=12\n"
+        ));
+    }
+
+    #[test]
+    fn master_without_subtitles_omits_the_group() {
+        let s = render_master("a=0", "", 1000, None, &[]);
+        assert!(!s.contains("SUBTITLES"));
+        assert!(s.ends_with("#EXT-X-STREAM-INF:BANDWIDTH=1000\nindex.m3u8?a=0\n"));
+    }
+
+    #[test]
+    fn master_dedupes_names_and_defaults() {
+        let subs = [
+            sub("a", "Eng \"full\"", "", true),
+            sub("b", "Eng \"full\"", "und", true),
+            sub("c", "", "en-US", false),
+        ];
+        let s = render_master("a=0", "", 1000, None, &subs);
+        assert!(s.contains("NAME=\"Eng 'full'\",DEFAULT=YES"));
+        assert!(s.contains("NAME=\"Eng 'full' (2)\",DEFAULT=NO"));
+        assert!(s.contains("NAME=\"c\",LANGUAGE=\"en-US\""));
+    }
+
+    #[test]
+    fn subtitle_playlist_is_one_segment_spanning_the_media() {
+        let s = render_subtitle_playlist(1425.4, "embed-3");
+        assert!(s.contains("#EXT-X-TARGETDURATION:1426\n"));
+        assert!(s.contains("#EXTINF:1425.400,\nsubs-embed-3.vtt\n"));
+        assert!(s.ends_with("#EXT-X-ENDLIST\n"));
     }
 
     #[test]
