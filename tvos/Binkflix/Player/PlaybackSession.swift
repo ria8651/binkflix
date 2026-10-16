@@ -1,5 +1,6 @@
 import AVKit
 import UIKit
+import VideoToolbox
 
 /// One stint in the player: loads an item (and the episodes after it),
 /// reports progress, offers skip actions from markers, and tears down when
@@ -71,14 +72,17 @@ final class PlaybackSession: NSObject, AVPlayerViewControllerDelegate {
         return episodes[i + 1]
     }
 
-    /// Apple TV decodes 8-bit H.264 and 8/10-bit HEVC itself, so those are
-    /// only repackaged; anything else is transcoded by the server.
+    /// Sources this box can decode are only repackaged; anything else is
+    /// transcoded by the server (to H.264, at most 1080p). Hardware HEVC
+    /// marks a 4K-capable box (A10X and later); the Apple TV HD has neither.
     private static func mode(for tech: MediaTechInfo) -> String {
         guard let video = tech.video else { return "remux" }
         let pix = video.pixFmt ?? "yuv420p"
+        let hevc = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+        let fits = hevc || (video.height ?? 0) <= 1080
         switch video.codec {
-        case "h264": return ["yuv420p", "yuvj420p"].contains(pix) ? "remux" : "transcode"
-        case "hevc": return ["yuv420p", "yuvj420p", "yuv420p10le"].contains(pix) ? "remux" : "transcode"
+        case "h264": return fits && ["yuv420p", "yuvj420p"].contains(pix) ? "remux" : "transcode"
+        case "hevc": return hevc && ["yuv420p", "yuvj420p", "yuv420p10le"].contains(pix) ? "remux" : "transcode"
         default: return "transcode"
         }
     }

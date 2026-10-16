@@ -152,6 +152,7 @@ struct MediaTechInfo: Decodable {
     struct Video: Decodable {
         let codec: String
         let pixFmt: String?
+        let height: Int?
     }
     let durationSeconds: Double?
     let video: Video?
