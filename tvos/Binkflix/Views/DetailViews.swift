@@ -113,15 +113,13 @@ struct PlayButtons: View {
             } label: {
                 Label(resume > 0 ? "Resume \(timestamp(resume))" : "Play", systemImage: "play.fill")
             }
-            .hoverEffect(.highlight)
             if resume > 0 {
                 Button {
                     player.play(id, app: app, from: 0)
                 } label: {
                     Label("Start Over", systemImage: "arrow.counterclockwise")
                 }
-                .hoverEffect(.highlight)
-            }
+                }
             Button {
                 Task {
                     try? await app.client?.setWatched(id, !watched)
@@ -130,7 +128,6 @@ struct PlayButtons: View {
             } label: {
                 Label(watched ? "Watched" : "Mark Watched", systemImage: watched ? "checkmark.circle.fill" : "checkmark.circle")
             }
-            .hoverEffect(.highlight)
         }
         .padding(.top, 20)
         .focusSection()
@@ -155,7 +152,9 @@ struct ShowDetailView: View {
     @State private var reload = 0
     @State private var seasonNumber: Int?
     @FocusState private var focusedSeason: Int?
-    @FocusState private var focusedEpisode: String?
+    /// The episode card that has focus, as reported by the card. Not a
+    /// `@FocusState`: binding one onto the cards stops their tilt effect.
+    @State private var focusedEpisode: String?
     private static let pageEnd = "page-end"
 
     var body: some View {
@@ -186,15 +185,8 @@ struct ShowDetailView: View {
             guard let client = app.client else { return }
             let result = await Result { try await client.show(id) }
             state.apply(result)
-            guard let detail = state.value else { return }
-            if seasonNumber == nil {
+            if seasonNumber == nil, let detail = state.value {
                 seasonNumber = upNext(detail)?.seasonNumber ?? detail.seasons.first?.number
-            }
-            // Back from the player: return focus to what was playing last.
-            if let last = player.lastPlayed,
-               let season = detail.seasons.first(where: { $0.episodes.contains { $0.id == last } }) {
-                seasonNumber = season.number
-                focusedEpisode = last
             }
         }
     }
@@ -228,8 +220,7 @@ struct ShowDetailView: View {
                     let tag = "S\(next.seasonNumber) E\(next.episodeNumber)"
                     Label(next.progress != nil ? "Resume \(tag)" : "Play \(tag)", systemImage: "play.fill")
                 }
-                .hoverEffect(.highlight)
-                .padding(.top, 20)
+                    .padding(.top, 20)
             }
         }
         .focusSection()
@@ -246,8 +237,7 @@ struct ShowDetailView: View {
                             Text(season.name).fontWeight(selected ? .bold : .regular)
                         }
                         .buttonStyle(.bordered)
-                        .hoverEffect(.highlight)
-                        .focused($focusedSeason, equals: season.number)
+                                    .focused($focusedSeason, equals: season.number)
                         .overlay(alignment: .bottom) {
                             if selected {
                                 Capsule().fill(.white).frame(width: 40, height: 4).offset(y: 14)
@@ -268,7 +258,13 @@ struct ShowDetailView: View {
         if let season = detail.seasons.first(where: { $0.number == seasonNumber }) ?? detail.seasons.first {
             Shelf(title: season.name) {
                 ForEach(season.episodes) { episode in
-                    EpisodeCard(episode: episode).focused($focusedEpisode, equals: episode.id)
+                    EpisodeCard(episode: episode) { focused in
+                        if focused {
+                            focusedEpisode = episode.id
+                        } else if focusedEpisode == episode.id {
+                            focusedEpisode = nil
+                        }
+                    }
                 }
             }
         }
@@ -284,6 +280,7 @@ struct ShowDetailView: View {
 
 struct EpisodeCard: View {
     let episode: EpisodeSummary
+    var onFocusChange: (Bool) -> Void = { _ in }
     @Environment(AppModel.self) private var app
     @Environment(PlayerPresenter.self) private var player
 
@@ -298,7 +295,8 @@ struct EpisodeCard: View {
                 subtitle: runtime(episode.runtimeMinutes),
                 detail: episode.plot,
                 progress: episode.progress,
-                watched: episode.isCompleted
+                watched: episode.isCompleted,
+                onFocusChange: onFocusChange
             )
         }
         .buttonStyle(.borderless)

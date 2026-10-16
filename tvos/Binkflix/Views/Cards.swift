@@ -41,6 +41,9 @@ struct CardLabel: View {
     /// 0…1 watch progress drawn across the bottom of the artwork.
     var progress: Double?
     var watched = false
+    var onFocusChange: (Bool) -> Void = { _ in }
+
+    @Environment(\.isFocused) private var isFocused
 
     var body: some View {
         RemoteImage(url: url, title: title)
@@ -61,6 +64,7 @@ struct CardLabel: View {
             }
             .clipShape(.rect(cornerRadius: 12))
             .hoverEffect(.highlight)
+            .onChange(of: isFocused) { _, focused in onFocusChange(focused) }
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(.caption)

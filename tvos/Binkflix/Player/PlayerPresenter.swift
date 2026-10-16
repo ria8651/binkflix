@@ -7,17 +7,12 @@ import UIKit
 @Observable
 final class PlayerPresenter {
     private var session: PlaybackSession?
-    /// What was on screen when the player last closed, so the page behind it
-    /// can put focus back there (it may be a later episode than the one
-    /// picked, after Next Episode).
-    private(set) var lastPlayed: String?
 
     /// Play `id`, from `from` seconds, or from the server's resume point.
     func play(_ id: String, app: AppModel, from: Double? = nil) {
         guard session == nil, let client = app.client, let host = Self.topViewController() else { return }
         let session = PlaybackSession(client: client, mediaId: id, startAt: from)
-        session.onFinish = { [weak self, weak app] lastId in
-            self?.lastPlayed = lastId
+        session.onFinish = { [weak self, weak app] in
             self?.session = nil
             app?.watchStateChanged()
         }
