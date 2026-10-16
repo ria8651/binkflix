@@ -355,7 +355,7 @@ struct ServerInfo {
     auth: bool,
     /// Where to pair when `auth` is on: the client runs bastion's device
     /// sign-in (RFC 8628) against `origin` with `client_id = service`, and
-    /// sends the JWT it gets back as `Authorization: Bearer`.
+    /// trades the JWT at `/auth/bastion` for a session cookie.
     bastion: Option<BastionInfo>,
 }
 
