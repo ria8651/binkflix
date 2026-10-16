@@ -12,7 +12,11 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		B1F000000000000000000005 /* Binkflix */ = {isa = PBXFileSystemSynchronizedRootGroup; path = Binkflix; sourceTree = "<group>"; };
+		B1F000000000000000000005 /* Binkflix */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Binkflix;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -179,7 +183,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = NG9C2KW6A3;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
@@ -191,15 +195,14 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(BINKFLIX_BUNDLE_PREFIX).binkflix";
-				BINKFLIX_BUNDLE_PREFIX = com.ria8651;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ria8651.binkflix.tv;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 6.0;
-				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				TARGETED_DEVICE_FAMILY = 3;
 			};
 			name = Debug;
@@ -211,7 +214,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = NG9C2KW6A3;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
@@ -223,15 +226,14 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "$(BINKFLIX_BUNDLE_PREFIX).binkflix";
-				BINKFLIX_BUNDLE_PREFIX = com.ria8651;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ria8651.binkflix.tv;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 6.0;
-				SUPPORTED_PLATFORMS = "appletvos appletvsimulator";
 				TARGETED_DEVICE_FAMILY = 3;
 			};
 			name = Release;
