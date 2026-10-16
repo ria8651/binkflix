@@ -510,7 +510,10 @@ pub fn ass_to_vtt(ass: &str) -> String {
         }
     }
 
-    cues.sort_by_key(|c| c.0);
+    // By start, then dropping exact repeats: typeset ASS layers outline and
+    // shadow copies of a line, and one is enough.
+    cues.sort();
+    cues.dedup();
     let mut out = String::from("WEBVTT\n\n");
     for (start, end, text) in cues {
         out.push_str(&format!("{} --> {}\n{}\n\n", vtt_time(start), vtt_time(end), text));
@@ -528,7 +531,12 @@ fn parse_ass_time(s: &str) -> Option<u64> {
     let sec: u64 = sec.parse().ok()?;
     // Centiseconds by spec, but tolerate any number of fractional digits.
     let frac_ms = format!("{frac:0<3}").get(..3)?.parse::<u64>().ok()?;
-    Some(((h * 60 + m) * 60 + sec) * 1000 + frac_ms)
+    h.checked_mul(60)?
+        .checked_add(m)?
+        .checked_mul(60)?
+        .checked_add(sec)?
+        .checked_mul(1000)?
+        .checked_add(frac_ms)
 }
 
 fn vtt_time(ms: u64) -> String {
@@ -551,11 +559,21 @@ fn ass_text_to_plain(text: &str) -> Option<String> {
         match c {
             '{' => {
                 let mut tag = String::new();
+                let mut closed = false;
                 for t in chars.by_ref() {
                     if t == '}' {
+                        closed = true;
                         break;
                     }
                     tag.push(t);
+                }
+                // An unclosed `{` is literal text, as libass shows it.
+                if !closed {
+                    if !drawing {
+                        out.push('{');
+                        out.push_str(&tag.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"));
+                    }
+                    continue;
                 }
                 // `\p0` ends drawing mode; any other `\pN` starts it.
                 for cmd in tag.split('\\') {
@@ -603,9 +621,16 @@ mod tests {
     }
 
     #[test]
+    fn ass_text_keeps_an_unclosed_brace_as_text() {
+        assert_eq!(ass_text_to_plain("Hello {world").as_deref(), Some("Hello {world"));
+        assert_eq!(ass_text_to_plain("{\\i1}Hi{\\i0}").as_deref(), Some("Hi"));
+    }
+
+    #[test]
     fn parse_ass_time_handles_hours_and_centiseconds() {
         assert_eq!(parse_ass_time("1:02:03.45"), Some(3_723_450));
         assert_eq!(parse_ass_time("0:00:00.00"), Some(0));
         assert_eq!(parse_ass_time("nope"), None);
+        assert_eq!(parse_ass_time("99999999999999999:00:00.00"), None);
     }
 }
